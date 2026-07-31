@@ -42,7 +42,6 @@ mod live_turn;
 mod llm;
 mod log_view_state;
 mod markdown;
-mod migrate;
 mod mouse_select;
 mod print_mode;
 mod process;
@@ -129,7 +128,6 @@ fn build_file_tracker() -> FileTracker {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    migrate::run();
     debug_log::init_logging();
 
     let cli = Cli::parse();
