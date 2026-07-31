@@ -652,8 +652,6 @@ mod tests {
                 manual_compaction_instructions: None,
                 executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
                 system_prompt: None,
-                hooks: HashMap::new(),
-                hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
                 session_id: String::new(),
             },
             DisplayConfig::default(),

@@ -110,7 +110,7 @@ pub struct App {
     /// All provider-related state: instances, active instance/model/thinking,
     /// and transient setup-flow state.
     pub(crate) provider: ProviderManager,
-    /// Agent loop configuration (tools, hooks).
+    /// Agent loop configuration (tools).
     pub(crate) agent_config: AgentLoopConfig,
     /// Skills loaded from all supported skill roots.
     pub(crate) loaded_skills: Vec<SkillMeta>,
@@ -790,9 +790,6 @@ impl App {
         let ctx = crate::agent::types::ToolCallContext {
             id: call_id.clone(),
             tx: Some(tx.clone()),
-            hooks: std::collections::HashMap::new(),
-            hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
-            session_id: String::new(),
             cancel_rx: None,
         };
 
@@ -1412,8 +1409,6 @@ mod tests {
                 manual_compaction_instructions: None,
                 executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
                 system_prompt: None,
-                hooks: std::collections::HashMap::new(),
-                hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
                 session_id: String::new(),
             },
             crate::config::DisplayConfig::default(),

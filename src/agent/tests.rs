@@ -147,11 +147,8 @@ fn make_executor() -> std::sync::Arc<DefaultToolExecutor> {
     std::sync::Arc::new(DefaultToolExecutor::new())
 }
 
-/// Run the agent loop with the given provider and hooks, and collect all emitted agent events.
-async fn run_and_collect_with_config(
-    provider: MockProvider,
-    hooks: HashMap<crate::hooks::HookPoint, Vec<crate::hooks::HookConfig>>,
-) -> Vec<AgentEvent> {
+/// Run the agent loop with the given provider and collect all emitted agent events.
+async fn run_and_collect_with_config(provider: MockProvider) -> Vec<AgentEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let (_steering_tx, steering_rx) = mpsc::unbounded_channel();
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(CancelLevel::None);
@@ -165,8 +162,6 @@ async fn run_and_collect_with_config(
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        hooks,
-        hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
     run_agent_loop(config, Arc::new(provider), tx, steering_rx, cancel_rx).await;
@@ -181,7 +176,7 @@ async fn run_and_collect_with_config(
 
 /// Run the agent loop with the given provider and collect all emitted agent events.
 async fn run_and_collect(provider: MockProvider) -> Vec<AgentEvent> {
-    run_and_collect_with_config(provider, HashMap::new()).await
+    run_and_collect_with_config(provider).await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -356,8 +351,6 @@ async fn steering_during_tool_batch_finishes_batch_before_consuming_steering() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        hooks: HashMap::new(),
-        hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
 
@@ -439,8 +432,6 @@ async fn cancellation_beats_steering_at_same_tool_boundary() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        hooks: HashMap::new(),
-        hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
 
@@ -528,8 +519,6 @@ async fn steering_after_streamed_text_is_consumed_after_turn_end() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        hooks: HashMap::new(),
-        hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
 
@@ -625,8 +614,6 @@ async fn agent_loop_before_hook_blocks_tool() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        hooks: HashMap::new(),
-        hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
     let (_steering_tx, steering_rx) = mpsc::unbounded_channel();
@@ -901,8 +888,6 @@ async fn agent_loop_ask_user_no_options_completes_loop() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        hooks: HashMap::new(),
-        hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
 
@@ -988,8 +973,6 @@ async fn agent_loop_pre_cancelled_exits_immediately() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        hooks: HashMap::new(),
-        hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
 
@@ -1056,8 +1039,6 @@ async fn agent_loop_cancel_after_tool_call_stops_before_next_turn() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        hooks: HashMap::new(),
-        hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
 
@@ -1084,55 +1065,6 @@ async fn agent_loop_cancel_after_tool_call_stops_before_next_turn() {
             .any(|e| matches!(e, AgentEvent::TextToken { text, .. } if text == "second-turn")),
         "second turn should not have been reached after cancellation"
     );
-}
-
-#[tokio::test]
-async fn post_turn_hook_fires_after_final_answer() {
-    use crate::hooks::{HookConfig, HookPoint};
-    use std::collections::HashMap;
-
-    let hook_path =
-        std::env::temp_dir().join(format!("xi-hook-test-post-turn-{}.txt", std::process::id()));
-
-    let mut hooks = HashMap::new();
-    hooks.insert(
-        HookPoint::PostTurn,
-        vec![HookConfig {
-            command: Some(post_turn_test_hook_program().into()),
-            args: post_turn_test_hook_args(&hook_path),
-            ..Default::default()
-        }],
-    );
-
-    let provider = MockProvider::new(vec![vec![
-        LlmEvent::Token {
-            text: "done".to_string(),
-            phase: AssistantPhase::Unknown,
-        },
-        LlmEvent::Done,
-    ]]);
-
-    let _events = run_and_collect_with_config(provider, hooks).await;
-
-    let content = std::fs::read_to_string(&hook_path).unwrap_or_default();
-    assert!(
-        content.contains("HOOK OK"),
-        "post_turn hook did not fire: content={content:?}"
-    );
-    let _ = std::fs::remove_file(&hook_path);
-}
-
-#[cfg(unix)]
-fn post_turn_test_hook_program() -> &'static str {
-    "sh"
-}
-
-#[cfg(unix)]
-fn post_turn_test_hook_args(path: &std::path::Path) -> Vec<String> {
-    vec![
-        "-c".into(),
-        format!("printf 'HOOK OK' > '{}'", path.display()),
-    ]
 }
 
 // ── build_sorted_tool_defs ────────────────────────────────────────────────────

@@ -4,11 +4,6 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::app_event::{AppEvent, SendIgnore};
-use crate::hooks::{
-    HookConfig, HookPoint, empty_payload, ipc_external_change_payload, ipc_on_error_payload,
-    ipc_pre_tool_payload, ipc_status_update_payload, ipc_tool_intent_payload, maybe_run_hook,
-    post_tool_json, tool_json,
-};
 use crate::llm::{
     AssistantPhase, LlmEvent, LlmProvider, LlmRequestContext, Message, ToolDefinition, UsageStats,
 };
@@ -74,19 +69,12 @@ enum BatchOutcome {
     Cancelled,
 }
 
-struct HookDispatchContext<'a> {
-    hooks: &'a std::collections::HashMap<HookPoint, Vec<HookConfig>>,
-    hook_ipc: &'a crate::hooks::HookIpcPublisherHandle,
-    session_id: &'a str,
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn drain_steering_messages(
     steering_rx: &mut UnboundedReceiver<String>,
     session_events: &mut Vec<SessionEvent>,
     tx: &UnboundedSender<AppEvent>,
-    hook_ctx: &HookDispatchContext<'_>,
 ) -> bool {
     let mut consumed = false;
     while let Ok(text) = steering_rx.try_recv() {
@@ -97,20 +85,6 @@ async fn drain_steering_messages(
             content: text.clone(),
             timestamp: 0,
         });
-        hook_ctx.hook_ipc.publish(
-            hook_ctx.session_id,
-            HookPoint::OnSteeringConsumed,
-            None,
-            crate::hooks::ipc_steering_consumed_payload(&text),
-        );
-        crate::hooks::maybe_run_hook(
-            hook_ctx.hooks,
-            HookPoint::OnSteeringConsumed,
-            hook_ctx.session_id,
-            Some(crate::hooks::on_steering_consumed_json(&text)),
-            None,
-        )
-        .await;
         consumed = true;
     }
     consumed
@@ -155,22 +129,6 @@ async fn emit_compaction(
     trigger_reason: CompactionTrigger,
     user_instructions: Option<String>,
 ) -> Result<compaction::CompactionOutcome, crate::llm::ProviderError> {
-    // ── Pre-turn hook equivalent for compaction ────────────────────────────
-    config.hook_ipc.publish(
-        &config.session_id,
-        HookPoint::OnCompacting,
-        None,
-        empty_payload(),
-    );
-    crate::hooks::maybe_run_hook(
-        &config.hooks,
-        HookPoint::OnCompacting,
-        &config.session_id,
-        None,
-        None,
-    )
-    .await;
-
     tx.send_ignore(AppEvent::Agent(AgentEvent::Compacting));
     let outcome = compaction::compact_events(
         provider,
@@ -181,28 +139,6 @@ async fn emit_compaction(
     )
     .await?;
     tx.send_ignore(AppEvent::Agent(AgentEvent::CompactionDone(outcome.clone())));
-    config.hook_ipc.publish(
-        &config.session_id,
-        HookPoint::OnCompactionDone,
-        None,
-        crate::hooks::ipc_compaction_done_payload(
-            outcome.tokens_before,
-            outcome.tokens_after,
-            outcome.retained_event_count,
-        ),
-    );
-    crate::hooks::maybe_run_hook(
-        &config.hooks,
-        HookPoint::OnCompactionDone,
-        &config.session_id,
-        Some(crate::hooks::on_compaction_done_json(
-            outcome.tokens_before,
-            outcome.tokens_after,
-            outcome.retained_event_count,
-        )),
-        None,
-    )
-    .await;
     Ok(outcome)
 }
 
@@ -218,7 +154,7 @@ async fn stream_assistant_turn(
     tool_defs: Vec<ToolDefinition>,
     tx: &UnboundedSender<AppEvent>,
     overflow_retry_remaining: usize,
-    hook_ctx: HookDispatchContext<'_>,
+    session_id: &str,
 ) -> TurnOutcome {
     // Build a lookup from tool name → streaming_field for intent events.
     let streaming_fields: std::collections::HashMap<String, Option<String>> = tool_defs
@@ -230,7 +166,7 @@ async fn stream_assistant_turn(
         messages,
         tool_defs,
         LlmRequestContext {
-            prompt_cache_key: Some(hook_ctx.session_id.to_string()),
+            prompt_cache_key: Some(session_id.to_string()),
         },
     );
 
@@ -248,20 +184,6 @@ async fn stream_assistant_turn(
             LlmEvent::Token { text, phase } => {
                 if first_text_token {
                     first_text_token = false;
-                    hook_ctx.hook_ipc.publish(
-                        hook_ctx.session_id,
-                        HookPoint::OnFirstTextToken,
-                        None,
-                        empty_payload(),
-                    );
-                    maybe_run_hook(
-                        hook_ctx.hooks,
-                        HookPoint::OnFirstTextToken,
-                        hook_ctx.session_id,
-                        None,
-                        None,
-                    )
-                    .await;
                 }
                 tx.send_ignore(AppEvent::Agent(AgentEvent::TextToken {
                     text: text.clone(),
@@ -275,20 +197,6 @@ async fn stream_assistant_turn(
             LlmEvent::ThinkingToken(t) => {
                 if first_thinking_token {
                     first_thinking_token = false;
-                    hook_ctx.hook_ipc.publish(
-                        hook_ctx.session_id,
-                        HookPoint::OnFirstThinkingToken,
-                        None,
-                        empty_payload(),
-                    );
-                    maybe_run_hook(
-                        hook_ctx.hooks,
-                        HookPoint::OnFirstThinkingToken,
-                        hook_ctx.session_id,
-                        None,
-                        None,
-                    )
-                    .await;
                 }
                 tx.send_ignore(AppEvent::Agent(AgentEvent::ThinkingToken(t.clone())));
                 assistant_thinking
@@ -308,20 +216,6 @@ async fn stream_assistant_turn(
                 }));
                 assistant_phase = AssistantPhase::Provisional;
                 tool_intent_seen = true;
-                hook_ctx.hook_ipc.publish(
-                    hook_ctx.session_id,
-                    HookPoint::OnToolIntent,
-                    Some(&name),
-                    ipc_tool_intent_payload(&name),
-                );
-                crate::hooks::maybe_run_hook(
-                    hook_ctx.hooks,
-                    HookPoint::OnToolIntent,
-                    hook_ctx.session_id,
-                    Some(crate::hooks::tool_json(&name, &serde_json::Value::Null)),
-                    Some(&name),
-                )
-                .await;
             }
             LlmEvent::ToolCallArgsDelta { id, partial_json } => {
                 tx.send_ignore(AppEvent::Agent(AgentEvent::ToolCallArgsDelta {
@@ -341,20 +235,6 @@ async fn stream_assistant_turn(
             }
             LlmEvent::StatusUpdate(msg) => {
                 tx.send_ignore(AppEvent::Agent(AgentEvent::StatusUpdate(msg.clone())));
-                hook_ctx.hook_ipc.publish(
-                    hook_ctx.session_id,
-                    HookPoint::OnStatusUpdate,
-                    None,
-                    ipc_status_update_payload(&msg),
-                );
-                maybe_run_hook(
-                    hook_ctx.hooks,
-                    HookPoint::OnStatusUpdate,
-                    hook_ctx.session_id,
-                    Some(serde_json::json!({"status": msg})),
-                    None,
-                )
-                .await;
             }
         }
     }
@@ -405,22 +285,6 @@ async fn execute_tool_batch(
     session_events: &mut Vec<SessionEvent>,
 ) -> BatchOutcome {
     for (idx, (id, name, args)) in pending_tool_calls.iter().cloned().enumerate() {
-        // ── Pre-tool hook ────────────────────────────────────────────────────
-        config.hook_ipc.publish(
-            &config.session_id,
-            HookPoint::PreTool,
-            Some(&name),
-            ipc_pre_tool_payload(&name, &args),
-        );
-        crate::hooks::maybe_run_hook(
-            &config.hooks,
-            HookPoint::PreTool,
-            &config.session_id,
-            Some(tool_json(&name, &args)),
-            Some(&name),
-        )
-        .await;
-
         tx.send_ignore(AppEvent::Agent(AgentEvent::ToolCallStart {
             id: id.clone(),
             name: name.clone(),
@@ -438,21 +302,6 @@ async fn execute_tool_batch(
                 Some(tx.clone()),
             )
             .await;
-
-        // ── Post-tool hook ───────────────────────────────────────────────────
-        crate::hooks::maybe_run_hook(
-            &config.hooks,
-            HookPoint::PostTool,
-            &config.session_id,
-            Some(post_tool_json(
-                &name,
-                &args,
-                result.is_error,
-                result.is_truncated,
-            )),
-            Some(&name),
-        )
-        .await;
 
         tx.send_ignore(AppEvent::Agent(AgentEvent::ToolCallEnd {
             id: id.clone(),
@@ -544,29 +393,6 @@ pub async fn run_agent_loop(
             Ok(_) => {}
             Err(e) => send_compaction_failed_status(&tx, &e.message),
         }
-        // ── On-done hook (manual compaction) ─────────────────────────────────
-        config
-            .hook_ipc
-            .publish(&config.session_id, HookPoint::OnDone, None, empty_payload());
-        crate::hooks::maybe_run_hook(
-            &config.hooks,
-            HookPoint::OnDone,
-            &config.session_id,
-            None,
-            None,
-        )
-        .await;
-        config
-            .hook_ipc
-            .publish(&config.session_id, HookPoint::OnIdle, None, empty_payload());
-        crate::hooks::maybe_run_hook(
-            &config.hooks,
-            HookPoint::OnIdle,
-            &config.session_id,
-            None,
-            None,
-        )
-        .await;
         tx.send_ignore(AppEvent::Agent(AgentEvent::Done));
         return;
     }
@@ -575,20 +401,6 @@ pub async fn run_agent_loop(
         // ── Cancellation check ────────────────────────────────────────────────
         let cancel_level = *cancel_rx.borrow();
         if cancel_level >= CancelLevel::HardAbort {
-            config.hook_ipc.publish(
-                &config.session_id,
-                HookPoint::OnCancel,
-                None,
-                empty_payload(),
-            );
-            crate::hooks::maybe_run_hook(
-                &config.hooks,
-                HookPoint::OnCancel,
-                &config.session_id,
-                None,
-                None,
-            )
-            .await;
             return;
         }
 
@@ -616,20 +428,6 @@ pub async fn run_agent_loop(
                 content: notification.clone(),
                 timestamp: 0,
             });
-            config.hook_ipc.publish(
-                &config.session_id,
-                HookPoint::OnExternalChange,
-                None,
-                ipc_external_change_payload(&paths),
-            );
-            crate::hooks::maybe_run_hook(
-                &config.hooks,
-                HookPoint::OnExternalChange,
-                &config.session_id,
-                None,
-                None,
-            )
-            .await;
             tx.send_ignore(AppEvent::Agent(AgentEvent::ExternalFileChange {
                 paths,
                 notification,
@@ -637,38 +435,12 @@ pub async fn run_agent_loop(
         }
 
         // ── Insert queued steering messages ───────────────────────────────────
-        let _ = drain_steering_messages(
-            &mut steering_rx,
-            &mut session_events,
-            &tx,
-            &HookDispatchContext {
-                hooks: &config.hooks,
-                hook_ipc: &config.hook_ipc,
-                session_id: &config.session_id,
-            },
-        )
-        .await;
+        let _ = drain_steering_messages(&mut steering_rx, &mut session_events, &tx).await;
 
         // ── Build message list ────────────────────────────────────────────────
         projection.ensure_current(&session_events);
         let mut messages: Vec<Message> = config.system_prompt.iter().map(Message::system).collect();
         messages.extend_from_slice(projection.messages());
-
-        // ── Pre-turn hook ────────────────────────────────────────────────────
-        config.hook_ipc.publish(
-            &config.session_id,
-            HookPoint::PreTurn,
-            None,
-            empty_payload(),
-        );
-        crate::hooks::maybe_run_hook(
-            &config.hooks,
-            HookPoint::PreTurn,
-            &config.session_id,
-            None,
-            None,
-        )
-        .await;
 
         // ── Stream assistant turn ─────────────────────────────────────────────
         let turn = stream_assistant_turn(
@@ -677,51 +449,17 @@ pub async fn run_agent_loop(
             tool_defs.clone(),
             &tx,
             overflow_retry_remaining,
-            HookDispatchContext {
-                hooks: &config.hooks,
-                hook_ipc: &config.hook_ipc,
-                session_id: &config.session_id,
-            },
+            &config.session_id,
         )
         .await;
 
         match turn {
             TurnOutcome::Error(e) => {
-                config.hook_ipc.publish(
-                    &config.session_id,
-                    HookPoint::OnError,
-                    None,
-                    ipc_on_error_payload(&e.message, None, None),
-                );
-                crate::hooks::maybe_run_hook(
-                    &config.hooks,
-                    HookPoint::OnError,
-                    &config.session_id,
-                    Some(crate::hooks::on_error_json(&e.message, None, None)),
-                    None,
-                )
-                .await;
                 tx.send_ignore(AppEvent::Agent(AgentEvent::Error(e)));
                 return;
             }
 
             TurnOutcome::ToolIntentWithNoCall => {
-                let error_message =
-                    "Tool call was indicated but not completed (response may have been truncated).";
-                config.hook_ipc.publish(
-                    &config.session_id,
-                    HookPoint::OnError,
-                    None,
-                    ipc_on_error_payload(error_message, None, None),
-                );
-                crate::hooks::maybe_run_hook(
-                    &config.hooks,
-                    HookPoint::OnError,
-                    &config.session_id,
-                    Some(crate::hooks::on_error_json(error_message, None, None)),
-                    None,
-                )
-                .await;
                 tx.send_ignore(AppEvent::Agent(AgentEvent::Error(
                     crate::llm::ProviderError::other(
                         "agent",
@@ -786,37 +524,10 @@ pub async fn run_agent_loop(
 
                 tx.send_ignore(AppEvent::Agent(AgentEvent::TurnEnd));
 
-                // ── Post-turn hook ───────────────────────────────────────────
-                config.hook_ipc.publish(
-                    &config.session_id,
-                    HookPoint::PostTurn,
-                    None,
-                    empty_payload(),
-                );
-                crate::hooks::maybe_run_hook(
-                    &config.hooks,
-                    HookPoint::PostTurn,
-                    &config.session_id,
-                    None,
-                    None,
-                )
-                .await;
-
                 // If a steering message arrived while the LLM was generating,
                 // consume it only after the completed assistant turn has been
                 // committed via TurnEnd so transcript order remains natural.
-                if drain_steering_messages(
-                    &mut steering_rx,
-                    &mut session_events,
-                    &tx,
-                    &HookDispatchContext {
-                        hooks: &config.hooks,
-                        hook_ipc: &config.hook_ipc,
-                        session_id: &config.session_id,
-                    },
-                )
-                .await
-                {
+                if drain_steering_messages(&mut steering_rx, &mut session_events, &tx).await {
                     continue;
                 }
 
@@ -844,35 +555,6 @@ pub async fn run_agent_loop(
                     }
                 }
 
-                // ── On-done hook (final answer) ──────────────────────────────
-                config.hook_ipc.publish(
-                    &config.session_id,
-                    HookPoint::OnDone,
-                    None,
-                    empty_payload(),
-                );
-                crate::hooks::maybe_run_hook(
-                    &config.hooks,
-                    HookPoint::OnDone,
-                    &config.session_id,
-                    None,
-                    None,
-                )
-                .await;
-                config.hook_ipc.publish(
-                    &config.session_id,
-                    HookPoint::OnIdle,
-                    None,
-                    empty_payload(),
-                );
-                crate::hooks::maybe_run_hook(
-                    &config.hooks,
-                    HookPoint::OnIdle,
-                    &config.session_id,
-                    None,
-                    None,
-                )
-                .await;
                 tx.send_ignore(AppEvent::Agent(AgentEvent::Done));
                 return;
             }
@@ -899,101 +581,18 @@ pub async fn run_agent_loop(
                 config.file_tracker.lock().unwrap().refresh_baselines();
                 tx.send_ignore(AppEvent::Agent(AgentEvent::TurnEnd));
 
-                // ── Post-turn hook (tool calls) ──────────────────────────────
-                config.hook_ipc.publish(
-                    &config.session_id,
-                    HookPoint::PostTurn,
-                    None,
-                    empty_payload(),
-                );
-                crate::hooks::maybe_run_hook(
-                    &config.hooks,
-                    HookPoint::PostTurn,
-                    &config.session_id,
-                    None,
-                    None,
-                )
-                .await;
-
                 if let BatchOutcome::Cancelled = batch_outcome {
-                    config.hook_ipc.publish(
-                        &config.session_id,
-                        HookPoint::OnCancel,
-                        None,
-                        empty_payload(),
-                    );
-                    crate::hooks::maybe_run_hook(
-                        &config.hooks,
-                        HookPoint::OnCancel,
-                        &config.session_id,
-                        None,
-                        None,
-                    )
-                    .await;
-                    config.hook_ipc.publish(
-                        &config.session_id,
-                        HookPoint::OnIdle,
-                        None,
-                        empty_payload(),
-                    );
-                    crate::hooks::maybe_run_hook(
-                        &config.hooks,
-                        HookPoint::OnIdle,
-                        &config.session_id,
-                        None,
-                        None,
-                    )
-                    .await;
                     tx.send_ignore(AppEvent::Agent(AgentEvent::Done));
                     return;
                 }
 
                 // ── Soft-stop check after turn completes ─────────────────────
                 if *cancel_rx.borrow() >= CancelLevel::SoftStop {
-                    config.hook_ipc.publish(
-                        &config.session_id,
-                        HookPoint::OnDone,
-                        None,
-                        empty_payload(),
-                    );
-                    crate::hooks::maybe_run_hook(
-                        &config.hooks,
-                        HookPoint::OnDone,
-                        &config.session_id,
-                        None,
-                        None,
-                    )
-                    .await;
-                    config.hook_ipc.publish(
-                        &config.session_id,
-                        HookPoint::OnIdle,
-                        None,
-                        empty_payload(),
-                    );
-                    crate::hooks::maybe_run_hook(
-                        &config.hooks,
-                        HookPoint::OnIdle,
-                        &config.session_id,
-                        None,
-                        None,
-                    )
-                    .await;
                     tx.send_ignore(AppEvent::Agent(AgentEvent::Done));
                     return;
                 }
 
-                if drain_steering_messages(
-                    &mut steering_rx,
-                    &mut session_events,
-                    &tx,
-                    &HookDispatchContext {
-                        hooks: &config.hooks,
-                        hook_ipc: &config.hook_ipc,
-                        session_id: &config.session_id,
-                    },
-                )
-                .await
-                {
+                if drain_steering_messages(&mut steering_rx, &mut session_events, &tx).await {
                     continue;
                 }
             }

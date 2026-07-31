@@ -473,9 +473,6 @@ mod tests {
         ToolCallContext {
             id: "call_1".to_string(),
             tx,
-            hooks: std::collections::HashMap::new(),
-            hook_ipc: crate::hooks::HookIpcPublisherHandle::disabled(),
-            session_id: String::new(),
             cancel_rx: Some(cancel_rx),
         }
     }

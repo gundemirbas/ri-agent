@@ -222,8 +222,8 @@ are allowed to finish; steering does not cancel them.
 
 **`LlmProvider` trait** — all provider-specific wire formats are contained
 in `llm/*.rs`. Message serialization is centralized in
-`llm/provider_format.rs` (`to_openai_wire`, `to_anthropic_wire`,
-`to_gemini_wire`, `to_codex_wire`, `to_ollama_wire`); individual provider
+`llm/provider_format.rs` (`to_openai_wire`,
+`to_gemini_wire`, `to_ollama_wire`); individual provider
 modules delegate to the appropriate function rather than maintaining their
 own inline conversion logic. `agent/mod.rs`, `app.rs`, and `ui.rs` are
 provider-agnostic. New backends implement the trait and are registered in

@@ -13,7 +13,6 @@ use crate::agent::types::CancelLevel;
 use crate::agent::{AgentEvent, ToolOutputLog, build_system_prompt};
 use crate::app_event::AppEvent;
 use crate::auth;
-use crate::hook_ipc::HookIpcPublisherHandle;
 use crate::llm;
 use crate::provider::build_provider_for_instance;
 use crate::provider_instance::ProviderInstance;
@@ -145,8 +144,6 @@ pub(crate) async fn run_print_mode(
         manual_compaction_instructions: None,
         executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
         system_prompt: Some(system_prompt),
-        hooks: std::collections::HashMap::new(),
-        hook_ipc: HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
 
@@ -345,8 +342,6 @@ async fn run_print_mode_loop_inner(
         manual_compaction_instructions: None,
         executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
         system_prompt,
-        hooks: std::collections::HashMap::new(),
-        hook_ipc: HookIpcPublisherHandle::disabled(),
         session_id: String::new(),
     };
 

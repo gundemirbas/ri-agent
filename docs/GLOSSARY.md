@@ -25,8 +25,8 @@ One agent loop contains one or more **turns**.
 One round in the agent loop: a single **LLM invocation** followed by execution
 of any **tool calls** the model requested in that response.
 
-A turn begins at the pre-turn hook, streams tokens from the model, executes any
-tool calls sequentially, and ends with `AgentEvent::TurnEnd`. The loop then
+A turn streams tokens from the model, executes any tool calls sequentially,
+and ends with `AgentEvent::TurnEnd`. The loop then
 either begins the next turn (if tool calls were made) or terminates (if the
 model gave a final answer).
 

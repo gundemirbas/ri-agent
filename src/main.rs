@@ -37,8 +37,6 @@ mod debug_log;
 mod dirs;
 mod event_log;
 mod export;
-mod hook_ipc;
-mod hooks;
 mod input;
 mod keybindings;
 mod live_turn;
@@ -81,7 +79,6 @@ use app::App;
 use app_event::AppEvent;
 
 use config::XiConfig;
-use hook_ipc::HookIpcPublisherHandle;
 use llm::{LlmProvider, Message};
 use provider::{ThinkingSupport, build_provider_for_instance, thinking_support_for_instance};
 use provider_instance::AuthMode;
@@ -219,7 +216,6 @@ async fn main() -> io::Result<()> {
 
     let file_tracker = Arc::new(Mutex::new(build_file_tracker()));
     let tool_output_log = Arc::new(std::sync::Mutex::new(ToolOutputLog::new("init")));
-    let hook_ipc = HookIpcPublisherHandle::new(&config.hook_ipc);
 
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
@@ -239,8 +235,6 @@ async fn main() -> io::Result<()> {
             manual_compaction_instructions: None,
             executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
             system_prompt: None,
-            hooks: crate::hooks::load_hooks(&cwd, &config.hooks),
-            hook_ipc: hook_ipc.clone(),
             session_id: String::new(),
         },
         config.display.clone(),

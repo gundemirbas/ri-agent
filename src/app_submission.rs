@@ -63,15 +63,10 @@ impl App {
                 .take(),
             executor: std::sync::Arc::new({
                 let mut ex = crate::agent::DefaultToolExecutor::new();
-                ex.hooks = self.agent_config.hooks.clone();
-                ex.hook_ipc = self.agent_config.hook_ipc.clone();
-                ex.session_id = session_id.clone();
                 ex.cancel_rx = Some(cancel_rx.clone());
                 ex
             }),
             system_prompt,
-            hooks: self.agent_config.hooks.clone(),
-            hook_ipc: self.agent_config.hook_ipc.clone(),
             session_id: session_id.clone(),
         };
         let (steering_tx, steering_rx) = tokio::sync::mpsc::unbounded_channel();
