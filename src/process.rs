@@ -43,17 +43,3 @@ impl DetachFromTty for tokio::process::Command {
         }
     }
 }
-
-#[cfg(not(unix))]
-impl DetachFromTty for std::process::Command {
-    fn detach_from_tty(&mut self) -> &mut Self {
-        self
-    }
-}
-
-#[cfg(not(unix))]
-impl DetachFromTty for tokio::process::Command {
-    fn detach_from_tty(&mut self) -> &mut Self {
-        self
-    }
-}

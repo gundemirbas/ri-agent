@@ -9,16 +9,10 @@ pub fn save_atomic(path: &std::path::Path, content: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[cfg(unix)]
 fn set_secure_permissions(path: &std::path::Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_secure_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 

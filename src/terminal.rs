@@ -72,7 +72,6 @@ pub(crate) fn recreate_terminal(
     Ok(new_terminal)
 }
 
-#[cfg(unix)]
 pub(crate) fn suspend_interactive_ui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     keyboard_enhancements_enabled: bool,
@@ -98,13 +97,5 @@ pub(crate) fn suspend_interactive_ui(
         return Err(io::Error::last_os_error());
     }
 
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn suspend_interactive_ui(
-    _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    _keyboard_enhancements_enabled: bool,
-) -> io::Result<()> {
     Ok(())
 }

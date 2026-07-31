@@ -150,17 +150,11 @@ pub(super) fn parse_args<T: DeserializeOwned>(
 }
 
 pub mod ask_user;
-#[cfg(not(target_os = "windows"))]
 pub mod bash;
-#[cfg(target_os = "windows")]
-pub mod cmd;
 pub mod custom;
 pub mod edit;
-#[cfg(not(target_os = "windows"))]
 pub mod exec;
 pub mod find;
-#[cfg(target_os = "windows")]
-pub mod powershell;
 pub mod python;
 pub mod read;
 pub mod read_skill;
@@ -171,16 +165,10 @@ pub mod utf8;
 pub mod write;
 
 use ask_user::AskUserTool;
-#[cfg(not(target_os = "windows"))]
 use bash::BashTool;
-#[cfg(target_os = "windows")]
-use cmd::CmdTool;
 use edit::EditTool;
-#[cfg(not(target_os = "windows"))]
 use exec::ExecTool;
 use find::FindTool;
-#[cfg(target_os = "windows")]
-use powershell::PowerShellTool;
 use python::PythonTool;
 use read::ReadFileTool;
 use read_skill::ReadSkillTool;
@@ -212,17 +200,8 @@ pub async fn register_builtin_tools(
         )),
     ];
 
-    #[cfg(target_os = "windows")]
-    {
-        tools.push(Arc::new(PowerShellTool));
-        tools.push(Arc::new(CmdTool));
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        tools.push(Arc::new(BashTool));
-        tools.push(Arc::new(ExecTool));
-    }
+    tools.push(Arc::new(BashTool));
+    tools.push(Arc::new(ExecTool));
 
     // Detect and register the Python tool if a suitable runtime is available.
     if let Some(runtime) = python::detect_python().await {

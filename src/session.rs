@@ -247,19 +247,7 @@ fn cwd_key(cwd: &str) -> String {
 }
 
 fn normalize_cwd_for_match(cwd: &str) -> String {
-    #[cfg(windows)]
-    {
-        let mut out = cwd.replace('/', "\\").to_ascii_lowercase();
-        while out.ends_with('\\') && out.len() > 3 {
-            out.pop();
-        }
-        out
-    }
-
-    #[cfg(not(windows))]
-    {
-        cwd.to_string()
-    }
+    cwd.to_string()
 }
 
 fn decode_cwd_key(key: &str) -> Option<String> {

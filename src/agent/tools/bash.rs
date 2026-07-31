@@ -63,7 +63,7 @@ impl Tool for BashTool {
     }
 }
 
-#[cfg(all(test, not(target_os = "windows")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::types::Tool;

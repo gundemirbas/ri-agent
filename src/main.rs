@@ -410,11 +410,6 @@ async fn run(
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(320));
     tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Timestamp of the most recent key Press event other than Enter itself.
-    // Used on Windows to detect paste-injected Enter events (see above).
-    #[cfg(windows)]
-    let mut last_key_at: Option<std::time::Instant> = None;
-
     // Draw unconditionally on the first iteration; subsequent draws are only
     // performed when something actually changed (dirty flag).
     let mut needs_redraw = true;
@@ -438,14 +433,7 @@ async fn run(
                 needs_redraw = true;
                 match ev {
                     Event::Key(key) => {
-                        if let Some(result) = handle_key_event(
-                            app,
-                            provider,
-                            config,
-                            key,
-                            #[cfg(windows)]
-                            &mut last_key_at,
-                        ) {
+                        if let Some(result) = handle_key_event(app, provider, config, key) {
                             if matches!(result, RunResult::Suspend) {
                                 drop(crossterm_events);
                             }

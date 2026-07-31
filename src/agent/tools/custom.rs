@@ -205,19 +205,11 @@ fn load_tool_from_executable(path: &std::path::Path) -> Option<CustomTool> {
 
 // ── Platform helpers ──────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.metadata()
         .map(|m| m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &std::path::Path) -> bool {
-    // On Windows, rely on the OS to decide via file extension (.exe, .cmd, etc.)
-    // We include all regular files and let Command::spawn fail gracefully.
-    path.exists()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

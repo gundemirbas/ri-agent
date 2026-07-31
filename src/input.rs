@@ -52,21 +52,6 @@ pub(crate) enum KeyDispatch {
     Return(RunResult),
 }
 
-// ── Windows-only paste heuristic ─────────────────────────────────────────────
-
-/// Timing threshold (milliseconds) used to distinguish paste-injected Enter
-/// events from real Enter keypresses on Windows terminals that don't support
-/// bracketed paste.  Paste events arrive in sub-millisecond bursts while human
-/// typing always has gaps >20 ms.
-///
-/// Set to `Some(10)` to enable the heuristic, or `None` to disable it.
-/// `ENABLE_VIRTUAL_TERMINAL_INPUT` has no effect on crossterm's Windows event
-/// source because it uses `ReadConsoleInputW` (raw INPUT_RECORDs), not
-/// `ReadFile`/`ReadConsole` (VT sequences).  The timing heuristic is therefore
-/// the correct fallback for terminals that deliver paste as individual key events.
-#[cfg(windows)]
-const PASTE_ENTER_THRESHOLD_MS: Option<u128> = Some(10);
-
 // ── Helper functions ──────────────────────────────────────────────────────────
 
 pub(crate) fn normalize_paste_text(text: &str) -> String {
@@ -145,7 +130,6 @@ pub(crate) fn handle_key_event(
     provider: &Arc<dyn LlmProvider + Send + Sync>,
     config: &XiConfig,
     key: KeyEvent,
-    #[cfg(windows)] last_key_at: &mut Option<std::time::Instant>,
 ) -> Option<RunResult> {
     // On Windows with keyboard enhancement flags enabled,
     // Crossterm can emit both Press and Release key events.
@@ -154,32 +138,14 @@ pub(crate) fn handle_key_event(
         return None;
     }
 
-    // Record the time of every non-Enter key press so we
-    // can detect paste-injected Enter events below.
-    #[cfg(windows)]
-    if key.code != KeyCode::Enter {
-        *last_key_at = Some(std::time::Instant::now());
-    }
-
-    match handle_global_key_shortcuts(
-        app,
-        provider,
-        key,
-        #[cfg(windows)]
-        last_key_at,
-    ) {
+    match handle_global_key_shortcuts(app, provider, key) {
         KeyDispatch::NotHandled => {}
         KeyDispatch::Continue => return None,
         KeyDispatch::Return(result) => return Some(result),
     }
 
     if app.input_mode == InputMode::Shell {
-        return match handle_shell_mode_key(
-            app,
-            key,
-            #[cfg(windows)]
-            last_key_at.as_ref(),
-        ) {
+        return match handle_shell_mode_key(app, key) {
             KeyDispatch::NotHandled | KeyDispatch::Continue => None,
             KeyDispatch::Return(result) => Some(result),
         };
@@ -192,14 +158,7 @@ pub(crate) fn handle_key_event(
         };
     }
 
-    match handle_chat_mode_key(
-        app,
-        provider,
-        config,
-        key,
-        #[cfg(windows)]
-        last_key_at.as_ref(),
-    ) {
+    match handle_chat_mode_key(app, provider, config, key) {
         KeyDispatch::NotHandled | KeyDispatch::Continue => None,
         KeyDispatch::Return(result) => Some(result),
     }
@@ -209,7 +168,6 @@ fn handle_global_key_shortcuts(
     app: &mut App,
     _provider: &Arc<dyn LlmProvider + Send + Sync>,
     key: KeyEvent,
-    #[cfg(windows)] _last_key_at: &mut Option<std::time::Instant>,
 ) -> KeyDispatch {
     if keybindings::matches(KeyBindingId::ShowHelp, key) {
         if app.selection.kind == Some(crate::selection_state::SelectionKind::KeybindingHelp) {
@@ -367,11 +325,7 @@ fn handle_global_key_shortcuts(
     KeyDispatch::NotHandled
 }
 
-fn handle_shell_mode_key(
-    app: &mut App,
-    key: KeyEvent,
-    #[cfg(windows)] last_key_at: Option<&std::time::Instant>,
-) -> KeyDispatch {
+fn handle_shell_mode_key(app: &mut App, key: KeyEvent) -> KeyDispatch {
     if keybindings::matches(KeyBindingId::CycleShell, key) {
         app.cycle_shell();
         return KeyDispatch::Continue;
@@ -381,13 +335,6 @@ fn handle_shell_mode_key(
         KeyCode::Esc => app.exit_shell_mode(),
         KeyCode::Backspace if app.shell_input_is_empty() => app.exit_shell_mode(),
         KeyCode::Enter if key.modifiers.is_empty() => {
-            #[cfg(windows)]
-            if let (Some(threshold), Some(t)) = (PASTE_ENTER_THRESHOLD_MS, last_key_at)
-                && t.elapsed().as_millis() < threshold
-            {
-                app.shell.textarea.insert_newline();
-                return KeyDispatch::Continue;
-            }
             app.submit_shell_command();
         }
         _ => {
@@ -603,7 +550,6 @@ fn handle_chat_mode_key(
     provider: &Arc<dyn LlmProvider + Send + Sync>,
     config: &XiConfig,
     key: KeyEvent,
-    #[cfg(windows)] last_key_at: Option<&std::time::Instant>,
 ) -> KeyDispatch {
     if key.code == KeyCode::Esc {
         app.handle_escape_in_chat_mode();
@@ -660,15 +606,6 @@ fn handle_chat_mode_key(
             }
         }
         KeyCode::Enter if key.modifiers.is_empty() => {
-            #[cfg(windows)]
-            if let (Some(threshold), Some(t)) = (PASTE_ENTER_THRESHOLD_MS, last_key_at)
-                && t.elapsed().as_millis() < threshold
-            {
-                app.textarea.insert_newline();
-                app.update_completions();
-                return KeyDispatch::Continue;
-            }
-
             return handle_chat_submit(app, provider, config);
         }
         KeyCode::Enter if key.modifiers == KeyModifiers::SHIFT => {

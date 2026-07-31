@@ -42,8 +42,6 @@ use crate::process::DetachFromTty;
 pub struct SubprocessCommand {
     program: String,
     args: Vec<String>,
-    #[cfg(target_os = "windows")]
-    raw_args: Vec<String>,
     envs: HashMap<String, String>,
     current_dir: Option<String>,
     stdin_data: Option<Vec<u8>>,
@@ -79,8 +77,6 @@ impl SubprocessCommand {
         Self {
             program: program.into(),
             args: Vec::new(),
-            #[cfg(target_os = "windows")]
-            raw_args: Vec::new(),
             envs: HashMap::new(),
             current_dir: None,
             stdin_data: None,
@@ -95,7 +91,6 @@ impl SubprocessCommand {
     }
 
     /// Append multiple arguments.
-    #[cfg(not(target_os = "windows"))]
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -105,20 +100,7 @@ impl SubprocessCommand {
         self
     }
 
-    /// Append a raw argument using platform-specific native command-line
-    /// handling.
-    ///
-    /// Maps to `tokio::process::Command::raw_arg`, which is needed for
-    /// commands like `cmd.exe /S /C` where quoting semantics must be
-    /// preserved exactly.
-    #[cfg(target_os = "windows")]
-    pub fn raw_arg(mut self, arg: impl Into<String>) -> Self {
-        self.raw_args.push(arg.into());
-        self
-    }
-
     /// Set an environment variable (merged with the inherited environment).
-    #[cfg(not(target_os = "windows"))]
     pub fn env(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
         self.envs.insert(key.into(), val.into());
         self
@@ -172,11 +154,6 @@ impl SubprocessCommand {
             cmd.env(k, v);
         }
 
-        #[cfg(target_os = "windows")]
-        for raw_arg in &self.raw_args {
-            cmd.raw_arg(raw_arg);
-        }
-
         if let Some(ref dir) = self.current_dir {
             cmd.current_dir(dir);
         }
@@ -212,7 +189,6 @@ impl SubprocessCommand {
         let mut cancel_rx = cancel_rx_opt.expect("checked is_some");
 
         // Cancel-aware path: race output collection against cancel signal.
-        #[cfg(unix)]
         let child_pid = child.id().map(|id| id as i32);
         let ctx_tx = ctx.tx.clone();
 
@@ -335,9 +311,6 @@ async fn collect_output_inner(
     #[cfg(unix)]
     let (out_bytes, err_bytes, exit_code, signal) = collect_unix(child, ctx).await;
 
-    #[cfg(not(unix))]
-    let (out_bytes, err_bytes, exit_code) = collect_other(child, ctx).await;
-
     let stdout = apply_terminal_render(&String::from_utf8_lossy(&out_bytes))
         .trim_end()
         .to_string();
@@ -368,15 +341,6 @@ fn annotate_termination_result(
                 ToolResult::err("killed by user (SIGKILL)")
             }
             _ => outcome.result,
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        match termination_requested {
-            Some(RequestedTermination::Sigterm) => ToolResult::err("killed by user"),
-            Some(RequestedTermination::Sigkill) => ToolResult::err("killed by user"),
-            None => outcome.result,
         }
     }
 }
@@ -488,27 +452,6 @@ async fn collect_unix(
     let exit_code = status.code().unwrap_or(-1);
     let signal = status.signal();
     (out_buf, err_buf, exit_code, signal)
-}
-
-// ── Non-Unix: simple wait_with_output ────────────────────────────────────────
-
-#[cfg(not(unix))]
-async fn collect_other(
-    child: tokio::process::Child,
-    ctx: &ToolCallContext,
-) -> (Vec<u8>, Vec<u8>, i32) {
-    match child.wait_with_output().await {
-        Ok(output) => {
-            send_chunk(ctx, &output.stdout);
-            send_chunk(ctx, &output.stderr);
-            let exit_code = output.status.code().unwrap_or(-1);
-            (output.stdout, output.stderr, exit_code)
-        }
-        Err(e) => {
-            log::debug!("collect_other: wait_with_output failed: {e}");
-            (Vec::new(), Vec::new(), -1)
-        }
-    }
 }
 
 #[cfg(test)]

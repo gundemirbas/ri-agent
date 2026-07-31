@@ -1088,22 +1088,6 @@ async fn agent_loop_cancel_after_tool_call_stops_before_next_turn() {
 
 #[tokio::test]
 async fn post_turn_hook_fires_after_final_answer() {
-    // Skip on cross-compiled Windows tests under wine where powershell.exe
-    // and cmd.exe are not functional.
-    #[cfg(windows)]
-    {
-        let ok = std::process::Command::new("powershell.exe")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg("Write-Output ok")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "ok")
-            .unwrap_or(false);
-        if !ok {
-            return;
-        }
-    }
-
     use crate::hooks::{HookConfig, HookPoint};
     use std::collections::HashMap;
 
@@ -1148,21 +1132,6 @@ fn post_turn_test_hook_args(path: &std::path::Path) -> Vec<String> {
     vec![
         "-c".into(),
         format!("printf 'HOOK OK' > '{}'", path.display()),
-    ]
-}
-
-#[cfg(windows)]
-fn post_turn_test_hook_program() -> &'static str {
-    "powershell.exe"
-}
-
-#[cfg(windows)]
-fn post_turn_test_hook_args(path: &std::path::Path) -> Vec<String> {
-    let escaped = path.display().to_string().replace('\'', "''");
-    vec![
-        "-NoProfile".into(),
-        "-Command".into(),
-        format!("Set-Content -Path '{escaped}' -Value 'HOOK OK'"),
     ]
 }
 

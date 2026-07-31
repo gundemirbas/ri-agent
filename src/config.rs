@@ -15,15 +15,7 @@ pub struct HookIpcConfig {
 
 impl HookIpcConfig {
     pub fn default_endpoint() -> &'static str {
-        #[cfg(windows)]
-        {
-            r#"\\.\pipe\xi-hook-events"#
-        }
-
-        #[cfg(unix)]
-        {
-            "/tmp/xi-hook-events.sock"
-        }
+        "/tmp/xi-hook-events.sock"
     }
 
     pub fn effective_endpoint(&self) -> String {
