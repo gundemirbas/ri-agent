@@ -1,17 +1,17 @@
 [package]
-name = "xi-agent"
+name = "ri-agent"
 version = "0.5.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "A focused AI agent for the terminal"
-repository = "https://github.com/larsch/xi-agent"
+repository = "https://github.com/gundemirbas/ri-agent"
 readme = "README.md"
 keywords = ["ai", "agent", "terminal", "llm", "cli"]
 categories = ["command-line-utilities"]
 exclude = [".github/", "docs/", "AGENTS.md"]
 
 [[bin]]
-name = "xi"
+name = "ri"
 path = "src/main.rs"
 
 [dependencies]

@@ -10,13 +10,13 @@ describes the file format, all available options, and how to select a theme.
 The default theme file is:
 
 ```
-~/.config/xi/theme.toml
+~/.config/ri/theme.toml
 ```
 
 You can also point Xi at a different file in two ways:
 
 1. **CLI flag** — pass `--theme <path>` when starting Xi.
-2. **config.toml** — set `theme = "<path>"` in `~/.config/xi/config.toml`.
+2. **config.toml** — set `theme = "<path>"` in `~/.config/ri/config.toml`.
 
 All fields in `theme.toml` are optional. Missing fields fall back to Xi's
 built-in defaults, so you only need to specify the values you want to change.

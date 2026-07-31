@@ -2,11 +2,11 @@
 
 ## Purpose
 
-This document defines xi-agent's backend model.
+This document defines ri-agent's backend model.
 
 It specifies:
 
-- the domain concepts xi-agent uses for backend integrations
+- the domain concepts ri-agent uses for backend integrations
 - the relationship between provider, service, API, endpoint, preset, and instance
 - how the interactive UI presents those concepts
 - how configuration represents those concepts
@@ -37,7 +37,7 @@ Examples:
 
 ### Service
 
-A **service** is the backend product or software xi-agent talks to.
+A **service** is the backend product or software ri-agent talks to.
 
 A service defines:
 
@@ -63,7 +63,7 @@ A service may be:
 
 ### API
 
-An **API** is the protocol surface xi-agent uses to communicate with a service.
+An **API** is the protocol surface ri-agent uses to communicate with a service.
 
 Examples:
 
@@ -79,11 +79,11 @@ The API determines:
 - response shape
 - streaming format
 - tool-calling behavior
-- model selection semantics exposed to xi-agent
+- model selection semantics exposed to ri-agent
 
 ### Endpoint
 
-An **endpoint** is the concrete URL where xi-agent reaches an API.
+An **endpoint** is the concrete URL where ri-agent reaches an API.
 
 Examples:
 
@@ -99,7 +99,7 @@ An endpoint is either:
 
 ### Provider preset
 
-A **provider preset** is xi-agent's built-in definition of a recognized backend kind.
+A **provider preset** is ri-agent's built-in definition of a recognized backend kind.
 
 A provider preset defines:
 
@@ -128,7 +128,7 @@ Examples of provider presets:
 
 ### Provider instance
 
-A **provider instance** is one configured, selectable backend entry in xi-agent.
+A **provider instance** is one configured, selectable backend entry in ri-agent.
 
 A provider instance contains:
 
@@ -213,7 +213,7 @@ The preset identifies which provider the user is choosing.
 
 ### Service identity
 
-The preset identifies which backend product or software xi-agent is speaking to.
+The preset identifies which backend product or software ri-agent is speaking to.
 
 ### API set
 
@@ -352,7 +352,7 @@ Built-in hosted providers are always available from the static backend catalog.
 They do not need to be stored in config to appear in the provider picker.
 
 When the user configures a built-in provider (by selecting a model or providing
-credentials), xi-agent persists the instance to config as a normal provider
+credentials), ri-agent persists the instance to config as a normal provider
 entry. On subsequent runs, the persisted entry overrides the catalog default.
 
 ### Custom instances
@@ -453,7 +453,7 @@ Semantics:
 - UI presence: built-in provider instance in the main provider picker
 
 Provider selection and API behavior are distinct for Copilot. The user selects
-Copilot as a provider instance, while xi-agent applies backend-specific routing
+Copilot as a provider instance, while ri-agent applies backend-specific routing
 rules internally.
 
 ### Codex

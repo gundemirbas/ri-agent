@@ -82,7 +82,7 @@ impl RigOpenAiProvider {
 
 // ── Message conversion ────────────────────────────────────────────────────────
 
-/// Convert a xi-agent [`Message`] history to rig's typed messages.
+/// Convert a ri-agent [`Message`] history to rig's typed messages.
 ///
 /// Mirrors the grouping used by the OpenAI wire format: an assistant message
 /// is merged with its immediately following tool-call messages into a single
@@ -159,7 +159,7 @@ pub(crate) fn to_rig_messages(messages: &[Message]) -> Vec<RigMessage> {
     out
 }
 
-/// Convert xi-agent [`ToolDefinition`]s to rig's typed tool definitions.
+/// Convert ri-agent [`ToolDefinition`]s to rig's typed tool definitions.
 pub(crate) fn to_rig_tools(tools: &[ToolDefinition]) -> Vec<RigToolDefinition> {
     tools
         .iter()
@@ -171,7 +171,7 @@ pub(crate) fn to_rig_tools(tools: &[ToolDefinition]) -> Vec<RigToolDefinition> {
         .collect()
 }
 
-/// Map rig token usage onto xi-agent [`UsageStats`].
+/// Map rig token usage onto ri-agent [`UsageStats`].
 fn to_usage_stats(u: &RigUsage) -> UsageStats {
     UsageStats {
         input_tokens: (u.input_tokens > 0).then_some(u.input_tokens as usize),
@@ -181,7 +181,7 @@ fn to_usage_stats(u: &RigUsage) -> UsageStats {
     }
 }
 
-/// Convert a rig completion error into a xi-agent [`ProviderError`].
+/// Convert a rig completion error into a ri-agent [`ProviderError`].
 ///
 /// Preserves the HTTP status (recoverable from rig's transport errors) so the
 /// UI can render provider-appropriate messages for auth, rate-limit, and server

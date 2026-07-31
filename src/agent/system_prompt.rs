@@ -27,11 +27,11 @@ pub enum AgentsKind {
 
 /// Read the first existing AGENTS.md candidate from a base directory.
 ///
-/// Priority: `.xi/AGENTS.md` → `.agents/AGENTS.md` → `AGENTS.md`.
+/// Priority: `.ri/AGENTS.md` → `.agents/AGENTS.md` → `AGENTS.md`.
 /// Returns `Some((path, content))` for the first match, or `None` if none exist.
 fn read_directory_agents(base: &Path) -> Option<(std::path::PathBuf, String)> {
     let candidates = [
-        base.join(".xi/AGENTS.md"),
+        base.join(".ri/AGENTS.md"),
         base.join(".agents/AGENTS.md"),
         base.join("AGENTS.md"),
     ];

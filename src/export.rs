@@ -10,7 +10,7 @@ use pulldown_cmark::{Options, Parser, html};
 use crate::llm::{AssistantPhase, Message, Role};
 
 pub fn default_export_filename() -> String {
-    format!("xi-session-{}.html", Utc::now().format("%Y%m%d-%H%M%S"))
+    format!("ri-session-{}.html", Utc::now().format("%Y%m%d-%H%M%S"))
 }
 
 pub fn resolve_export_path(cwd: &str, requested: Option<&str>) -> PathBuf {
@@ -46,10 +46,10 @@ pub fn build_session_export_html(
 
     out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
-    out.push_str("<title>xi-agent session export</title>\n<style>\n");
+    out.push_str("<title>ri-agent session export</title>\n<style>\n");
     out.push_str("*{box-sizing:border-box}body{margin:0;padding:0;background:#0b1020;color:#e6edf3;font:15px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Helvetica,Arial,sans-serif}main{max-width:980px;margin:0 auto;padding:24px}h1{margin:0 0 8px;font-size:22px}header{position:sticky;top:0;background:linear-gradient(180deg,#0b1020 85%,rgba(11,16,32,0));padding-bottom:12px;margin-bottom:8px}.meta{color:#9fb0c3;font-size:13px}.list{display:flex;flex-direction:column;gap:12px}.msg{border:1px solid #243047;border-radius:10px;overflow:hidden;background:#11182b}.msg .head{display:flex;justify-content:space-between;gap:8px;padding:8px 12px;font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#9fb0c3;border-bottom:1px solid #243047}.msg .body{padding:12px;word-break:break-word}.msg.user{border-color:#355783}.msg.user .head{background:#12213a}.msg.assistant{border-color:#265b4b}.msg.assistant .head{background:#102821}.msg.system{border-color:#5e4f1a}.msg.system .head{background:#2a220d}.msg.tool-call{border-color:#61408a}.msg.tool-call .head{background:#25153d}.msg.tool-result{border-color:#4b5f23}.msg.tool-result .head{background:#1b260f}.thinking{margin:0 0 10px;padding:10px;border-radius:8px;background:#1a2239;color:#b9c8d8;white-space:pre-wrap}.badge{padding:2px 8px;border-radius:999px;background:#2b3a56;color:#dbe7f3;font-size:11px}.muted{color:#9fb0c3}.markdown{line-height:1.6}.markdown p{margin:.4em 0 .8em}.markdown pre,.tool-output{margin:.6em 0;background:#0f172a;border:1px solid #22304f;border-radius:8px;padding:10px;overflow:auto}.markdown code,.tool-output{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.markdown :not(pre)>code{background:#16213b;padding:1px 4px;border-radius:4px}.markdown blockquote{margin:.5em 0;padding:.3em .8em;border-left:3px solid #37507a;color:#b9c8d8}.markdown table{border-collapse:collapse;display:block;overflow:auto}.markdown th,.markdown td{border:1px solid #32435f;padding:4px 8px}.markdown a{color:#8dc2ff}.tool-json{margin-top:6px}.tool-json pre{margin:.4em 0;background:#0f172a;border:1px solid #22304f;border-radius:8px;padding:10px;overflow:auto;white-space:pre-wrap}@media (max-width:640px){main{padding:14px}}\n");
     out.push_str("</style>\n</head>\n<body>\n<main>\n<header>\n");
-    out.push_str("<h1>xi-agent session export</h1>\n<div class=\"meta\">\n");
+    out.push_str("<h1>ri-agent session export</h1>\n<div class=\"meta\">\n");
     let _ = writeln!(out, "Generated: {}<br>", escape_html(&generated_local));
     let _ = writeln!(out, "Working directory: {}<br>", escape_html(cwd));
     let _ = writeln!(

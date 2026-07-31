@@ -2491,6 +2491,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "ri-agent"
+version = "0.5.0"
+dependencies = [
+ "ammonia",
+ "anyhow",
+ "async-stream",
+ "base64",
+ "chrono",
+ "clap",
+ "crossterm",
+ "csscolorparser 0.8.3",
+ "directories",
+ "futures-util",
+ "getrandom 0.2.17",
+ "globset",
+ "http",
+ "ignore",
+ "jawohl",
+ "libc",
+ "log",
+ "pulldown-cmark",
+ "ratatui",
+ "ratatui-textarea",
+ "reqwest",
+ "rig-core",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2",
+ "shlex 1.3.0",
+ "similar",
+ "tempfile",
+ "textwrap",
+ "tokio",
+ "toml",
+ "unicode-width",
+ "urlencoding",
+ "wiremock",
+]
+
+[[package]]
 name = "rig-core"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4200,47 +4241,6 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
-
-[[package]]
-name = "xi-agent"
-version = "0.5.0"
-dependencies = [
- "ammonia",
- "anyhow",
- "async-stream",
- "base64",
- "chrono",
- "clap",
- "crossterm",
- "csscolorparser 0.8.3",
- "directories",
- "futures-util",
- "getrandom 0.2.17",
- "globset",
- "http",
- "ignore",
- "jawohl",
- "libc",
- "log",
- "pulldown-cmark",
- "ratatui",
- "ratatui-textarea",
- "reqwest",
- "rig-core",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "sha2",
- "shlex 1.3.0",
- "similar",
- "tempfile",
- "textwrap",
- "tokio",
- "toml",
- "unicode-width",
- "urlencoding",
- "wiremock",
-]
 
 [[package]]
 name = "yoke"

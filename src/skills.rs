@@ -22,11 +22,11 @@ pub struct SkillMeta {
 /// `SKILL.md` with YAML frontmatter.
 ///
 /// Skill roots:
-/// - `~/.xi/skills`
+/// - `~/.ri/skills`
 /// - `~/.agents/skills`
 /// - `%USERPROFILE%\\.agents\\skills` (Windows)
 /// - `./.agents/skills`
-/// - `./.xi/skills`
+/// - `./.ri/skills`
 ///
 /// Also injects the embedded `edit_skill` that tells the model where skill
 /// files live on this system and where to create new ones.
@@ -41,7 +41,7 @@ pub fn load_skills() -> Vec<SkillMeta> {
 
 /// Build the embedded `edit_skill` with a body that lists:
 /// - all loaded skill files with absolute paths
-/// - the skill root directories where xi searches
+/// - the skill root directories where ri searches
 /// - guidance for modifying existing skills and creating new ones
 fn build_embedded_edit_skill(loaded: &[SkillMeta]) -> SkillMeta {
     let dirs = skill_dirs();
@@ -163,7 +163,7 @@ fn build_embedded_edit_skill(loaded: &[SkillMeta]) -> SkillMeta {
 
 ## Skill search directories
 
-xi searches these directories recursively for subdirectories containing
+ri searches these directories recursively for subdirectories containing
 `SKILL.md` files. Directories that don't exist are silently skipped.
 Directories marked \"← in use\" currently contain skill files.
 
@@ -171,7 +171,7 @@ Directories marked \"← in use\" currently contain skill files.
 
 ## Currently loaded skills
 
-These are the skill files xi found at startup (absolute paths):
+These are the skill files ri found at startup (absolute paths):
 
 {skills_section}
 
@@ -222,7 +222,7 @@ fn skill_dirs() -> Vec<PathBuf> {
 
     if let Some(home) = env::var_os("HOME").filter(|s| !s.is_empty()) {
         let home = PathBuf::from(home);
-        dirs.push(home.join(".xi").join("skills"));
+        dirs.push(home.join(".ri").join("skills"));
         dirs.push(home.join(".agents").join("skills"));
     }
 
@@ -234,7 +234,7 @@ fn skill_dirs() -> Vec<PathBuf> {
 
     if let Ok(cwd) = env::current_dir() {
         dirs.push(cwd.join(".agents").join("skills"));
-        dirs.push(cwd.join(".xi").join("skills"));
+        dirs.push(cwd.join(".ri").join("skills"));
     }
 
     dirs

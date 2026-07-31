@@ -142,7 +142,7 @@ pub struct OpenAiConfig {
 }
 
 impl XiConfig {
-    /// Load from $XDG_CONFIG_HOME/xi/config.toml (or ~/.config/xi/config.toml).
+    /// Load from $XDG_CONFIG_HOME/ri/config.toml (or ~/.config/ri/config.toml).
     /// Missing file is not an error and returns `Default`.
     pub fn load() -> anyhow::Result<Self> {
         let path = config_path()?;

@@ -737,7 +737,7 @@ fn handle_slash_submit(
         Some(CommandAction::AgentNoArg) => {
             if app.primary_agents().is_empty() {
                 app.push_notice(Message::assistant(
-                    "[no agents defined — create an AGENT.md in ~/.xi/agents/<name>/]".to_string(),
+                    "[no agents defined — create an AGENT.md in ~/.ri/agents/<name>/]".to_string(),
                 ));
             } else {
                 app.enter_agent_selection_mode();

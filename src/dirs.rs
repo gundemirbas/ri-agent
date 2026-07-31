@@ -8,14 +8,14 @@ use directories::ProjectDirs;
 /// `None` only when the platform cannot resolve a home directory (extremely
 /// rare in practice).
 pub static PROJECT_DIRS: LazyLock<Option<ProjectDirs>> =
-    LazyLock::new(|| ProjectDirs::from("", "", "xi"));
+    LazyLock::new(|| ProjectDirs::from("", "", "ri"));
 
 /// Returns a reference to the shared [`ProjectDirs`], or an error if the
 /// platform failed to resolve a home directory.
 pub fn project_dirs() -> anyhow::Result<&'static ProjectDirs> {
     PROJECT_DIRS
         .as_ref()
-        .context("Could not resolve platform directories for xi")
+        .context("Could not resolve platform directories for ri")
 }
 
 /// Print all paths ri uses to stdout, one labelled entry per line.
@@ -37,25 +37,25 @@ pub fn print_dirs() {
         }),
         (
             "logs",
-            "xi-debug-*   — debug logs (enabled by XI_DEBUG=1)",
+            "ri-debug-*   — debug logs (enabled by RI_DEBUG=1)",
             &|| dirs.cache_dir().to_path_buf(),
         ),
         (
             "tools (1)",
-            "~/.xi/tools/   — user-defined tools (home)",
+            "~/.ri/tools/   — user-defined tools (home)",
             &|| {
                 std::env::var_os("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".xi").join("tools"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("~/.xi/tools"))
+                    .map(|h| std::path::PathBuf::from(h).join(".ri").join("tools"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("~/.ri/tools"))
             },
         ),
         (
             "tools (2)",
-            ".xi/tools/     — user-defined tools (project-local)",
+            ".ri/tools/     — user-defined tools (project-local)",
             &|| {
                 std::env::current_dir()
-                    .map(|d| d.join(".xi").join("tools"))
-                    .unwrap_or_else(|_| std::path::PathBuf::from(".xi/tools"))
+                    .map(|d| d.join(".ri").join("tools"))
+                    .unwrap_or_else(|_| std::path::PathBuf::from(".ri/tools"))
             },
         ),
         (

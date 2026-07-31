@@ -77,7 +77,7 @@ impl Tool for AskUserTool {
                 },
                 "allowMultiple": {
                     "type": "boolean",
-                    "description": "Whether multiple options may be selected (currently ignored in xi-agent UI)"
+                    "description": "Whether multiple options may be selected (currently ignored in ri-agent UI)"
                 },
                 "allowFreeform": {
                     "type": "boolean",

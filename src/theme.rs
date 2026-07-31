@@ -2,7 +2,7 @@
 //!
 //! All visual style choices — colors, symbols, padding, margins — are
 //! expressed as a [`Theme`] struct that is loaded from
-//! `~/.config/xi/theme.toml` (or a path supplied via `--theme`).
+//! `~/.config/ri/theme.toml` (or a path supplied via `--theme`).
 //!
 //! Every field is optional in the TOML file; missing values fall back to
 //! [`Theme::default()`], which reproduces Xi's built-in appearance.

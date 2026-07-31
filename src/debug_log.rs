@@ -15,7 +15,7 @@ static LOG_INITIALIZED: OnceLock<()> = OnceLock::new();
 static WRITER: OnceLock<Mutex<BufWriter<File>>> = OnceLock::new();
 
 fn is_enabled() -> bool {
-    *LOG_ENABLED.get_or_init(|| match std::env::var("XI_DEBUG") {
+    *LOG_ENABLED.get_or_init(|| match std::env::var("RI_DEBUG") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v.is_empty() || v == "0" || v == "false" || v == "off")
@@ -72,7 +72,7 @@ pub fn init_logging() {
         return;
     };
     let timestamp = Local::now().format("%Y%m%d-%H%M%S");
-    let log_path = dirs.cache_dir().join(format!("xi-debug-{timestamp}.jsonl"));
+    let log_path = dirs.cache_dir().join(format!("ri-debug-{timestamp}.jsonl"));
 
     if let Some(parent) = log_path.parent()
         && fs::create_dir_all(parent).is_err()

@@ -79,7 +79,7 @@ pub(crate) const KEYBINDINGS: &[KeyBinding] = &[
         id: Some(KeyBindingId::Suspend),
         shortcut: "Ctrl+Z",
         context: BindingContext::Global,
-        description: "Suspend xi when the UI and agent loop are idle",
+        description: "Suspend ri when the UI and agent loop are idle",
     },
     KeyBinding {
         id: Some(KeyBindingId::EndInput),

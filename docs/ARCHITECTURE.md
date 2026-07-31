@@ -6,7 +6,7 @@
 
 ## Purpose
 
-`xi-agent` is a terminal AI agent harness. It provides a streaming TUI for
+`ri-agent` is a terminal AI agent harness. It provides a streaming TUI for
 conversational interaction with LLMs and runs the full agentic loop: user
 message → model response → tool call → tool result → model continues,
 until the model returns a final answer without tool calls.
@@ -278,14 +278,14 @@ backend route is chosen per model (`gpt-5`/Codex-style models use Responses;
 chat-completions and Anthropic-routed models do not currently map thinking).
 
 **Custom user tools** — at startup (and on `/reload`), `load_custom_tools`
-scans three directories in order: `~/.xi/tools/`, `./.xi/tools/` (project-
+scans three directories in order: `~/.ri/tools/`, `./.ri/tools/` (project-
 local), and `ProjectDirs::config_dir()/tools/`. Each executable that responds
 to `--describe` with a valid JSON descriptor (`name`, `description`,
 `parameters_schema`) is registered as a `CustomTool`. At invocation, JSON
 args are written to the process stdin; stdout is the result string; non-zero
 exit becomes `ToolResult::err`. Built-in tool names take precedence — a
 custom tool whose name collides with a built-in is silently dropped (logged
-at debug). All three tool directories are shown in `xi --print-dirs`.
+at debug). All three tool directories are shown in `ri --print-dirs`.
 
 **Bash tool terminal rendering** — `apply_terminal_render()` in
 `agent/tools/terminal.rs` emulates terminal cursor behavior for carriage
@@ -325,7 +325,7 @@ marker.
 
 Compaction uses two token measures:
 - provider-reported turn usage when available for trigger decisions
-- xi-estimated current context size (`chars / 4`) for cut-point selection and
+- ri-estimated current context size (`chars / 4`) for cut-point selection and
   before/after reporting
 
 The compaction algorithm preserves recent history verbatim, respects
@@ -336,7 +336,7 @@ summary prompt.
 
 ## User-definable agents
 
-xi-agent supports user-definable agent profiles via filesystem-based
+ri-agent supports user-definable agent profiles via filesystem-based
 agent directories. Each agent customises the system prompt, available tools,
 available skills, and can optionally override the global AGENTS.md
 instructions.
@@ -344,8 +344,8 @@ instructions.
 ### Agent discovery
 
 Agents are discovered from:
-- `~/.xi/agents/<name>/` (global)
-- `.xi/agents/<name>/` (project-local)
+- `~/.ri/agents/<name>/` (global)
+- `.ri/agents/<name>/` (project-local)
 
 Project-local agents shadow global agents with the same name. Discovery is
 recursive — nested subdirectories under an agent root are scanned.
@@ -375,7 +375,7 @@ For backwards compatibility, `AGENT.md` is used as a fallback if `SYSTEM.md`
 does not exist.
 
 **`AGENTS.md`** (optional) — raw markdown (no frontmatter). When present,
-its content replaces the global `~/.xi/AGENTS.md` entry in the system prompt.
+its content replaces the global `~/.ri/AGENTS.md` entry in the system prompt.
 Project-local AGENTS.md files (from the cwd→root chain) are still appended
 after the agent's AGENTS.md.
 

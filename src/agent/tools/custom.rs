@@ -56,18 +56,18 @@ impl Tool for CustomTool {
 // ── Discovery ─────────────────────────────────────────────────────────────────
 
 /// Returns the ordered list of directories to search for custom tools:
-/// 1. `~/.xi/tools/`
-/// 2. `./.xi/tools/` (project-local)
+/// 1. `~/.ri/tools/`
+/// 2. `./.ri/tools/` (project-local)
 /// 3. `ProjectDirs::config_dir()/tools/`
 pub fn custom_tool_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
     if let Some(home) = env::var_os("HOME").filter(|s| !s.is_empty()) {
-        dirs.push(PathBuf::from(home).join(".xi").join("tools"));
+        dirs.push(PathBuf::from(home).join(".ri").join("tools"));
     }
 
     if let Ok(cwd) = env::current_dir() {
-        dirs.push(cwd.join(".xi").join("tools"));
+        dirs.push(cwd.join(".ri").join("tools"));
     }
 
     if let Ok(proj) = crate::dirs::project_dirs() {
@@ -313,7 +313,7 @@ printf "got: $input"
 
     #[test]
     fn nonexistent_directory_returns_no_tools() {
-        let tools = load_custom_tools(&[PathBuf::from("/nonexistent/xi/tools")]);
+        let tools = load_custom_tools(&[PathBuf::from("/nonexistent/ri/tools")]);
         assert!(tools.is_empty());
     }
 

@@ -981,9 +981,9 @@ mod tests {
 
     #[test]
     fn plain_text_first_paragraph_wraps_to_first_column_after_icon() {
-        let lines = render("hello world from xi", 12, "💬 ");
+        let lines = render("hello world from ri", 12, "💬 ");
         let texts = lines_text(&lines);
-        assert_eq!(texts, vec!["💬 hello ", "world from ", "xi"]);
+        assert_eq!(texts, vec!["💬 hello ", "world from ", "ri"]);
     }
 
     // ── Bold / italic / inline code ─────────────────────────────────────────────
@@ -1066,9 +1066,9 @@ mod tests {
 
     #[test]
     fn list_wrapping_remains_indented_under_prefix() {
-        let lines = render("- hello world from xi", 12, "💬 ");
+        let lines = render("- hello world from ri", 12, "💬 ");
         let texts = lines_text(&lines);
-        assert_eq!(texts, vec!["💬 • hello ", "     world ", "     from xi"]);
+        assert_eq!(texts, vec!["💬 • hello ", "     world ", "     from ri"]);
     }
 
     #[test]

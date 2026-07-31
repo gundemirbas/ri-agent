@@ -645,10 +645,10 @@ mod tests {
     }
     #[test]
     fn input_wrap_prefers_word_boundaries() {
-        let chunks = input::wrap_input_line("hello world from xi", 11);
+        let chunks = input::wrap_input_line("hello world from ri", 11);
         assert_eq!(
             chunks,
-            vec!["hello world".to_string(), " from xi".to_string()]
+            vec!["hello world".to_string(), " from ri".to_string()]
         );
     }
 

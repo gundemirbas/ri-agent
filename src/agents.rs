@@ -2,12 +2,12 @@
 //! customise system prompt, tool availability, and skill availability.
 //!
 //! Each agent lives in a subdirectory under an agent root (e.g.
-//! `~/.xi/agents/{name}/`). Two files are recognised:
+//! `~/.ri/agents/{name}/`). Two files are recognised:
 //!
 //! - `SYSTEM.md` (required) — YAML frontmatter with metadata + body that
 //!   replaces the default system-prompt identity. Falls back to `AGENT.md`
 //!   for backwards compatibility.
-//! - `AGENTS.md` (optional) — replaces the global `~/.xi/AGENTS.md`
+//! - `AGENTS.md` (optional) — replaces the global `~/.ri/AGENTS.md`
 //!   instructions. Project-local AGENTS.md files (cwd→root chain) are still
 //!   appended after the agent's AGENTS.md.
 
@@ -49,7 +49,7 @@ pub struct AgentMeta {
     /// `SYSTEM.md`, or `AGENT.md` for backwards compatibility).
     pub system_prompt: String,
     /// Content of the agent's `AGENTS.md`, if present. When set, this replaces
-    /// the global `~/.xi/AGENTS.md` entry in the system prompt.
+    /// the global `~/.ri/AGENTS.md` entry in the system prompt.
     pub agents_md: Option<String>,
     /// Absolute path to the metadata file (`SYSTEM.md` or `AGENT.md`).
     #[allow(dead_code)] // Reserved for future use (subagent file references, etc.)
@@ -72,7 +72,7 @@ fn agent_dirs() -> Vec<PathBuf> {
 
     if let Some(home) = env::var_os("HOME").filter(|s| !s.is_empty()) {
         let home = PathBuf::from(home);
-        dirs.push(home.join(".xi").join("agents"));
+        dirs.push(home.join(".ri").join("agents"));
         dirs.push(home.join(".agents").join("agents"));
     }
 
@@ -84,7 +84,7 @@ fn agent_dirs() -> Vec<PathBuf> {
 
     if let Ok(cwd) = env::current_dir() {
         dirs.push(cwd.join(".agents").join("agents"));
-        dirs.push(cwd.join(".xi").join("agents"));
+        dirs.push(cwd.join(".ri").join("agents"));
     }
 
     dirs

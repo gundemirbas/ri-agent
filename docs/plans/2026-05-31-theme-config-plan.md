@@ -9,7 +9,7 @@
 ## Goal
 
 Consolidate all hardcoded theme/style values across the Xi codebase into a
-central `Theme` struct loaded from `~/.config/xi/theme.toml`. Users can
+central `Theme` struct loaded from `~/.config/ri/theme.toml`. Users can
 override any value; missing values fall back to built-in defaults that
 reproduce the current appearance exactly.
 

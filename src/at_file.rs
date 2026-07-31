@@ -1,7 +1,7 @@
 //! Parsing and resolution of `@<path>` file-attachment tokens in user input.
 //!
 //! When a user types `@src/main.rs` (or `@"path with spaces.txt"`) in the
-//! textarea, xi-agent resolves the path and injects a synthetic `read_file`
+//! textarea, ri-agent resolves the path and injects a synthetic `read_file`
 //! tool call + result before the user message so the model receives the file
 //! content without a round-trip tool call.
 //!

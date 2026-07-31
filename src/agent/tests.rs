@@ -651,10 +651,10 @@ fn test_read_agents_md() {
     let temp_working = tempdir().unwrap();
     let working_path = temp_working.path();
 
-    // Simulate ~/.xi/AGENTS.md
-    let xi_agents_md = home_path.join(".xi/AGENTS.md");
-    fs::create_dir_all(xi_agents_md.parent().unwrap()).unwrap();
-    fs::write(&xi_agents_md, "Global agents configuration\n").unwrap();
+    // Simulate ~/.ri/AGENTS.md
+    let ri_agents_md = home_path.join(".ri/AGENTS.md");
+    fs::create_dir_all(ri_agents_md.parent().unwrap()).unwrap();
+    fs::write(&ri_agents_md, "Global agents configuration\n").unwrap();
 
     // Simulate AGENTS.md at cwd.
     let cwd_agents_md = working_path.join("AGENTS.md");
@@ -675,7 +675,7 @@ fn test_read_agents_md() {
     assert!(entries[1].content.contains("Local agents configuration"));
 
     // Paths are preserved.
-    assert!(entries[0].path.to_string_lossy().contains(".xi/AGENTS.md"));
+    assert!(entries[0].path.to_string_lossy().contains(".ri/AGENTS.md"));
     assert!(entries[1].path.to_string_lossy().contains("AGENTS.md"));
 
     temp_home.close().unwrap();
@@ -695,7 +695,7 @@ fn test_read_agents_md_falls_back_to_dot_agents() {
     let temp_working = tempdir().unwrap();
     let working_path = temp_working.path();
 
-    // Only ~/.agents/AGENTS.md exists (no ~/.xi/AGENTS.md).
+    // Only ~/.agents/AGENTS.md exists (no ~/.ri/AGENTS.md).
     let agents_md = home_path.join(".agents/AGENTS.md");
     fs::create_dir_all(agents_md.parent().unwrap()).unwrap();
     fs::write(&agents_md, "Global .agents config\n").unwrap();
@@ -728,10 +728,10 @@ fn test_read_agents_md_xi_overrides_agents_at_same_level() {
     let temp_home = tempdir().unwrap();
     let home_path = temp_home.path();
 
-    // Both ~/.xi/AGENTS.md and ~/.agents/AGENTS.md exist.
-    let xi_agents_md = home_path.join(".xi/AGENTS.md");
-    fs::create_dir_all(xi_agents_md.parent().unwrap()).unwrap();
-    fs::write(&xi_agents_md, ".xi content\n").unwrap();
+    // Both ~/.ri/AGENTS.md and ~/.agents/AGENTS.md exist.
+    let ri_agents_md = home_path.join(".ri/AGENTS.md");
+    fs::create_dir_all(ri_agents_md.parent().unwrap()).unwrap();
+    fs::write(&ri_agents_md, ".ri content\n").unwrap();
 
     let agents_md = home_path.join(".agents/AGENTS.md");
     fs::create_dir_all(agents_md.parent().unwrap()).unwrap();
@@ -744,12 +744,12 @@ fn test_read_agents_md_xi_overrides_agents_at_same_level() {
         None,
     );
 
-    // .xi takes priority; only one entry, and it's from .xi.
+    // .ri takes priority; only one entry, and it's from .ri.
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].kind, AgentsKind::Global);
-    assert!(entries[0].content.contains(".xi content"));
+    assert!(entries[0].content.contains(".ri content"));
     assert!(!entries[0].content.contains(".agents content"));
-    assert!(entries[0].path.to_string_lossy().contains(".xi/AGENTS.md"));
+    assert!(entries[0].path.to_string_lossy().contains(".ri/AGENTS.md"));
 
     temp_home.close().unwrap();
     cwd.close().unwrap();
@@ -770,10 +770,10 @@ fn test_read_agents_md_dot_xi_in_cwd_walk() {
     let working = tempdir().unwrap();
     let working_path = working.path();
 
-    // .xi/AGENTS.md inside cwd (prioritised over bare AGENTS.md).
-    let xi_path = working_path.join(".xi/AGENTS.md");
+    // .ri/AGENTS.md inside cwd (prioritised over bare AGENTS.md).
+    let xi_path = working_path.join(".ri/AGENTS.md");
     fs::create_dir_all(xi_path.parent().unwrap()).unwrap();
-    fs::write(&xi_path, ".xi project config\n").unwrap();
+    fs::write(&xi_path, ".ri project config\n").unwrap();
 
     // Also create bare AGENTS.md to confirm it's NOT picked up.
     fs::write(working_path.join("AGENTS.md"), "bare config\n").unwrap();
@@ -781,12 +781,12 @@ fn test_read_agents_md_dot_xi_in_cwd_walk() {
     let cwd = working_path.display().to_string();
     let entries = crate::agent::system_prompt::read_agents_md(&cwd, Some(home_path), None);
 
-    // Only one entry (.xi takes priority over bare).
+    // Only one entry (.ri takes priority over bare).
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].kind, AgentsKind::Local);
-    assert!(entries[0].content.contains(".xi project config"));
+    assert!(entries[0].content.contains(".ri project config"));
     assert!(!entries[0].content.contains("bare config"));
-    assert!(entries[0].path.to_string_lossy().contains(".xi/AGENTS.md"));
+    assert!(entries[0].path.to_string_lossy().contains(".ri/AGENTS.md"));
 
     temp_home.close().unwrap();
     working.close().unwrap();
@@ -803,10 +803,10 @@ fn test_read_agents_md_from_nested_cwd_includes_parent_chain_in_order() {
     let temp_home = tempdir().unwrap();
     let home_path = temp_home.path();
 
-    // Simulate ~/.xi/AGENTS.md
-    let xi_agents_md = home_path.join(".xi/AGENTS.md");
-    fs::create_dir_all(xi_agents_md.parent().unwrap()).unwrap();
-    fs::write(&xi_agents_md, "Global config\n").unwrap();
+    // Simulate ~/.ri/AGENTS.md
+    let ri_agents_md = home_path.join(".ri/AGENTS.md");
+    fs::create_dir_all(ri_agents_md.parent().unwrap()).unwrap();
+    fs::write(&ri_agents_md, "Global config\n").unwrap();
 
     // Build nested workspace: <root>/project/subdir
     let root = tempdir().unwrap();

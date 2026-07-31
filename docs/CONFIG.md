@@ -1,6 +1,6 @@
 # Xi Configuration Guide
 
-Xi is configured via `~/.config/xi/config.toml`. All fields are optional;
+Xi is configured via `~/.config/ri/config.toml`. All fields are optional;
 missing values fall back to built-in defaults.
 
 ---
@@ -27,7 +27,7 @@ max_one_line_chars = 120
 To use a custom theme file:
 
 ```toml
-theme = "~/.config/xi/my-theme.toml"
+theme = "~/.config/ri/my-theme.toml"
 ```
 
 See [THEME.md](THEME.md) for the full theme file format and all available options.

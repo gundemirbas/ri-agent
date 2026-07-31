@@ -26,7 +26,7 @@ busy tool loops.
 |---|---|---|
 | **OpenAI-compatible endpoint** | Any OpenAI-compatible API (OpenAI, DeepSeek, vLLM, local inference servers, …) | API key in config |
 
-Configure named provider instances in `~/.config/xi/config.toml` and select them with `-P <name>` or `/provider <name>`.
+Configure named provider instances in `~/.config/ri/config.toml` and select them with `-P <name>` or `/provider <name>`.
 
 ## License
 
@@ -95,19 +95,19 @@ cargo install --path .
 
 Add custom agent capabilities and expertise by placing [SKILL.md](https://agentskills.io/) files in these directories; reference them with `/skill:<name>`:
 
-- `~/.xi/skills`
+- `~/.ri/skills`
 - `~/.agents/skills`
 - `./.agents/skills`
-- `./.xi/skills`
+- `./.ri/skills`
 
 ## Custom tools
 
 Add custom tools by placing executable files in these directories (in this order):
 
-- `~/.xi/tools`
+- `~/.ri/tools`
 - `~/.agents/tools`
 - `./.agents/tools`
-- `./.xi/tools`
+- `./.ri/tools`
 
 Tools must respond to a `--describe` option and output a JSON description of the
 tool's interface, including its name, description, and expected input

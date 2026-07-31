@@ -85,9 +85,9 @@ use thinking::ThinkingLevel;
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
-/// xi — a terminal-based AI coding agent
+/// ri — a terminal-based AI coding agent
 #[derive(Debug, Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(name = "ri", author, version, about, long_about = None)]
 struct Cli {
     /// LLM provider to use (must match a configured provider instance id).
     #[arg(long, short = 'P', value_name = "PROVIDER")]
@@ -102,7 +102,7 @@ struct Cli {
     #[arg(long, short = 'p', value_name = "PROMPT", num_args = 1..)]
     print: Option<Vec<String>>,
 
-    /// Print the file-system paths xi uses and exit.
+    /// Print the file-system paths ri uses and exit.
     #[arg(long)]
     print_dirs: bool,
 
@@ -113,7 +113,7 @@ struct Cli {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Build a [`FileTracker`] pre-configured to ignore xi-agent's own generated files:
+/// Build a [`FileTracker`] pre-configured to ignore ri-agent's own generated files:
 ///
 /// - Session files (data dir `sessions/` subtree).
 /// - Debug logs (cache dir).
@@ -143,7 +143,7 @@ async fn main() -> io::Result<()> {
         eprintln!(
             "error: failed to load config.toml: {e}\n\
              Refusing to start with default config to prevent data loss.\n\
-             Fix or restore ~/.config/xi/config.toml and try again."
+             Fix or restore ~/.config/ri/config.toml and try again."
         );
         io::Error::other("config load failed")
     })?;
