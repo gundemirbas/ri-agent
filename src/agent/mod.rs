@@ -154,7 +154,6 @@ async fn stream_assistant_turn(
     tool_defs: Vec<ToolDefinition>,
     tx: &UnboundedSender<AppEvent>,
     overflow_retry_remaining: usize,
-    session_id: &str,
 ) -> TurnOutcome {
     // Build a lookup from tool name → streaming_field for intent events.
     let streaming_fields: std::collections::HashMap<String, Option<String>> = tool_defs
@@ -162,13 +161,7 @@ async fn stream_assistant_turn(
         .map(|t| (t.name.clone(), t.streaming_field.clone()))
         .collect();
 
-    let mut stream = provider.stream_chat_with_tools(
-        messages,
-        tool_defs,
-        LlmRequestContext {
-            prompt_cache_key: Some(session_id.to_string()),
-        },
-    );
+    let mut stream = provider.stream_chat_with_tools(messages, tool_defs, LlmRequestContext {});
 
     let mut assistant_text = String::new();
     let mut assistant_thinking: Option<String> = None;
@@ -449,7 +442,6 @@ pub async fn run_agent_loop(
             tool_defs.clone(),
             &tx,
             overflow_retry_remaining,
-            &config.session_id,
         )
         .await;
 

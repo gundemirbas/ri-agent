@@ -7,7 +7,7 @@ use crate::{
         LlmProvider,
         gemini::{DEFAULT_BASE_URL as GEMINI_DEFAULT_BASE_URL, GeminiProvider},
         ollama::{self, OllamaProvider},
-        openai::OpenAiProvider,
+        rig_provider::RigOpenAiProvider,
         test_provider::TestProvider,
     },
     provider_instance::{ApiType, BackendPreset, ProviderInstance},
@@ -93,7 +93,12 @@ pub fn build_provider_for_instance(
                     instance.id
                 )
             })?;
-            let mut p = OpenAiProvider::new(base_url, model, api_key);
+            let mut p = RigOpenAiProvider::new(base_url, model, api_key).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to build OpenAI-compatible provider '{}': {e}",
+                    instance.id
+                )
+            })?;
             log::debug!(
                 "provider build: id={} backend={:?} api={:?} thinking={:?}",
                 instance.id,
@@ -104,10 +109,7 @@ pub fn build_provider_for_instance(
             // Only send reasoning_effort for OpenAI API; generic
             // openai-compatible endpoints (e.g. DeepSeek) may reject it.
             if instance.backend_preset == BackendPreset::OpenAi {
-                log::debug!("provider build: enabling reasoning_effort for OpenAi backend");
                 p = p.with_reasoning_effort(thinking.to_reasoning_effort_string());
-            } else {
-                log::debug!("provider build: skipping reasoning_effort (backend is not OpenAi)");
             }
             Ok(Arc::new(p))
         }
@@ -122,7 +124,7 @@ pub fn build_provider_for_instance(
                     instance.id
                 )
             })?;
-            let mut p = OpenAiProvider::new_with_headers(
+            let mut p = RigOpenAiProvider::new_with_headers(
                 base_url,
                 model,
                 api_key,
@@ -130,7 +132,10 @@ pub fn build_provider_for_instance(
                     ("HTTP-Referer".to_string(), OPENROUTER_REFERER.to_string()),
                     ("X-Title".to_string(), OPENROUTER_TITLE.to_string()),
                 ],
-            );
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("failed to build OpenRouter provider '{}': {e}", instance.id)
+            })?;
             p = p.with_reasoning_effort(thinking.to_reasoning_effort_string());
             Ok(Arc::new(p))
         }
@@ -191,7 +196,14 @@ pub fn build_provider_for_instance(
                         });
                     }
 
-                    Ok(Arc::new(OpenAiProvider::new(api_base, model, api_key)))
+                    Ok(Arc::new(
+                        RigOpenAiProvider::new(api_base, model, api_key).map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to build Open WebUI provider '{}': {e}",
+                                instance.id
+                            )
+                        })?,
+                    ))
                 }
             }
         }

@@ -6,8 +6,6 @@
 
 use std::time::Duration;
 
-use super::{Message, Role};
-
 // ── HTTP client factory ───────────────────────────────────────────────────────
 
 /// The maximum time allowed for the TCP connection to be established.
@@ -26,18 +24,6 @@ pub fn build_http_client() -> reqwest::Client {
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .expect("failed to build HTTP client")
-}
-
-// ── Initiator inference ───────────────────────────────────────────────────────
-
-/// Returns `"user"` when the last message is from a user (or the history is
-/// empty), and `"agent"` otherwise.  Used by providers that support an
-/// `X-Initiator` hint header.
-pub fn infer_initiator(messages: &[Message]) -> &'static str {
-    match messages.last().map(|m| &m.role) {
-        Some(Role::User) | None => "user",
-        _ => "agent",
-    }
 }
 
 // ── Tool-name normalisation ───────────────────────────────────────────────────
@@ -432,29 +418,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::Message;
-
-    // ── infer_initiator ───────────────────────────────────────────────────────
-
-    #[test]
-    fn infer_initiator_empty_history_is_user() {
-        assert_eq!(infer_initiator(&[]), "user");
-    }
-
-    #[test]
-    fn infer_initiator_last_user_is_user() {
-        assert_eq!(infer_initiator(&[Message::user("hi")]), "user");
-    }
-
-    #[test]
-    fn infer_initiator_last_assistant_is_agent() {
-        assert_eq!(infer_initiator(&[Message::assistant("ok")]), "agent");
-    }
-
-    #[test]
-    fn infer_initiator_last_system_is_agent() {
-        assert_eq!(infer_initiator(&[Message::system("rules")]), "agent");
-    }
 
     // ── normalize_tool_name ───────────────────────────────────────────────────
 

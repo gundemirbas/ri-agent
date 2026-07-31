@@ -542,8 +542,6 @@ pub struct AgentLoopConfig {
     /// System prompt prepended to all LLM requests.  When `None`, no system
     /// message is added.
     pub system_prompt: Option<String>,
-    /// Persistent session identifier.
-    pub session_id: String,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

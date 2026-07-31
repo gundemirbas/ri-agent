@@ -6,7 +6,6 @@
 //! are resolved before being sent to any provider.
 //!
 //! Protocol families:
-//! - [`to_openai_wire`]    — OpenAI Chat Completions
 //! - [`to_gemini_wire`]    — Google Gemini `contents` array
 //! - [`to_ollama_wire`]    — Ollama `/api/chat` (OpenAI-like with `thinking` and object `arguments`)
 //!
@@ -125,122 +124,6 @@ fn openai_tool_result_content(tr: &Message) -> serde_json::Value {
     } else {
         serde_json::Value::String(tr.content.clone())
     }
-}
-
-// ── OpenAI Chat Completions ───────────────────────────────────────────────────
-
-/// Convert a xi-agent `Message` history to the OpenAI Chat Completions wire format.
-///
-/// The OpenAI API requires that tool calls and their accompanying text live in
-/// *one* assistant message, followed by one `"role":"tool"` message per result.
-/// xi-agent stores them as separate `Role::Assistant` + `Role::ToolCall` +
-/// `Role::ToolResult` messages, interleaved when there are multiple calls in a
-/// single turn.  This function:
-///
-/// 1. Merges a `Role::Assistant` message with any immediately following
-///    `Role::ToolCall` messages into a single assistant message that carries
-///    both `content` and `tool_calls`.
-/// 2. Collects the corresponding `Role::ToolResult` messages and emits them
-///    after the merged assistant message, preserving order.
-/// 3. Skips empty assistant messages that have no content and no tool calls.
-pub fn to_openai_wire(messages: &[Message]) -> Vec<serde_json::Value> {
-    let mut result: Vec<serde_json::Value> = Vec::new();
-
-    for turn in group_messages(messages) {
-        match turn {
-            Turn::System(msg) => {
-                result.push(serde_json::json!({
-                    "role": "system",
-                    "content": msg.content,
-                }));
-            }
-            Turn::User(msg) => {
-                result.push(serde_json::json!({
-                    "role": "user",
-                    "content": msg.content,
-                }));
-            }
-            Turn::Assistant { msg, tool_pairs } => {
-                let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-                let mut tool_results: Vec<serde_json::Value> = Vec::new();
-
-                for (call_idx, (tc, tr_opt)) in tool_pairs.iter().enumerate() {
-                    tool_calls.push(serde_json::json!({
-                        "id": tc.tool_call_id.clone().unwrap_or_else(|| format!("call_{call_idx}")),
-                        "type": "function",
-                        "function": {
-                            "name": normalize_tool_name(tc.tool_name.as_deref().unwrap_or_default()).to_string(),
-                            "arguments": tc.tool_args.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string()),
-                        }
-                    }));
-                    if let Some(tr) = tr_opt {
-                        let tr_content = openai_tool_result_content(tr);
-                        tool_results.push(serde_json::json!({
-                            "role": "tool",
-                            "content": tr_content,
-                            "tool_call_id": tr.tool_call_id,
-                        }));
-                    }
-                }
-
-                let content = if msg.content.is_empty() {
-                    None
-                } else {
-                    Some(&msg.content)
-                };
-                let tool_calls_opt = if tool_calls.is_empty() {
-                    None
-                } else {
-                    Some(&tool_calls)
-                };
-
-                if content.is_some() || tool_calls_opt.is_some() {
-                    let mut entry = serde_json::json!({
-                        "role": "assistant",
-                        "content": content,
-                        "tool_calls": tool_calls_opt,
-                        // Always include reasoning_content so reasoning
-                        // models (e.g. DeepSeek-v4-pro) don't reject the
-                        // request.  Use an empty string when there is no
-                        // thinking content (matches the model's own
-                        // initial delta pattern).
-                        "reasoning_content": "",
-                    });
-                    if let Some(thinking) = msg.thinking.as_deref().filter(|t| !t.is_empty()) {
-                        entry["reasoning_content"] =
-                            serde_json::Value::String(thinking.to_string());
-                    }
-                    result.push(entry);
-                    result.extend(tool_results);
-                }
-            }
-            Turn::StandaloneToolCall(tc) => {
-                result.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": serde_json::Value::Null,
-                    "reasoning_content": "",
-                    "tool_calls": [{
-                        "id": tc.tool_call_id.clone().unwrap_or_else(|| "call_0".to_string()),
-                        "type": "function",
-                        "function": {
-                            "name": normalize_tool_name(tc.tool_name.as_deref().unwrap_or_default()).to_string(),
-                            "arguments": tc.tool_args.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string()),
-                        }
-                    }],
-                }));
-            }
-            Turn::StandaloneToolResult(tr) => {
-                let tr_content = openai_tool_result_content(tr);
-                result.push(serde_json::json!({
-                    "role": "tool",
-                    "content": tr_content,
-                    "tool_call_id": tr.tool_call_id,
-                }));
-            }
-        }
-    }
-
-    result
 }
 
 // ── Google Gemini ─────────────────────────────────────────────────────────────
@@ -441,67 +324,6 @@ pub fn to_ollama_wire(messages: &[Message]) -> Vec<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::llm::Message;
-
-    // ── to_openai_wire ────────────────────────────────────────────────────────
-
-    #[test]
-    fn openai_wire_normalizes_emoji_tool_name() {
-        let messages = vec![
-            Message::assistant(""),
-            Message::tool_call("id-1", "👀", serde_json::json!({"path": "foo"})),
-            Message::tool_result("id-1", "content", false),
-        ];
-        let wire = to_openai_wire(&messages);
-        let assistant = &wire[0];
-        let name = &assistant["tool_calls"][0]["function"]["name"];
-        assert_eq!(name, "read_file");
-    }
-
-    #[test]
-    fn openai_wire_merges_assistant_with_tool_calls_and_results() {
-        let messages = vec![
-            Message::assistant("thinking"),
-            Message::tool_call("id-1", "bash", serde_json::json!({"command": "ls"})),
-            Message::tool_result("id-1", "output", false),
-        ];
-        let wire = to_openai_wire(&messages);
-        assert_eq!(wire.len(), 2);
-        assert_eq!(wire[0]["role"], "assistant");
-        assert_eq!(wire[0]["content"], "thinking");
-        assert_eq!(wire[1]["role"], "tool");
-    }
-
-    #[test]
-    fn openai_wire_reasoning_content_echoed_when_present() {
-        let mut msg = Message::assistant("answer");
-        msg.thinking = Some("chain of thought".to_string());
-        let wire = to_openai_wire(&[msg]);
-        assert_eq!(wire[0]["reasoning_content"], "chain of thought");
-    }
-
-    #[test]
-    fn openai_wire_reasoning_content_absent_when_empty() {
-        let mut msg = Message::assistant("answer");
-        msg.thinking = Some(String::new());
-        let wire = to_openai_wire(&[msg]);
-        // reasoning_content is always present; empty string when no thinking.
-        assert_eq!(wire[0]["reasoning_content"], "");
-    }
-
-    #[test]
-    fn openai_wire_skips_empty_assistant_without_tool_calls() {
-        let messages = vec![Message::assistant("")];
-        let wire = to_openai_wire(&messages);
-        assert!(wire.is_empty());
-    }
-
-    #[test]
-    fn openai_wire_standalone_tool_call_fallback_id() {
-        let mut tc = Message::tool_call("", "bash", serde_json::json!({}));
-        tc.tool_call_id = None;
-        let wire = to_openai_wire(&[tc]);
-        assert_eq!(wire[0]["tool_calls"][0]["id"], "call_0");
-    }
 
     // ── to_gemini_wire ────────────────────────────────────────────────────────
 

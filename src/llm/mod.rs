@@ -324,13 +324,11 @@ pub type ModelListFuture =
 /// and makes implementors independently testable by collecting the stream.
 /// Session-owned request context supplied at send time.
 ///
-/// This keeps stable session identity out of long-lived provider instances
-/// while still letting a request carry provider-specific routing hints such as
-/// `prompt_cache_key`.
+/// Currently an empty marker; kept as the single place to add per-request,
+/// session-scoped routing hints without churning every `LlmProvider`
+/// signature.
 #[derive(Debug, Clone, Default)]
-pub struct LlmRequestContext {
-    pub prompt_cache_key: Option<String>,
-}
+pub struct LlmRequestContext {}
 
 pub trait LlmProvider: Send + Sync {
     fn stream_chat(&self, messages: Vec<Message>, context: LlmRequestContext) -> LlmStream;
@@ -362,8 +360,8 @@ pub trait LlmProvider: Send + Sync {
 pub mod common;
 pub mod gemini;
 pub mod ollama;
-pub mod openai;
 pub mod provider_format;
+pub mod rig_provider;
 pub mod test_provider;
 
 #[cfg(test)]

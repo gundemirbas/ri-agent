@@ -162,7 +162,6 @@ async fn run_and_collect_with_config(provider: MockProvider) -> Vec<AgentEvent> 
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        session_id: String::new(),
     };
     run_agent_loop(config, Arc::new(provider), tx, steering_rx, cancel_rx).await;
     let mut events = Vec::new();
@@ -351,7 +350,6 @@ async fn steering_during_tool_batch_finishes_batch_before_consuming_steering() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        session_id: String::new(),
     };
 
     let handle = tokio::spawn(async move {
@@ -432,7 +430,6 @@ async fn cancellation_beats_steering_at_same_tool_boundary() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        session_id: String::new(),
     };
 
     let handle = tokio::spawn(async move {
@@ -519,7 +516,6 @@ async fn steering_after_streamed_text_is_consumed_after_turn_end() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        session_id: String::new(),
     };
 
     let handle = tokio::spawn(async move {
@@ -614,7 +610,6 @@ async fn agent_loop_before_hook_blocks_tool() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        session_id: String::new(),
     };
     let (_steering_tx, steering_rx) = mpsc::unbounded_channel();
     let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(CancelLevel::None);
@@ -888,7 +883,6 @@ async fn agent_loop_ask_user_no_options_completes_loop() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        session_id: String::new(),
     };
 
     let handle = tokio::spawn(async move {
@@ -973,7 +967,6 @@ async fn agent_loop_pre_cancelled_exits_immediately() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        session_id: String::new(),
     };
 
     run_agent_loop(config, Arc::new(PanicProvider), tx, steering_rx, cancel_rx).await;
@@ -1039,7 +1032,6 @@ async fn agent_loop_cancel_after_tool_call_stops_before_next_turn() {
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
         system_prompt: None,
-        session_id: String::new(),
     };
 
     run_agent_loop(config, Arc::new(provider), tx, steering_rx, cancel_rx).await;

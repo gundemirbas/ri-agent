@@ -235,7 +235,6 @@ async fn main() -> io::Result<()> {
             manual_compaction_instructions: None,
             executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
             system_prompt: None,
-            session_id: String::new(),
         },
         config.display.clone(),
     );

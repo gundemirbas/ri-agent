@@ -1409,7 +1409,6 @@ mod tests {
                 manual_compaction_instructions: None,
                 executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
                 system_prompt: None,
-                session_id: String::new(),
             },
             crate::config::DisplayConfig::default(),
         )

@@ -144,7 +144,6 @@ pub(crate) async fn run_print_mode(
         manual_compaction_instructions: None,
         executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
         system_prompt: Some(system_prompt),
-        session_id: String::new(),
     };
 
     let provider_ctx = PrintModeProviderCtx {
@@ -342,7 +341,6 @@ async fn run_print_mode_loop_inner(
         manual_compaction_instructions: None,
         executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
         system_prompt,
-        session_id: String::new(),
     };
 
     tokio::spawn(async move {
