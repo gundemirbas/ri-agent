@@ -81,10 +81,6 @@ pub struct XiConfig {
     #[serde(default)]
     pub openai: OpenAiConfig,
     #[serde(default)]
-    pub copilot: CopilotConfig,
-    #[serde(default)]
-    pub codex: CodexConfig,
-    #[serde(default)]
     pub gemini: GeminiConfig,
 }
 
@@ -186,17 +182,6 @@ pub struct OpenAiConfig {
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
-pub struct CopilotConfig {
-    pub model: Option<String>,
-}
-
-#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
-pub struct CodexConfig {
-    pub base_url: Option<String>,
-    pub model: Option<String>,
-}
-
-#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
 pub struct GeminiConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
@@ -276,13 +261,6 @@ api_key = "sk-test"
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 
-[copilot]
-model = "gpt-4o"
-
-[codex]
-base_url = "https://chatgpt.com/backend-api/codex"
-model = "gpt-5"
-
 [gemini]
 base_url = "https://cloudcode-pa.googleapis.com"
 model = "gemini-2.5-pro"
@@ -311,12 +289,6 @@ recent_endpoints = ["http://localhost:11434", "http://gpu-box:11434"]
             Some("https://api.openai.com/v1")
         );
         assert_eq!(cfg.openai.model.as_deref(), Some("gpt-4o-mini"));
-        assert_eq!(cfg.copilot.model.as_deref(), Some("gpt-4o"));
-        assert_eq!(
-            cfg.codex.base_url.as_deref(),
-            Some("https://chatgpt.com/backend-api/codex")
-        );
-        assert_eq!(cfg.codex.model.as_deref(), Some("gpt-5"));
         assert_eq!(
             cfg.gemini.base_url.as_deref(),
             Some("https://cloudcode-pa.googleapis.com")
@@ -329,17 +301,11 @@ recent_endpoints = ["http://localhost:11434", "http://gpu-box:11434"]
     #[test]
     fn legacy_provider_sections_do_not_synthesise_instances() {
         let raw = r#"
-provider = "copilot"
+provider = "gemini"
 
 [openai]
 api_key = "sk-test"
 model = "gpt-4o-mini"
-
-[copilot]
-model = "gpt-4o"
-
-[codex]
-model = "gpt-5"
 
 [gemini]
 model = "gemini-2.5-pro"
@@ -355,10 +321,8 @@ model = "llama3.1"
 "#;
         let cfg = XiConfig::from_toml_str(raw).unwrap();
         assert!(cfg.providers.is_empty());
-        assert!(cfg.find_provider("copilot").is_none());
-        assert!(cfg.find_provider("openai").is_none());
-        assert!(cfg.find_provider("codex").is_none());
         assert!(cfg.find_provider("gemini").is_none());
+        assert!(cfg.find_provider("openai").is_none());
         assert!(cfg.find_provider("ollama").is_none());
         assert!(cfg.find_provider("open-webui").is_none());
     }
@@ -452,18 +416,18 @@ base_url = "http://gpu-box:11434"
         let effective = cfg.resolve_effective_providers();
         assert!(effective.iter().any(|p| p.id == "my-ollama"));
         // Built-ins still present.
-        assert!(effective.iter().any(|p| p.id == "copilot"));
+        assert!(effective.iter().any(|p| p.id == "gemini"));
     }
 
     #[test]
     fn resolve_effective_providers_prefers_config_override_for_builtin() {
         let mut cfg = XiConfig::default();
-        let mut inst = ProviderInstance::new("copilot", BackendPreset::Copilot);
+        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
         inst.model = Some("override-model".to_string());
         cfg.upsert_provider(inst);
         let effective = cfg.resolve_effective_providers();
-        let copilot = effective.iter().find(|p| p.id == "copilot").unwrap();
-        assert_eq!(copilot.model.as_deref(), Some("override-model"));
+        let openai = effective.iter().find(|p| p.id == "openai").unwrap();
+        assert_eq!(openai.model.as_deref(), Some("override-model"));
     }
 
     #[test]

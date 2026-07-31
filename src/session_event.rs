@@ -17,7 +17,7 @@
 //! {"type":"tool_call","id":"call_1","name":"read_file","args":{"path":"src/main.rs"},"timestamp":1713000002}
 //! {"type":"tool_result","id":"call_1","name":"read_file","content":"fn main() {}","is_error":false,"display_range":null,"timestamp":1713000003}
 //! {"type":"turn_error","message":"rate limit exceeded","timestamp":1713000004}
-//! {"type":"model_changed","model":"claude-opus-4","provider":"copilot","timestamp":1713000005}
+//! {"type":"model_changed","model":"claude-opus-4","provider":"openai","timestamp":1713000005}
 //! {"type":"thinking_level_changed","level":"high","timestamp":1713000006}
 //! ```
 //!
@@ -294,7 +294,7 @@ mod tests {
     fn model_changed_round_trips() {
         let ev = SessionEvent::ModelChanged {
             model: "claude-opus-4".to_string(),
-            provider: "copilot".to_string(),
+            provider: "openai".to_string(),
             timestamp: ts(),
         };
         let json = serde_json::to_string(&ev).unwrap();

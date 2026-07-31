@@ -164,7 +164,7 @@ impl LoginState {
     ///
     /// Items are populated based on what is currently available:
     /// - "Open browser" and "Copy URL" only when a URL has arrived
-    /// - "Copy code" only when a device code is present (Copilot flow)
+    /// - "Copy code" only when a device code is present (device-code flow)
     /// - "Cancel" always
     pub fn enter_login_action_menu(&mut self, selection: &mut SelectionState) {
         if !self.active {

@@ -6,8 +6,6 @@ use std::sync::{
 use crate::app_event::{AppEvent, AppEventTx};
 
 pub mod backend;
-pub mod codex;
-pub mod copilot;
 pub mod gemini;
 #[cfg(test)]
 pub mod mock;
@@ -22,10 +20,7 @@ pub use store::AuthStore;
 /// Describes what the user needs to do after receiving an [`LoginEvent::AuthCode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthFlow {
-    /// GitHub device-code flow: open the URL **and** type the short code shown
-    /// on screen into the browser.
-    DeviceCode,
-    /// PKCE redirect flow (Codex, Gemini): open the URL; the browser will
+    /// PKCE redirect flow (Gemini): open the URL; the browser will
     /// redirect back to localhost automatically once the user approves.
     RedirectCallback,
 }
@@ -213,8 +208,6 @@ pub fn token_state_from_store(
     leeway_secs: i64,
 ) -> anyhow::Result<AuthTokenState> {
     let expires_at = match provider {
-        "copilot" => store.get_copilot().map(|c| c.expires_at),
-        "codex" => store.get_codex().map(|c| c.expires_at),
         "gemini" => store.get_gemini().map(|c| c.expires_at),
         _ => return Ok(AuthTokenState::Missing),
     };
@@ -238,7 +231,7 @@ pub fn token_state_from_store(
 /// based on `expires_at` relative to `now_secs` with a `leeway_secs` buffer.
 ///
 /// # Arguments
-/// - `provider`: Provider name ("copilot", "codex", "gemini")
+/// - `provider`: Provider name ("gemini")
 /// - `now_secs`: Current time as Unix epoch seconds
 /// - `leeway_secs`: Seconds before expiry to consider the token "expiring soon"
 pub fn token_state(
@@ -314,7 +307,7 @@ mod tests {
     // ── login_provider orchestration tests ────────────────────────────────────
 
     use crate::app_event::AppEvent;
-    use crate::auth::mock::{MockOAuthBackend, fake_copilot_creds};
+    use crate::auth::mock::{MockOAuthBackend, fake_gemini_creds};
     use crate::auth::store::AuthStore;
     use crate::auth::types::ProviderCredentials;
     use std::sync::Arc;
@@ -326,12 +319,12 @@ mod tests {
     async fn login_provider_success_emits_event_sequence() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.toml");
-        let mock = Arc::new(MockOAuthBackend::new().expect_login(Ok(fake_copilot_creds())));
+        let mock = Arc::new(MockOAuthBackend::new().expect_login(Ok(fake_gemini_creds())));
 
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        login_provider_inner("copilot", tx, cancel, mock, Some(&path)).await;
+        login_provider_inner("gemini", tx, cancel, mock, Some(&path)).await;
 
         // Drain events
         let events: Vec<LoginEvent> = std::iter::from_fn(|| {
@@ -357,7 +350,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, LoginEvent::Success { provider } if provider == "copilot")),
+                .any(|e| matches!(e, LoginEvent::Success { provider } if provider == "gemini")),
             "expected Success event"
         );
         assert!(
@@ -368,7 +361,7 @@ mod tests {
         // Verify credentials were persisted
         let store = AuthStore::load(&path).unwrap();
         assert!(
-            store.get_copilot().is_some(),
+            store.get_gemini().is_some(),
             "credentials should be persisted"
         );
     }
@@ -384,7 +377,7 @@ mod tests {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        login_provider_inner("copilot", tx, cancel, mock, Some(&path)).await;
+        login_provider_inner("gemini", tx, cancel, mock, Some(&path)).await;
 
         let events: Vec<LoginEvent> = std::iter::from_fn(|| {
             rx.try_recv().ok().map(|e| match e {
@@ -416,7 +409,7 @@ mod tests {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let cancel = Arc::new(AtomicBool::new(true)); // already cancelled
 
-        login_provider_inner("copilot", tx, cancel, mock, Some(&path)).await;
+        login_provider_inner("gemini", tx, cancel, mock, Some(&path)).await;
 
         let events: Vec<LoginEvent> = std::iter::from_fn(|| {
             rx.try_recv().ok().map(|e| match e {
@@ -441,15 +434,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.toml");
         let mut store = AuthStore::load(&path).unwrap();
-        store.set_from_credentials(ProviderCredentials::Copilot {
+        store.set_from_credentials(ProviderCredentials::Gemini {
             access_token: "tok".to_string(),
             refresh_token: "ref".to_string(),
             expires_at: 900,
-            base_url: None,
+            project_id: "proj".to_string(),
         });
         store.save().unwrap();
 
-        let state = token_state_from_store(&store, "copilot", 1000, 120).unwrap();
+        let state = token_state_from_store(&store, "gemini", 1000, 120).unwrap();
         assert_eq!(state, AuthTokenState::Expired);
     }
 
@@ -458,15 +451,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.toml");
         let mut store = AuthStore::load(&path).unwrap();
-        store.set_from_credentials(ProviderCredentials::Copilot {
+        store.set_from_credentials(ProviderCredentials::Gemini {
             access_token: "tok".to_string(),
             refresh_token: "ref".to_string(),
             expires_at: 1100,
-            base_url: None,
+            project_id: "proj".to_string(),
         });
         store.save().unwrap();
 
-        let state = token_state_from_store(&store, "copilot", 1000, 120).unwrap();
+        let state = token_state_from_store(&store, "gemini", 1000, 120).unwrap();
         assert_eq!(state, AuthTokenState::ExpiringSoon);
     }
 
@@ -475,15 +468,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.toml");
         let mut store = AuthStore::load(&path).unwrap();
-        store.set_from_credentials(ProviderCredentials::Copilot {
+        store.set_from_credentials(ProviderCredentials::Gemini {
             access_token: "tok".to_string(),
             refresh_token: "ref".to_string(),
             expires_at: 2000,
-            base_url: None,
+            project_id: "proj".to_string(),
         });
         store.save().unwrap();
 
-        let state = token_state_from_store(&store, "copilot", 1000, 120).unwrap();
+        let state = token_state_from_store(&store, "gemini", 1000, 120).unwrap();
         assert_eq!(state, AuthTokenState::Valid);
     }
 
@@ -494,31 +487,31 @@ mod tests {
         let store = AuthStore::load(&path).unwrap();
         // No credentials written — store is empty.
 
-        let state = token_state_from_store(&store, "copilot", 1000, 120).unwrap();
+        let state = token_state_from_store(&store, "gemini", 1000, 120).unwrap();
         assert_eq!(state, AuthTokenState::Missing);
     }
 
     // ── Store helper tests ─────────────────────────────────────────────────────
 
     #[test]
-    fn set_from_credentials_copilot_round_trips() {
+    fn set_from_credentials_gemini_round_trips() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.toml");
         let mut store = AuthStore::load(&path).unwrap();
-        store.set_from_credentials(ProviderCredentials::Copilot {
+        store.set_from_credentials(ProviderCredentials::Gemini {
             access_token: "a1".to_string(),
             refresh_token: "r1".to_string(),
             expires_at: 1000,
-            base_url: Some("https://example.com".to_string()),
+            project_id: "proj".to_string(),
         });
         store.save().unwrap();
 
         let loaded = AuthStore::load(&path).unwrap();
-        let creds = loaded.get_copilot().unwrap();
+        let creds = loaded.get_gemini().unwrap();
         assert_eq!(creds.access_token, "a1");
         assert_eq!(creds.refresh_token, "r1");
         assert_eq!(creds.expires_at, 1000);
-        assert_eq!(creds.base_url.as_deref(), Some("https://example.com"));
+        assert_eq!(creds.project_id, "proj");
     }
 
     #[test]
@@ -526,24 +519,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.toml");
         let mut store = AuthStore::load(&path).unwrap();
-        store.set_from_credentials(ProviderCredentials::Copilot {
+        store.set_from_credentials(ProviderCredentials::Gemini {
             access_token: "at".to_string(),
-            refresh_token: "rt_cop".to_string(),
+            refresh_token: "rt_gem".to_string(),
             expires_at: 9999,
-            base_url: None,
-        });
-        store.set_from_credentials(ProviderCredentials::Codex {
-            access_token: "at".to_string(),
-            refresh_token: "rt_cod".to_string(),
-            expires_at: 9999,
-            account_id: "acct".to_string(),
+            project_id: "proj".to_string(),
         });
 
-        assert_eq!(
-            store.get_refresh_token("copilot").as_deref(),
-            Some("rt_cop")
-        );
-        assert_eq!(store.get_refresh_token("codex").as_deref(), Some("rt_cod"));
+        assert_eq!(store.get_refresh_token("gemini").as_deref(), Some("rt_gem"));
         assert_eq!(store.get_refresh_token("unknown"), None);
     }
 
@@ -560,18 +543,19 @@ mod tests {
             r#"
 version = 1
 
-[providers.copilot]
-kind = "copilot"
+[providers.gemini]
+kind = "gemini"
 access_token = "tok"
 refresh_token = "ref"
 expires_at = {}
+project_id = "proj"
 "#,
             ms_value
         );
         std::fs::write(&path, &toml).unwrap();
 
         let store = AuthStore::load(&path).unwrap();
-        let creds = store.get_copilot().unwrap();
+        let creds = store.get_gemini().unwrap();
         // Should have been divided by 1000
         assert_eq!(creds.expires_at, ms_value / 1000);
     }
@@ -587,18 +571,19 @@ expires_at = {}
             r#"
 version = 1
 
-[providers.copilot]
-kind = "copilot"
+[providers.gemini]
+kind = "gemini"
 access_token = "tok"
 refresh_token = "ref"
 expires_at = {}
+project_id = "proj"
 "#,
             secs_value
         );
         std::fs::write(&path, &toml).unwrap();
 
         let store = AuthStore::load(&path).unwrap();
-        let creds = store.get_copilot().unwrap();
+        let creds = store.get_gemini().unwrap();
         // Should remain unchanged
         assert_eq!(creds.expires_at, secs_value);
     }

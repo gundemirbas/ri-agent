@@ -197,7 +197,7 @@ mod tests {
         let html = build_session_export_html(
             &[Message::assistant("# Title\n\n`code`")],
             "/tmp",
-            "copilot",
+            "openai",
             "gpt-4o",
             None,
         );
@@ -210,7 +210,7 @@ mod tests {
         let html = build_session_export_html(
             &[Message::user("<script>alert(1)</script>ok")],
             "/tmp",
-            "copilot",
+            "openai",
             "gpt-4o",
             None,
         );
@@ -223,7 +223,7 @@ mod tests {
         let html = build_session_export_html(
             &[Message::tool_result("1", "line 1\n    line 2", false)],
             "/tmp",
-            "copilot",
+            "openai",
             "gpt-4o",
             None,
         );

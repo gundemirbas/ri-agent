@@ -7,9 +7,7 @@
 //!
 //! Protocol families:
 //! - [`to_openai_wire`]    — OpenAI Chat Completions
-//! - [`to_anthropic_wire`] — Anthropic Messages API
 //! - [`to_gemini_wire`]    — Google Gemini `contents` array
-//! - [`to_codex_wire`]     — OpenAI Responses API (Codex / GPT-5 style)
 //! - [`to_ollama_wire`]    — Ollama `/api/chat` (OpenAI-like with `thinking` and object `arguments`)
 //!
 //! ## Per-provider deviations
@@ -32,17 +30,6 @@ use super::common::normalize_tool_name;
 use super::{ImageData, Message, Role};
 
 // ── Shared helpers ─────────────────────────────────────────────────────────────
-
-/// Return the tool args as a JSON object, falling back to `{}` when absent or
-/// null.  Anthropic's API requires `input` to be a valid dictionary; a `null`
-/// value (which can occur when the LLM emits a tool call with no arguments, or
-/// when an old session file stores `"args": null`) causes a 400 error.
-fn tool_args_object(msg: &Message) -> serde_json::Value {
-    match &msg.tool_args {
-        Some(v) if v.is_object() => v.clone(),
-        _ => serde_json::json!({}),
-    }
-}
 
 // ── Shared traversal ──────────────────────────────────────────────────────────
 
@@ -134,22 +121,6 @@ fn openai_tool_result_content(tr: &Message) -> serde_json::Value {
         serde_json::json!([
             { "type": "text", "text": &tr.content },
             { "type": "image_url", "image_url": { "url": format!("data:{mime_type};base64,{base64}") } }
-        ])
-    } else {
-        serde_json::Value::String(tr.content.clone())
-    }
-}
-
-/// Build the `content` array for an Anthropic tool result message.
-///
-/// For image results the content carries both a `text` block (placeholder)
-/// and an `image` block with base64 data.  For text results it is a single
-/// `text` block.
-fn anthropic_tool_result_content(tr: &Message) -> serde_json::Value {
-    if let Some(ImageData { base64, mime_type }) = &tr.image_data {
-        serde_json::json!([
-            { "type": "text", "text": &tr.content },
-            { "type": "image", "source": { "type": "base64", "media_type": mime_type, "data": base64 } }
         ])
     } else {
         serde_json::Value::String(tr.content.clone())
@@ -272,100 +243,6 @@ pub fn to_openai_wire(messages: &[Message]) -> Vec<serde_json::Value> {
     result
 }
 
-// ── Anthropic Messages API ────────────────────────────────────────────────────
-
-/// Convert a xi-agent `Message` history to the Anthropic Messages API wire format.
-///
-/// System messages are skipped here (they must be extracted separately and
-/// passed as the top-level `system` field in the request body).
-/// Tool calls are grouped with their parent assistant turn into a single
-/// `content` array entry; tool results are emitted as a `"role":"user"` block.
-pub fn to_anthropic_wire(messages: &[Message]) -> Vec<serde_json::Value> {
-    let mut result: Vec<serde_json::Value> = Vec::new();
-
-    for turn in group_messages(messages) {
-        match turn {
-            Turn::System(_) => {}
-            Turn::User(msg) => {
-                result.push(serde_json::json!({
-                    "role": "user",
-                    "content": msg.content,
-                }));
-            }
-            Turn::Assistant { msg, tool_pairs } => {
-                let mut content: Vec<serde_json::Value> = Vec::new();
-
-                if !msg.content.is_empty() {
-                    content.push(serde_json::json!({
-                        "type": "text",
-                        "text": msg.content,
-                    }));
-                }
-
-                let mut tool_results: Vec<serde_json::Value> = Vec::new();
-                for (tc, tr_opt) in &tool_pairs {
-                    content.push(serde_json::json!({
-                        "type": "tool_use",
-                        "id": tc.tool_call_id.as_deref().unwrap_or("call_0"),
-                        "name": normalize_tool_name(tc.tool_name.as_deref().unwrap_or("")),
-                        "input": tool_args_object(tc),
-                    }));
-                    if let Some(tr) = tr_opt {
-                        let tr_content = anthropic_tool_result_content(tr);
-                        tool_results.push(serde_json::json!({
-                            "type": "tool_result",
-                            "tool_use_id": tr.tool_call_id.as_deref().unwrap_or("call_0"),
-                            "content": tr_content,
-                            "is_error": tr.is_error,
-                        }));
-                    }
-                }
-
-                if content.is_empty() {
-                    continue;
-                }
-
-                result.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": content,
-                }));
-
-                if !tool_results.is_empty() {
-                    result.push(serde_json::json!({
-                        "role": "user",
-                        "content": tool_results,
-                    }));
-                }
-            }
-            Turn::StandaloneToolCall(tc) => {
-                result.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": tc.tool_call_id.as_deref().unwrap_or("call_0"),
-                        "name": normalize_tool_name(tc.tool_name.as_deref().unwrap_or("")),
-                        "input": tool_args_object(tc),
-                    }],
-                }));
-            }
-            Turn::StandaloneToolResult(tr) => {
-                let tr_content = anthropic_tool_result_content(tr);
-                result.push(serde_json::json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tr.tool_call_id.as_deref().unwrap_or("call_0"),
-                        "content": tr_content,
-                        "is_error": tr.is_error,
-                    }],
-                }));
-            }
-        }
-    }
-
-    result
-}
-
 // ── Google Gemini ─────────────────────────────────────────────────────────────
 
 /// Convert a xi-agent `Message` history to the Gemini `contents` array wire format.
@@ -453,75 +330,6 @@ pub fn to_gemini_wire(messages: &[Message]) -> Vec<serde_json::Value> {
     }
 
     contents
-}
-
-// ── OpenAI Responses API (Codex / GPT-5) ─────────────────────────────────────
-
-/// Convert a xi-agent `Message` history to the OpenAI Responses API wire format.
-///
-/// System messages are skipped (passed as the `instructions` field).
-/// This format differs from Chat Completions: assistant messages use
-/// `"type":"message"` with `output_text` content; tool calls are
-/// `"type":"function_call"` items; tool results are
-/// `"type":"function_call_output"` items.
-///
-/// Codex iterates messages individually (flat model) — see the deviation
-/// table in the module doc.
-pub fn to_codex_wire(messages: &[Message]) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    let mut msg_idx = 0usize;
-
-    for msg in messages {
-        match msg.role {
-            Role::System => {}
-
-            Role::User => {
-                out.push(serde_json::json!({
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": msg.content }]
-                }));
-                msg_idx += 1;
-            }
-
-            Role::Assistant => {
-                out.push(serde_json::json!({
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "completed",
-                    "id": format!("msg_{msg_idx}"),
-                    "content": [{ "type": "output_text", "text": msg.content, "annotations": [] }]
-                }));
-                msg_idx += 1;
-            }
-
-            Role::ToolCall => {
-                let call_id = msg.tool_call_id.as_deref().unwrap_or("call_0");
-                let name = normalize_tool_name(msg.tool_name.as_deref().unwrap_or(""));
-                let args = msg
-                    .tool_args
-                    .as_ref()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "{}".to_string());
-                out.push(serde_json::json!({
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": args,
-                }));
-            }
-
-            Role::ToolResult => {
-                let call_id = msg.tool_call_id.as_deref().unwrap_or("call_0");
-                out.push(serde_json::json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": msg.content,
-                }));
-            }
-        }
-    }
-
-    out
 }
 
 // ── Ollama /api/chat ──────────────────────────────────────────────────────────
@@ -695,84 +503,6 @@ mod tests {
         assert_eq!(wire[0]["tool_calls"][0]["id"], "call_0");
     }
 
-    // ── to_anthropic_wire ─────────────────────────────────────────────────────
-
-    #[test]
-    fn anthropic_wire_normalizes_emoji_tool_name() {
-        let messages = vec![
-            Message::assistant(""),
-            Message::tool_call("id-1", "✏️", serde_json::json!({})),
-            Message::tool_result("id-1", "ok", false),
-        ];
-        let wire = to_anthropic_wire(&messages);
-        let tc_block = &wire[0]["content"][0];
-        assert_eq!(tc_block["name"], "write_file");
-    }
-
-    #[test]
-    fn anthropic_wire_skips_system_messages() {
-        let messages = vec![Message::system("be helpful"), Message::user("hello")];
-        let wire = to_anthropic_wire(&messages);
-        assert_eq!(wire.len(), 1);
-        assert_eq!(wire[0]["role"], "user");
-    }
-
-    #[test]
-    fn anthropic_wire_tool_results_emitted_as_user_block() {
-        let messages = vec![
-            Message::assistant("ok"),
-            Message::tool_call("id-1", "bash", serde_json::json!({})),
-            Message::tool_result("id-1", "done", false),
-        ];
-        let wire = to_anthropic_wire(&messages);
-        assert_eq!(wire.len(), 2);
-        assert_eq!(wire[1]["role"], "user");
-        assert_eq!(wire[1]["content"][0]["type"], "tool_result");
-    }
-
-    #[test]
-    fn anthropic_wire_null_tool_args_become_empty_object() {
-        // When the LLM emits a tool call with null args (a known model quirk),
-        // the Anthropic wire format must still emit an object for `input`, not
-        // null — Anthropic's API rejects null with a 400.
-        // Case 1: tool_args is None
-        let mut tc = Message::tool_call("id-1", "exec", serde_json::json!({}));
-        tc.tool_args = None;
-        let messages = vec![
-            Message::assistant(""),
-            tc,
-            Message::tool_result("id-1", "err", true),
-        ];
-        let wire = to_anthropic_wire(&messages);
-        assert!(wire[0]["content"][0]["input"].is_object());
-
-        // Case 2: tool_args is Some(Value::Null) — from "args": null in session file
-        let mut tc2 = Message::tool_call("id-2", "exec", serde_json::json!({}));
-        tc2.tool_args = Some(serde_json::Value::Null);
-        let messages2 = vec![
-            Message::assistant(""),
-            tc2,
-            Message::tool_result("id-2", "err", true),
-        ];
-        let wire2 = to_anthropic_wire(&messages2);
-        assert!(wire2[0]["content"][0]["input"].is_object());
-    }
-
-    #[test]
-    fn anthropic_wire_standalone_null_tool_args_become_empty_object() {
-        // Case 1: None
-        let mut tc = Message::tool_call("id-1", "exec", serde_json::json!({}));
-        tc.tool_args = None;
-        let wire = to_anthropic_wire(&[tc]);
-        assert!(wire[0]["content"][0]["input"].is_object());
-
-        // Case 2: Some(Value::Null)
-        let mut tc2 = Message::tool_call("id-2", "exec", serde_json::json!({}));
-        tc2.tool_args = Some(serde_json::Value::Null);
-        let wire2 = to_anthropic_wire(&[tc2]);
-        assert!(wire2[0]["content"][0]["input"].is_object());
-    }
-
     // ── to_gemini_wire ────────────────────────────────────────────────────────
 
     #[test]
@@ -798,31 +528,6 @@ mod tests {
         ];
         let wire = to_gemini_wire(&messages);
         assert_eq!(wire[1]["parts"][0]["functionResponse"]["name"], "bash");
-    }
-
-    // ── to_codex_wire ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn codex_wire_normalizes_emoji_tool_name() {
-        let messages = vec![Message::tool_call("id-1", "💻", serde_json::json!({}))];
-        let wire = to_codex_wire(&messages);
-        assert_eq!(wire[0]["name"], "bash");
-    }
-
-    #[test]
-    fn codex_wire_skips_system_messages() {
-        let messages = vec![Message::system("instructions"), Message::user("do it")];
-        let wire = to_codex_wire(&messages);
-        assert_eq!(wire.len(), 1);
-        assert_eq!(wire[0]["role"], "user");
-    }
-
-    #[test]
-    fn codex_wire_assistant_gets_type_message() {
-        let messages = vec![Message::assistant("reply")];
-        let wire = to_codex_wire(&messages);
-        assert_eq!(wire[0]["type"], "message");
-        assert_eq!(wire[0]["role"], "assistant");
     }
 
     // ── to_ollama_wire ────────────────────────────────────────────────────────

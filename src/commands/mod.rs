@@ -43,7 +43,7 @@ pub static COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "login",
         usage: "/login <provider>",
-        description: "Authenticate provider (copilot / codex / gemini)",
+        description: "Authenticate provider (gemini)",
         takes_arg: true,
     },
     SlashCommand {
@@ -97,11 +97,11 @@ pub enum CommandAction {
     Model(String),
     /// `/model` typed with no argument — show interactive selection menu.
     ModelNoArg,
-    /// Switch provider to the given name (e.g. `"copilot"`, `"openai"`).
+    /// Switch provider to the given name (e.g. `"openai"`).
     Provider(String),
     /// `/provider` typed with no argument — show interactive selection menu.
     ProviderNoArg,
-    /// Authenticate with provider by name (`copilot`, `codex`, `gemini`).
+    /// Authenticate with provider by name (`gemini`).
     Login(String),
     /// Set thinking/reasoning level.
     Thinking(String),
@@ -202,10 +202,6 @@ mod tests {
         assert!(matches!(
             parse("/thinking high"),
             Some(CommandAction::Thinking(l)) if l == "high"
-        ));
-        assert!(matches!(
-            parse("/login codex"),
-            Some(CommandAction::Login(p)) if p == "codex"
         ));
         assert!(matches!(
             parse("/login gemini"),

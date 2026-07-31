@@ -4,9 +4,7 @@ use std::{
 };
 
 use crate::auth::paths::auth_file_path;
-use crate::auth::types::{
-    AuthFile, CodexCredentials, CopilotCredentials, GeminiCredentials, ProviderCredentials,
-};
+use crate::auth::types::{AuthFile, GeminiCredentials, ProviderCredentials};
 
 pub struct AuthStore {
     path: PathBuf,
@@ -44,40 +42,6 @@ impl AuthStore {
         Ok(Self { path, data })
     }
 
-    pub fn get_copilot(&self) -> Option<CopilotCredentials> {
-        match self.data.providers.get("copilot") {
-            Some(ProviderCredentials::Copilot {
-                access_token,
-                refresh_token,
-                expires_at,
-                base_url,
-            }) => Some(CopilotCredentials {
-                access_token: access_token.clone(),
-                refresh_token: refresh_token.clone(),
-                expires_at: *expires_at,
-                base_url: base_url.clone(),
-            }),
-            _ => None,
-        }
-    }
-
-    pub fn get_codex(&self) -> Option<CodexCredentials> {
-        match self.data.providers.get("codex") {
-            Some(ProviderCredentials::Codex {
-                access_token,
-                refresh_token,
-                expires_at,
-                account_id,
-            }) => Some(CodexCredentials {
-                access_token: access_token.clone(),
-                refresh_token: refresh_token.clone(),
-                expires_at: *expires_at,
-                account_id: account_id.clone(),
-            }),
-            _ => None,
-        }
-    }
-
     pub fn get_gemini(&self) -> Option<GeminiCredentials> {
         match self.data.providers.get("gemini") {
             Some(ProviderCredentials::Gemini {
@@ -93,30 +57,6 @@ impl AuthStore {
             }),
             _ => None,
         }
-    }
-
-    pub fn set_copilot(&mut self, creds: CopilotCredentials) {
-        self.data.providers.insert(
-            "copilot".to_string(),
-            ProviderCredentials::Copilot {
-                access_token: creds.access_token,
-                refresh_token: creds.refresh_token,
-                expires_at: creds.expires_at,
-                base_url: creds.base_url,
-            },
-        );
-    }
-
-    pub fn set_codex(&mut self, creds: CodexCredentials) {
-        self.data.providers.insert(
-            "codex".to_string(),
-            ProviderCredentials::Codex {
-                access_token: creds.access_token,
-                refresh_token: creds.refresh_token,
-                expires_at: creds.expires_at,
-                account_id: creds.account_id,
-            },
-        );
     }
 
     pub fn set_gemini(&mut self, creds: GeminiCredentials) {
@@ -135,28 +75,6 @@ impl AuthStore {
     /// backend, routing to the correct typed setter by variant.
     pub fn set_from_credentials(&mut self, creds: ProviderCredentials) {
         match creds {
-            ProviderCredentials::Copilot {
-                access_token,
-                refresh_token,
-                expires_at,
-                base_url,
-            } => self.set_copilot(CopilotCredentials {
-                access_token,
-                refresh_token,
-                expires_at,
-                base_url,
-            }),
-            ProviderCredentials::Codex {
-                access_token,
-                refresh_token,
-                expires_at,
-                account_id,
-            } => self.set_codex(CodexCredentials {
-                access_token,
-                refresh_token,
-                expires_at,
-                account_id,
-            }),
             ProviderCredentials::Gemini {
                 access_token,
                 refresh_token,
@@ -174,8 +92,6 @@ impl AuthStore {
     /// Return the stored refresh token for `provider`, or `None` if absent.
     pub fn get_refresh_token(&self, provider: &str) -> Option<String> {
         match provider {
-            "copilot" => self.get_copilot().map(|c| c.refresh_token),
-            "codex" => self.get_codex().map(|c| c.refresh_token),
             "gemini" => self.get_gemini().map(|c| c.refresh_token),
             _ => None,
         }
@@ -201,24 +117,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn copilot_creds() -> CopilotCredentials {
-        CopilotCredentials {
-            access_token: "at_copilot".to_string(),
-            refresh_token: "rt_copilot".to_string(),
-            expires_at: 9_999_999_999,
-            base_url: Some("https://api.example.com".to_string()),
-        }
-    }
-
-    fn codex_creds() -> CodexCredentials {
-        CodexCredentials {
-            access_token: "at_codex".to_string(),
-            refresh_token: "rt_codex".to_string(),
-            expires_at: 8_888_888_888,
-            account_id: "acct_123".to_string(),
-        }
-    }
-
     fn gemini_creds() -> GeminiCredentials {
         GeminiCredentials {
             access_token: "at_gemini".to_string(),
@@ -233,45 +131,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
         let store = AuthStore::load(&path).unwrap();
-        assert!(store.get_copilot().is_none());
-        assert!(store.get_codex().is_none());
         assert!(store.get_gemini().is_none());
-    }
-
-    #[test]
-    fn round_trip_copilot() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("auth.toml");
-
-        let mut store = AuthStore::load(&path).unwrap();
-        store.set_copilot(copilot_creds());
-        store.save().unwrap();
-
-        let store2 = AuthStore::load(&path).unwrap();
-        let got = store2
-            .get_copilot()
-            .expect("copilot creds should be present");
-        assert_eq!(got.access_token, "at_copilot");
-        assert_eq!(got.refresh_token, "rt_copilot");
-        assert_eq!(got.expires_at, 9_999_999_999);
-        assert_eq!(got.base_url.as_deref(), Some("https://api.example.com"));
-    }
-
-    #[test]
-    fn round_trip_codex() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("auth.toml");
-
-        let mut store = AuthStore::load(&path).unwrap();
-        store.set_codex(codex_creds());
-        store.save().unwrap();
-
-        let store2 = AuthStore::load(&path).unwrap();
-        let got = store2.get_codex().expect("codex creds should be present");
-        assert_eq!(got.access_token, "at_codex");
-        assert_eq!(got.refresh_token, "rt_codex");
-        assert_eq!(got.expires_at, 8_888_888_888);
-        assert_eq!(got.account_id, "acct_123");
     }
 
     #[test]
@@ -292,19 +152,15 @@ mod tests {
     }
 
     #[test]
-    fn set_copilot_preserves_codex() {
+    fn set_gemini_survives_reload() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.toml");
 
         let mut store = AuthStore::load(&path).unwrap();
-        store.set_copilot(copilot_creds());
-        store.set_codex(codex_creds());
         store.set_gemini(gemini_creds());
         store.save().unwrap();
 
         let store2 = AuthStore::load(&path).unwrap();
-        assert!(store2.get_copilot().is_some(), "copilot should survive");
-        assert!(store2.get_codex().is_some(), "codex should survive");
         assert!(store2.get_gemini().is_some(), "gemini should survive");
     }
 
@@ -314,7 +170,7 @@ mod tests {
         let path = dir.path().join("auth.toml");
 
         let mut store = AuthStore::load(&path).unwrap();
-        store.set_copilot(copilot_creds());
+        store.set_gemini(gemini_creds());
         store.save().unwrap();
 
         assert!(path.exists(), "auth.toml should exist after save");
@@ -329,7 +185,7 @@ mod tests {
         let path = dir.path().join("auth.toml");
 
         let mut store = AuthStore::load(&path).unwrap();
-        store.set_copilot(copilot_creds());
+        store.set_gemini(gemini_creds());
         store.save().unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();

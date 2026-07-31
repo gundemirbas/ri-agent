@@ -8,7 +8,6 @@ pub enum ApiType {
     OpenAiCompatible,
     #[serde(rename = "openai-responses")]
     OpenAiResponses,
-    AnthropicCompatible,
     GeminiNative,
     OllamaChatApi,
     /// Internal only — used by the test provider. Never shown to users.
@@ -20,7 +19,6 @@ impl ApiType {
         match self {
             Self::OpenAiCompatible => "OpenAI-compatible",
             Self::OpenAiResponses => "OpenAI Responses",
-            Self::AnthropicCompatible => "Anthropic-compatible",
             Self::GeminiNative => "Gemini native",
             Self::OllamaChatApi => "Ollama chat API",
             Self::Test => "Test",
@@ -32,15 +30,11 @@ impl ApiType {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendPreset {
-    /// GitHub Copilot (cloud, managed routing)
-    Copilot,
     /// OpenAI API (cloud)
     #[serde(rename = "openai")]
     OpenAi,
     /// OpenRouter API (cloud)
     OpenRouter,
-    /// OpenAI Codex / chatgpt.com (cloud)
-    Codex,
     /// Google Gemini CLI / Cloud Code Assist (cloud)
     Gemini,
     /// Self-hosted Ollama server
@@ -133,7 +127,7 @@ pub struct BackendPresetDef {
     /// The recommended / default API type.
     pub default_api: ApiType,
     /// Whether the user should be allowed to choose the API type.
-    /// `false` means xi-agent picks internally (e.g. Copilot).
+    /// `false` means xi-agent picks the API internally.
     pub user_selects_api: bool,
     /// Whether the endpoint is predetermined, user-supplied, or overrideable.
     pub endpoint_behavior: EndpointBehavior,
@@ -146,21 +140,6 @@ pub struct BackendPresetDef {
 
 /// Static catalog of all supported backend presets.
 pub const BACKEND_PRESET_CATALOG: &[BackendPresetDef] = &[
-    BackendPresetDef {
-        id: "copilot",
-        label: "GitHub Copilot",
-        backend_class: BackendClass::BuiltInHosted,
-        allowed_apis: &[
-            ApiType::OpenAiCompatible,
-            ApiType::OpenAiResponses,
-            ApiType::AnthropicCompatible,
-        ],
-        default_api: ApiType::OpenAiCompatible,
-        user_selects_api: false,
-        endpoint_behavior: EndpointBehavior::Predetermined,
-        auth_mode: AuthMode::OAuthLogin,
-        url_normalization: None,
-    },
     BackendPresetDef {
         id: "openai",
         label: "OpenAI API",
@@ -188,17 +167,6 @@ pub const BACKEND_PRESET_CATALOG: &[BackendPresetDef] = &[
         }),
     },
     BackendPresetDef {
-        id: "codex",
-        label: "OpenAI Codex (chatgpt.com)",
-        backend_class: BackendClass::BuiltInHosted,
-        allowed_apis: &[ApiType::OpenAiResponses],
-        default_api: ApiType::OpenAiResponses,
-        user_selects_api: false,
-        endpoint_behavior: EndpointBehavior::Predetermined,
-        auth_mode: AuthMode::OAuthLogin,
-        url_normalization: None,
-    },
-    BackendPresetDef {
         id: "gemini",
         label: "Google Gemini CLI (Cloud Code Assist)",
         backend_class: BackendClass::BuiltInHosted,
@@ -213,11 +181,7 @@ pub const BACKEND_PRESET_CATALOG: &[BackendPresetDef] = &[
         id: "ollama",
         label: "Ollama",
         backend_class: BackendClass::UserSuppliedService,
-        allowed_apis: &[
-            ApiType::OllamaChatApi,
-            ApiType::OpenAiCompatible,
-            ApiType::AnthropicCompatible,
-        ],
+        allowed_apis: &[ApiType::OllamaChatApi, ApiType::OpenAiCompatible],
         default_api: ApiType::OllamaChatApi,
         user_selects_api: true,
         endpoint_behavior: EndpointBehavior::UserSupplied,
@@ -294,10 +258,8 @@ impl BackendPreset {
 
     pub fn id(&self) -> &'static str {
         match self {
-            Self::Copilot => "copilot",
             Self::OpenAi => "openai",
             Self::OpenRouter => "openrouter",
-            Self::Codex => "codex",
             Self::Gemini => "gemini",
             Self::Ollama => "ollama",
             Self::OllamaCom => "ollama-com",
@@ -317,8 +279,6 @@ impl BackendPreset {
     /// deletes them.  Credentials are collected on first selection.
     pub fn built_in_hosted() -> &'static [BackendPreset] {
         &[
-            Self::Copilot,
-            Self::Codex,
             Self::Gemini,
             Self::OpenAi,
             Self::OpenRouter,
@@ -328,10 +288,8 @@ impl BackendPreset {
 
     pub fn from_id(s: &str) -> Option<Self> {
         match s {
-            "copilot" => Some(Self::Copilot),
             "openai" => Some(Self::OpenAi),
             "openrouter" => Some(Self::OpenRouter),
-            "codex" => Some(Self::Codex),
             "gemini" => Some(Self::Gemini),
             "ollama" => Some(Self::Ollama),
             "ollama-com" => Some(Self::OllamaCom),
@@ -345,10 +303,8 @@ impl BackendPreset {
     /// Sensible default model name for first-time use.
     pub fn default_model(&self) -> &'static str {
         match self {
-            Self::Copilot => "gpt-4o",
             Self::OpenAi => "gpt-4o",
             Self::OpenRouter => "openai/gpt-4o",
-            Self::Codex => "gpt-5.4",
             Self::Gemini => "gemini-2.5-pro",
             Self::Ollama => "llama3.1",
             Self::OllamaCom => "llama3.1",
@@ -416,10 +372,8 @@ mod tests {
     #[test]
     fn every_backend_preset_has_catalog_entry() {
         let types = [
-            BackendPreset::Copilot,
             BackendPreset::OpenAi,
             BackendPreset::OpenRouter,
-            BackendPreset::Codex,
             BackendPreset::Gemini,
             BackendPreset::Ollama,
             BackendPreset::OllamaCom,
@@ -445,10 +399,8 @@ mod tests {
     #[test]
     fn backend_preset_round_trips_through_id() {
         let types = [
-            BackendPreset::Copilot,
             BackendPreset::OpenAi,
             BackendPreset::OpenRouter,
-            BackendPreset::Codex,
             BackendPreset::Gemini,
             BackendPreset::Ollama,
             BackendPreset::OllamaCom,
@@ -471,8 +423,6 @@ mod tests {
         assert_eq!(
             built_ins,
             &[
-                BackendPreset::Copilot,
-                BackendPreset::Codex,
                 BackendPreset::Gemini,
                 BackendPreset::OpenAi,
                 BackendPreset::OpenRouter,
@@ -499,9 +449,9 @@ mod tests {
             EndpointBehavior::Predetermined
         );
 
-        let copilot = BackendPreset::Copilot.def();
-        assert_eq!(copilot.auth_mode, AuthMode::OAuthLogin);
-        assert_eq!(copilot.endpoint_behavior, EndpointBehavior::Predetermined);
+        let gemini = BackendPreset::Gemini.def();
+        assert_eq!(gemini.auth_mode, AuthMode::OAuthLogin);
+        assert_eq!(gemini.endpoint_behavior, EndpointBehavior::Predetermined);
 
         let ollama = BackendPreset::Ollama.def();
         assert_eq!(ollama.backend_class, BackendClass::UserSuppliedService);
@@ -528,14 +478,14 @@ mod tests {
 
     #[test]
     fn provider_instance_effective_model_falls_back_to_default() {
-        let inst = ProviderInstance::new("copilot", BackendPreset::Copilot);
+        let inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
         assert_eq!(inst.effective_model(), "gpt-4o");
     }
 
     #[test]
     fn provider_instance_effective_model_uses_override() {
-        let mut inst = ProviderInstance::new("copilot", BackendPreset::Copilot);
-        inst.model = Some("claude-sonnet-4.5".to_string());
-        assert_eq!(inst.effective_model(), "claude-sonnet-4.5");
+        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
+        inst.model = Some("gpt-5".to_string());
+        assert_eq!(inst.effective_model(), "gpt-5");
     }
 }

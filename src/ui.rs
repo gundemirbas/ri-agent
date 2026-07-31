@@ -631,8 +631,8 @@ mod tests {
     fn make_app() -> App {
         use crate::config::DisplayConfig;
         let instance = crate::provider_instance::ProviderInstance::new(
-            "copilot",
-            crate::provider_instance::BackendPreset::Copilot,
+            "openai",
+            crate::provider_instance::BackendPreset::OpenAi,
         );
         App::new(
             instance,
@@ -964,14 +964,14 @@ mod tests {
     fn draw_login_mode_renders_auth_header_and_hides_input_textarea() {
         let mut app = make_app();
         app.login.active = true;
-        app.login.provider = Some("copilot".to_string());
+        app.login.provider = Some("gemini".to_string());
         app.login.info = "Waiting for browser".to_string();
 
         app.textarea.insert_char('x');
 
         let lines = render_to_plain_lines(&mut app, 80, 20);
         let joined = lines.join("\n");
-        assert!(joined.contains("Authenticating: copilot"), "{joined}");
+        assert!(joined.contains("Authenticating: gemini"), "{joined}");
         assert!(!joined.contains('x'), "{joined}");
     }
 
@@ -1013,20 +1013,9 @@ mod tests {
 
         let lines = render_to_plain_lines(&mut app, 120, 20);
         let joined = lines.join("\n");
-        assert!(joined.contains("provider copilot"), "{joined}");
+        assert!(joined.contains("provider openai"), "{joined}");
         assert!(joined.contains("model gpt-4o"), "{joined}");
         assert!(joined.contains("context"), "{joined}");
-    }
-
-    #[test]
-    fn login_content_uses_device_flow_instruction() {
-        let mut app = make_app();
-        app.login.auth_flow = Some(AuthFlow::DeviceCode);
-        app.login.info = "Waiting".to_string();
-
-        let lines = build_login_content_lines(&mut app, 80);
-        let row0 = line_text(&lines[0]);
-        assert!(row0.contains("enter the code shown"), "{row0}");
     }
 
     #[test]
@@ -1765,7 +1754,7 @@ mod tests {
     fn info_line_renders_context_utilization_when_available() {
         let line = info::build_info_line(
             &crate::theme::InfoTheme::default(),
-            "copilot",
+            "openai",
             "gpt-4o",
             Some("medium"),
             None,
@@ -1801,7 +1790,7 @@ mod tests {
     fn info_line_shows_agent_when_set() {
         let line = info::build_info_line(
             &crate::theme::InfoTheme::default(),
-            "copilot",
+            "openai",
             "gpt-4o",
             None,
             Some("explorer"),
@@ -1819,7 +1808,7 @@ mod tests {
     fn info_line_omits_agent_when_none() {
         let line = info::build_info_line(
             &crate::theme::InfoTheme::default(),
-            "copilot",
+            "openai",
             "gpt-4o",
             None,
             None,

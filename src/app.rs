@@ -915,7 +915,7 @@ impl App {
     /// been populated.  This covers two cases:
     /// 1. No model configured — the list is needed so the user can pick one.
     /// 2. Model configured — the fetch is still beneficial because it populates
-    ///    the Copilot model metadata cache (context-window size, vendor) from
+    ///    the provider model metadata cache (context-window size, vendor) from
     ///    the live API, which otherwise falls back to the hard-coded table.
     ///
     /// Does not trigger when no provider has been selected — on a clean
@@ -1565,7 +1565,7 @@ mod tests {
     fn enter_provider_selection_mode_lists_providers_and_login_entry() {
         let mut app = make_app();
         let providers = vec![
-            ProviderInstance::new("copilot", BackendPreset::Copilot),
+            ProviderInstance::new("openai", BackendPreset::OpenAi),
             ProviderInstance::new("gpu-box", BackendPreset::Ollama),
             ProviderInstance::new("work-webui", BackendPreset::OpenWebUi),
         ];
@@ -1580,7 +1580,7 @@ mod tests {
             .collect();
 
         assert!(items.contains(&"/login"));
-        assert!(items.contains(&"/provider copilot"));
+        assert!(items.contains(&"/provider openai"));
         assert!(items.contains(&"/provider gpu-box"));
         assert!(items.contains(&"/provider work-webui"));
     }
@@ -1723,7 +1723,7 @@ mod tests {
     fn provider_selection_mode_reports_selected_provider_id() {
         let mut app = make_app();
         app.enter_provider_selection_mode(&[
-            ProviderInstance::new("copilot", BackendPreset::Copilot),
+            ProviderInstance::new("openai", BackendPreset::OpenAi),
             ProviderInstance::new("gpu-box", BackendPreset::Ollama),
         ]);
         app.selection.selected = app
@@ -1821,7 +1821,7 @@ mod tests {
         let mut app = make_app();
         app.provider.pending_setup = Some(PendingProviderSetup::new(String::new()));
         app.set_pending_provider_backend_preset(BackendPreset::Ollama);
-        app.set_pending_provider_api_type(ApiType::AnthropicCompatible);
+        app.set_pending_provider_api_type(ApiType::OpenAiCompatible);
         if let Some(setup) = app.provider.pending_setup.as_mut() {
             setup.base_url = Some("http://mydomain.com:11434".to_string());
         }
@@ -1831,7 +1831,7 @@ mod tests {
             .expect("pending provider instance");
         assert_eq!(instance.id, "ollama-mydomain.com");
         assert_eq!(instance.backend_preset, BackendPreset::Ollama);
-        assert_eq!(instance.api_type, ApiType::AnthropicCompatible);
+        assert_eq!(instance.api_type, ApiType::OpenAiCompatible);
     }
 
     #[test]
@@ -1865,14 +1865,14 @@ mod tests {
         let mut app = make_app();
         app.provider.pending_setup = Some(PendingProviderSetup::new(String::new()));
         app.set_pending_provider_backend_preset(BackendPreset::Ollama);
-        app.set_pending_provider_api_type(ApiType::AnthropicCompatible);
+        app.set_pending_provider_api_type(ApiType::OpenAiCompatible);
 
         let instance = app
             .pending_provider_instance()
             .expect("pending provider instance");
         assert_eq!(instance.id, "ollama-ollama");
         assert_eq!(instance.backend_preset, BackendPreset::Ollama);
-        assert_eq!(instance.api_type, ApiType::AnthropicCompatible);
+        assert_eq!(instance.api_type, ApiType::OpenAiCompatible);
     }
 
     #[test]
@@ -1880,14 +1880,14 @@ mod tests {
         let mut app = make_app();
         app.provider.pending_setup = Some(PendingProviderSetup::new("gpu-box".to_string()));
         app.set_pending_provider_backend_preset(BackendPreset::Ollama);
-        app.set_pending_provider_api_type(ApiType::AnthropicCompatible);
+        app.set_pending_provider_api_type(ApiType::OpenAiCompatible);
 
         let instance = app
             .pending_provider_instance()
             .expect("pending provider instance");
         assert_eq!(instance.id, "gpu-box");
         assert_eq!(instance.backend_preset, BackendPreset::Ollama);
-        assert_eq!(instance.api_type, ApiType::AnthropicCompatible);
+        assert_eq!(instance.api_type, ApiType::OpenAiCompatible);
     }
 
     #[test]

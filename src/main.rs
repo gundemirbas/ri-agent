@@ -632,14 +632,6 @@ fn handle_change_provider(app: &mut App, config: &mut XiConfig, id: String) -> b
 
         if inst.backend_preset.def().auth_mode == AuthMode::OAuthLogin {
             let has_creds = match inst.backend_preset {
-                BackendPreset::Copilot => auth::AuthStore::load_default()
-                    .ok()
-                    .and_then(|s| s.get_copilot())
-                    .is_some(),
-                BackendPreset::Codex => auth::AuthStore::load_default()
-                    .ok()
-                    .and_then(|s| s.get_codex())
-                    .is_some(),
                 BackendPreset::Gemini => auth::AuthStore::load_default()
                     .ok()
                     .and_then(|s| s.get_gemini())
@@ -875,7 +867,7 @@ mod tests {
     fn resolve_provider_instance_rejects_unknown_cli_provider() {
         let mut cfg = XiConfig::default();
         cfg.providers
-            .push(ProviderInstance::new("copilot", BackendPreset::Copilot));
+            .push(ProviderInstance::new("openai", BackendPreset::OpenAi));
         cfg.providers.push(ProviderInstance::new(
             "work-webui",
             BackendPreset::OpenWebUi,
@@ -884,10 +876,7 @@ mod tests {
         let err = provider_setup::resolve_provider_instance(Some("does-not-exist"), &cfg)
             .expect_err("unknown provider should be rejected");
 
-        assert_eq!(
-            err,
-            "unknown provider 'does-not-exist'. Expected one of: codex, copilot, gemini, ollama-com, openai, openrouter, work-webui, test"
-        );
+        assert!(err.contains("unknown provider 'does-not-exist'"), "{err}");
     }
 
     #[test]
@@ -897,7 +886,7 @@ mod tests {
             ..XiConfig::default()
         };
         cfg.providers
-            .push(ProviderInstance::new("copilot", BackendPreset::Copilot));
+            .push(ProviderInstance::new("openai", BackendPreset::OpenAi));
         cfg.providers.push(ProviderInstance::new(
             "work-webui",
             BackendPreset::OpenWebUi,
@@ -915,29 +904,29 @@ mod tests {
 
         let instance = provider_setup::resolve_default_provider_instance(&cfg);
 
-        // First effective provider is the first built-in alphabetically: codex.
-        assert_eq!(instance.id, "codex");
-        assert_eq!(instance.backend_preset, BackendPreset::Codex);
+        // First effective provider is the first built-in alphabetically: gemini.
+        assert_eq!(instance.id, "gemini");
+        assert_eq!(instance.backend_preset, BackendPreset::Gemini);
     }
 
     #[test]
     fn resolve_model_uses_instance_model() {
-        let mut inst = ProviderInstance::new("copilot", BackendPreset::Copilot);
-        inst.model = Some("gpt-5.3-codex".to_string());
+        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
+        inst.model = Some("gpt-5".to_string());
         let model = provider_setup::resolve_model_for_instance(None, &inst);
-        assert_eq!(model, "gpt-5.3-codex");
+        assert_eq!(model, "gpt-5");
     }
 
     #[test]
     fn resolve_model_falls_back_to_service_default() {
-        let inst = ProviderInstance::new("copilot", BackendPreset::Copilot);
+        let inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
         let model = provider_setup::resolve_model_for_instance(None, &inst);
-        assert_eq!(model, BackendPreset::Copilot.default_model());
+        assert_eq!(model, BackendPreset::OpenAi.default_model());
     }
 
     #[test]
     fn with_resolved_model_applies_cli_override() {
-        let mut inst = ProviderInstance::new("copilot", BackendPreset::Copilot);
+        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
         inst.model = Some("gpt-4o".to_string());
 
         let resolved = with_resolved_model(Some("gpt-5"), &inst);
@@ -948,7 +937,7 @@ mod tests {
 
     #[test]
     fn with_resolved_model_preserves_instance_model_without_override() {
-        let mut inst = ProviderInstance::new("copilot", BackendPreset::Copilot);
+        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
         inst.model = Some("gpt-4o".to_string());
 
         let resolved = with_resolved_model(None, &inst);

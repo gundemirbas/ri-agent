@@ -42,9 +42,9 @@ pub(crate) fn provider_display_name(instance: &ProviderInstance) -> String {
 }
 
 /// Returns `true` if `provider` is one of the OAuth providers that support
-/// token refresh (copilot, codex, gemini).
+/// token refresh (gemini).
 fn provider_supports_token_refresh(provider: &str) -> bool {
-    matches!(provider, "copilot" | "codex" | "gemini")
+    matches!(provider, "gemini")
 }
 
 /// Proactively refresh the token for `provider` if it is expired or expiring

@@ -786,7 +786,7 @@ impl App {
         // display log — the agent's ToolCall message already represents this
         // in the conversation history and UI. Adding an extra assistant
         // message here would corrupt the tool_use / tool_result pairing
-        // expected by the Anthropic API.
+        // expected by the provider (tool_use / tool_result pairing).
 
         if options.is_empty() {
             // No options: go straight to freeform input so the user can type

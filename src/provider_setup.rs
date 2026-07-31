@@ -47,7 +47,7 @@ impl LlmProvider for UnavailableProvider {
 /// Resolution order:
 /// 1. `config.provider` matched against effective providers
 /// 2. First effective provider
-/// 3. Synthetic copilot default
+/// 3. Fallback synthetic default (OpenAI)
 pub(crate) fn resolve_default_provider_instance(config: &XiConfig) -> ProviderInstance {
     let effective = config.resolve_effective_providers();
 
@@ -60,7 +60,7 @@ pub(crate) fn resolve_default_provider_instance(config: &XiConfig) -> ProviderIn
     effective
         .into_iter()
         .next()
-        .unwrap_or_else(|| ProviderInstance::new("copilot", BackendPreset::Copilot))
+        .unwrap_or_else(|| ProviderInstance::new("openai", BackendPreset::OpenAi))
 }
 
 pub(crate) fn resolve_provider_instance(

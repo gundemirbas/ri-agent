@@ -104,10 +104,10 @@ mod tests {
 
     #[test]
     fn unauthorized_constructor() {
-        let err = ProviderError::unauthorized("copilot", "token expired");
+        let err = ProviderError::unauthorized("openai", "token expired");
         assert_eq!(err.kind, ProviderErrorKind::Unauthorized);
         assert_eq!(err.status_code, Some(401));
-        assert_eq!(err.source, "copilot");
+        assert_eq!(err.source, "openai");
         assert_eq!(err.message, "token expired");
     }
 
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn rate_limited_constructor() {
-        let err = ProviderError::rate_limited("anthropic", "too many requests");
+        let err = ProviderError::rate_limited("openai", "too many requests");
         assert_eq!(err.kind, ProviderErrorKind::RateLimited);
         assert_eq!(err.status_code, Some(429));
     }
@@ -148,8 +148,8 @@ mod tests {
 
     #[test]
     fn display_with_status_code() {
-        let err = ProviderError::unauthorized("copilot", "invalid token");
-        assert_eq!(format!("{err}"), "copilot (401): invalid token");
+        let err = ProviderError::unauthorized("openai", "invalid token");
+        assert_eq!(format!("{err}"), "openai (401): invalid token");
     }
 
     #[test]

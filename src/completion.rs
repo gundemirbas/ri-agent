@@ -318,7 +318,7 @@ pub fn completions_for(
                     .filter(|p| p.id.starts_with(arg))
                     .map(|p| CompletionItem::from_provider(&p.id, &p.label()))
                     .collect(),
-                "login" => ["copilot", "codex", "gemini"]
+                "login" => ["gemini"]
                     .iter()
                     .filter(|p| p.starts_with(arg))
                     .map(|p| CompletionItem {

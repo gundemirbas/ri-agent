@@ -42,7 +42,7 @@ impl OAuthBackend for MockOAuthBackend {
         on_event(LoginEvent::AuthCode {
             url: "https://mock.example.com/device".into(),
             code: Some("MOCK-CODE".into()),
-            flow: crate::auth::AuthFlow::DeviceCode,
+            flow: crate::auth::AuthFlow::RedirectCallback,
         });
 
         let result = self.login_result.lock().unwrap().take();
@@ -63,12 +63,12 @@ impl OAuthBackend for MockOAuthBackend {
     }
 }
 
-/// Create fake Copilot credentials for testing.
-pub fn fake_copilot_creds() -> ProviderCredentials {
-    ProviderCredentials::Copilot {
-        access_token: "fake-copilot-token".to_string(),
+/// Create fake Gemini credentials for testing.
+pub fn fake_gemini_creds() -> ProviderCredentials {
+    ProviderCredentials::Gemini {
+        access_token: "fake-gemini-token".to_string(),
         refresh_token: "fake-refresh-token".to_string(),
         expires_at: 9999999999i64,
-        base_url: None,
+        project_id: "fake-project".to_string(),
     }
 }

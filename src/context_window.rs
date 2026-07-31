@@ -1,22 +1,16 @@
-use crate::llm::{copilot::CopilotProvider, ollama::OllamaProvider};
+use crate::llm::ollama::OllamaProvider;
 
 /// Return the context-window size (in tokens) for a known model name.
 ///
-/// Checks the Copilot model metadata cache first (populated by
-/// `CopilotProvider::list_models()`), then the Ollama `/api/ps` runtime
-/// cache (actual context for currently loaded models), and finally a
-/// hard-coded fallback table for providers and models not covered above.
+/// Checks the Ollama `/api/ps` runtime cache (actual context for currently
+/// loaded models) first, and finally a hard-coded fallback table for providers
+/// and models not covered above.
 ///
 /// Returns `None` for unrecognised models or Ollama models that are not
 /// currently loaded (we cannot trust the GGUF `context_length` from
 /// `/api/show` because the server may override it with `num_ctx`).
 pub fn context_window_for_model(model: &str) -> Option<usize> {
-    // Primary: live metadata from the Copilot /models API.
-    if let Some(cw) = CopilotProvider::cached_context_window(model) {
-        return Some(cw);
-    }
-
-    // Secondary: runtime context from Ollama /api/ps (loaded models only).
+    // Primary: runtime context from Ollama /api/ps (loaded models only).
     if let Some(cw) = OllamaProvider::cached_context_window(model) {
         return Some(cw);
     }
@@ -124,33 +118,6 @@ pub fn scaled_token_budget(context_window: usize, floor: usize, scale: usize) ->
 #[cfg(test)]
 mod tests {
     use super::{context_window_for_model, scaled_token_budget};
-    use crate::llm::copilot::test_helpers;
-
-    // ── Cache-driven context window ──────────────────────────────────────────
-
-    #[test]
-    fn context_window_prefers_cache_over_hard_coded_table() {
-        // Seed cache with a non-standard size to prove it wins over the table.
-        test_helpers::insert_cache("__gpt_4o_cache_test__", "Azure OpenAI", Some(999_999));
-        assert_eq!(
-            context_window_for_model("__gpt_4o_cache_test__"),
-            Some(999_999)
-        );
-    }
-
-    #[test]
-    fn context_window_falls_back_to_table_when_cache_miss() {
-        // gpt-4o is not seeded with this exact key — falls back to hard-coded table.
-        assert_eq!(context_window_for_model("gpt-4o"), Some(128_000));
-    }
-
-    #[test]
-    fn context_window_falls_back_to_table_when_cache_has_no_limit() {
-        test_helpers::insert_cache("__no_limit_model__", "OpenAI", None);
-        // Cache entry exists but carries no context-window value; table has no
-        // match either → None.
-        assert_eq!(context_window_for_model("__no_limit_model__"), None);
-    }
 
     #[test]
     fn context_window_claude4_returns_1m() {

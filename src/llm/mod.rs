@@ -359,10 +359,7 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
-pub mod anthropic;
-pub mod codex;
 pub mod common;
-pub mod copilot;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;

@@ -33,9 +33,6 @@ pub(super) fn build_login_content_lines(app: &mut App, width: usize) -> Vec<Line
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let instruction = match app.login.auth_flow {
-        Some(AuthFlow::DeviceCode) => {
-            "  Open the URL below, then enter the code shown into the browser."
-        }
         Some(AuthFlow::RedirectCallback) => {
             "  Open the URL below; the browser will redirect back automatically."
         }
