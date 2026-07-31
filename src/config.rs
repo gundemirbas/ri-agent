@@ -49,8 +49,6 @@ pub struct XiConfig {
     // reads from them).
     #[serde(default)]
     pub openai: OpenAiConfig,
-    #[serde(default)]
-    pub gemini: GeminiConfig,
 }
 
 impl XiConfig {
@@ -61,15 +59,8 @@ impl XiConfig {
 
     /// Return a mutable reference to the provider instance with the given id.
     ///
-    /// For built-in hosted providers, auto-creates a config entry when none
-    /// exists yet (so that model/API-key changes can be persisted).
+    /// Return a mutable reference to the provider instance with the given id.
     pub fn find_provider_mut(&mut self, id: &str) -> Option<&mut ProviderInstance> {
-        if !self.providers.iter().any(|p| p.id == id)
-            && let Some(preset) = BackendPreset::from_id(id)
-            && preset.def().backend_class == BackendClass::BuiltInHosted
-        {
-            self.providers.push(ProviderInstance::new(id, preset));
-        }
         self.providers.iter_mut().find(|p| p.id == id)
     }
 
@@ -146,12 +137,6 @@ impl XiConfig {
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
 pub struct OpenAiConfig {
     pub api_key: Option<String>,
-    pub base_url: Option<String>,
-    pub model: Option<String>,
-}
-
-#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
-pub struct GeminiConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
 }
@@ -258,12 +243,8 @@ recent_endpoints = ["http://localhost:11434", "http://gpu-box:11434"]
             Some("https://api.openai.com/v1")
         );
         assert_eq!(cfg.openai.model.as_deref(), Some("gpt-4o-mini"));
-        assert_eq!(
-            cfg.gemini.base_url.as_deref(),
-            Some("https://cloudcode-pa.googleapis.com")
-        );
-        assert_eq!(cfg.gemini.model.as_deref(), Some("gemini-2.5-pro"));
-        // Legacy [ollama] section is silently ignored — no provider instance synthesised.
+        // Legacy [gemini]/[ollama] sections are silently ignored — no provider
+        // instance synthesised.
         assert!(cfg.providers.is_empty());
     }
 
@@ -303,7 +284,7 @@ provider = "work-webui"
 
 [[providers]]
 id = "work-webui"
-backend_preset = "open-webui"
+backend_preset = "openai-compatible"
 api_type = "openai-compatible"
 base_url = "https://work.example.com"
 api_key = "tok"
@@ -311,20 +292,20 @@ model = "llama3.1"
 
 [[providers]]
 id = "gpu-box"
-backend_preset = "ollama"
-api_type = "ollama-chat-api"
+backend_preset = "openai-compatible"
+api_type = "openai-compatible"
 base_url = "http://gpu-box:11434"
 "#;
         let cfg = XiConfig::from_toml_str(raw).unwrap();
         assert_eq!(cfg.providers.len(), 2);
 
         let webui = cfg.find_provider("work-webui").unwrap();
-        assert_eq!(webui.backend_preset, BackendPreset::OpenWebUi);
+        assert_eq!(webui.backend_preset, BackendPreset::OpenAiCompatible);
         assert_eq!(webui.base_url.as_deref(), Some("https://work.example.com"));
 
         let gpu = cfg.find_provider("gpu-box").unwrap();
-        assert_eq!(gpu.backend_preset, BackendPreset::Ollama);
-        assert_eq!(gpu.api_type, ApiType::OllamaChatApi);
+        assert_eq!(gpu.backend_preset, BackendPreset::OpenAiCompatible);
+        assert_eq!(gpu.api_type, ApiType::OpenAiCompatible);
 
         assert!(cfg.find_provider("openrouter").is_none());
 
@@ -335,23 +316,23 @@ base_url = "http://gpu-box:11434"
     fn upsert_and_remove_provider() {
         let mut cfg = XiConfig::default();
         use crate::provider_instance::ProviderInstance;
-        let inst = ProviderInstance::new("my-ollama", BackendPreset::Ollama);
+        let inst = ProviderInstance::new("my-provider", BackendPreset::OpenAiCompatible);
         cfg.upsert_provider(inst);
-        assert!(cfg.find_provider("my-ollama").is_some());
+        assert!(cfg.find_provider("my-provider").is_some());
 
         // Upsert again with model set
-        let mut inst2 = ProviderInstance::new("my-ollama", BackendPreset::Ollama);
+        let mut inst2 = ProviderInstance::new("my-provider", BackendPreset::OpenAiCompatible);
         inst2.model = Some("mistral".into());
         cfg.upsert_provider(inst2);
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(
-            cfg.find_provider("my-ollama").unwrap().model.as_deref(),
+            cfg.find_provider("my-provider").unwrap().model.as_deref(),
             Some("mistral")
         );
 
-        assert!(cfg.remove_provider("my-ollama"));
-        assert!(cfg.find_provider("my-ollama").is_none());
-        assert!(!cfg.remove_provider("my-ollama")); // idempotent
+        assert!(cfg.remove_provider("my-provider"));
+        assert!(cfg.find_provider("my-provider").is_none());
+        assert!(!cfg.remove_provider("my-provider")); // idempotent
     }
 
     #[test]
@@ -381,17 +362,20 @@ base_url = "http://gpu-box:11434"
     #[test]
     fn resolve_effective_providers_includes_user_providers() {
         let mut cfg = XiConfig::default();
-        cfg.upsert_provider(ProviderInstance::new("my-ollama", BackendPreset::Ollama));
+        cfg.upsert_provider(ProviderInstance::new(
+            "my-provider",
+            BackendPreset::OpenAiCompatible,
+        ));
         let effective = cfg.resolve_effective_providers();
-        assert!(effective.iter().any(|p| p.id == "my-ollama"));
-        // Built-ins still present.
-        assert!(effective.iter().any(|p| p.id == "gemini"));
+        assert!(effective.iter().any(|p| p.id == "my-provider"));
+        // No unconditional hosted singletons anymore.
+        assert!(effective.iter().all(|p| p.id != "gemini"));
     }
 
     #[test]
     fn resolve_effective_providers_prefers_config_override_for_builtin() {
         let mut cfg = XiConfig::default();
-        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
+        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAiCompatible);
         inst.model = Some("override-model".to_string());
         cfg.upsert_provider(inst);
         let effective = cfg.resolve_effective_providers();
@@ -402,13 +386,17 @@ base_url = "http://gpu-box:11434"
     #[test]
     fn upsert_provider_replaces_existing_provider_after_rename_when_old_id_removed() {
         let mut cfg = XiConfig::default();
-        let mut original =
-            crate::provider_instance::ProviderInstance::new("gpu-box", BackendPreset::Ollama);
+        let mut original = crate::provider_instance::ProviderInstance::new(
+            "gpu-box",
+            BackendPreset::OpenAiCompatible,
+        );
         original.base_url = Some("http://gpu-box:11434".to_string());
         cfg.upsert_provider(original);
 
-        let mut renamed =
-            crate::provider_instance::ProviderInstance::new("renamed-box", BackendPreset::Ollama);
+        let mut renamed = crate::provider_instance::ProviderInstance::new(
+            "renamed-box",
+            BackendPreset::OpenAiCompatible,
+        );
         renamed.base_url = Some("http://gpu-box:11434".to_string());
 
         assert!(cfg.remove_provider("gpu-box"));

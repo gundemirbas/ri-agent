@@ -26,7 +26,6 @@ mod app_event;
 mod app_interaction;
 mod app_submission;
 mod ask_user_state;
-mod auth;
 mod clipboard;
 mod commands;
 mod completion;
@@ -42,7 +41,6 @@ mod keybindings;
 mod live_turn;
 mod llm;
 mod log_view_state;
-mod login_state;
 mod markdown;
 mod migrate;
 mod mouse_select;
@@ -81,11 +79,8 @@ use app_event::AppEvent;
 use config::XiConfig;
 use llm::{LlmProvider, Message};
 use provider::{ThinkingSupport, build_provider_for_instance, thinking_support_for_instance};
-use provider_instance::AuthMode;
-use provider_instance::BackendPreset;
 use provider_instance::ProviderInstance;
 use provider_manager::PendingProviderSetup;
-use provider_manager::ProviderSetupStep;
 use thinking::ThinkingLevel;
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -297,27 +292,8 @@ async fn main() -> io::Result<()> {
             }
         };
 
-        if app.login.retry_after_refresh {
-            app.login.retry_after_refresh = false;
-            app.retry_last_request(&provider);
-        }
-
-        if app.login.retry_model_fetch_after_refresh {
-            app.login.retry_model_fetch_after_refresh = false;
-            app.start_model_fetch(&provider);
-        }
-
         if app.should_auto_query_model() {
             app.start_model_fetch(&provider);
-        }
-
-        // On clean install with no provider selected, show the login menu
-        // automatically so the user can connect to a service.
-        if !app.provider.provider_selected
-            && !app.selection.active
-            && app.provider.setup_step == ProviderSetupStep::Idle
-        {
-            app.enter_login_selection_mode();
         }
 
         match run(&mut terminal, &mut app, &provider, &config).await {
@@ -331,8 +307,6 @@ async fn main() -> io::Result<()> {
                     &window_title,
                 )?;
             }
-
-            Ok(RunResult::RebuildProvider) => {}
 
             Ok(RunResult::ReloadContext) => {
                 handle_reload_context(&mut app, &file_tracker, app_event_tx.clone(), &cwd).await;
@@ -466,10 +440,9 @@ async fn run(
                             _ => {}
                         }
                     },
-                    Event::Paste(text)
-                        if !app.login.active => {
-                            apply_paste(app, provider, &text);
-                        },
+                    Event::Paste(text) => {
+                        apply_paste(app, provider, &text);
+                    },
                     _ => {}
                 }
 
@@ -488,18 +461,13 @@ async fn run(
             Some(ev) = app.recv_app_event() => {
                 needs_redraw = true;
                 app.apply_app_event(ev);
-                if app.login.needs_rebuild {
-                    app.login.needs_rebuild = false;
-                    return Ok(RunResult::RebuildProvider);
-                }
             }
 
             // ── Throbber animation tick ───────────────────────────────────────
             _ = tick_interval.tick() => {
                 app.tick();
-                // Redraw when the turn is active or when a token refresh is in
-                // flight — the throbber should animate in both cases.
-                if app.streaming() || app.login.refresh_in_progress {
+                // Redraw when the turn is active — the throbber should animate.
+                if app.streaming() {
                     needs_redraw = true;
                 }
             }
@@ -623,29 +591,6 @@ fn handle_change_provider(app: &mut App, config: &mut XiConfig, id: String) -> b
             return true;
         }
 
-        if inst.backend_preset.def().auth_mode == AuthMode::OAuthLogin {
-            let has_creds = match inst.backend_preset {
-                BackendPreset::Gemini => auth::AuthStore::load_default()
-                    .ok()
-                    .and_then(|s| s.get_gemini())
-                    .is_some(),
-                _ => false,
-            };
-            if !has_creds {
-                app.provider.current_instance = inst;
-                app.provider.current_model = provider_setup::resolve_model_for_instance(
-                    None,
-                    &app.provider.current_instance,
-                );
-                app.provider.current_thinking = provider_setup::resolve_thinking_level_for_model(
-                    config,
-                    &app.provider.current_model,
-                );
-                app.start_login(&id);
-                return true;
-            }
-        }
-
         app.provider.current_instance = inst;
         app.provider.current_model =
             provider_setup::resolve_model_for_instance(None, &app.provider.current_instance);
@@ -761,7 +706,6 @@ fn handle_remove_provider(app: &mut App, config: &mut XiConfig, id: String) {
 
 fn handle_change_thinking(app: &mut App, config: &mut XiConfig, level: ThinkingLevel) {
     app.provider.current_thinking = level;
-    app.provider.current_thinking = level;
     app.record_thinking_level_changed();
     provider_setup::persist_provider_model_selection_v2(config, app);
     app.provider.instances = config.resolve_effective_providers();
@@ -835,14 +779,14 @@ mod tests {
         let mut cfg = XiConfig::default();
         cfg.providers.push(ProviderInstance::new(
             "work-webui",
-            BackendPreset::OpenWebUi,
+            BackendPreset::OpenAiCompatible,
         ));
 
         let instance = provider_setup::resolve_provider_instance(Some("work-webui"), &cfg)
             .expect("provider should resolve");
 
         assert_eq!(instance.id, "work-webui");
-        assert_eq!(instance.backend_preset, BackendPreset::OpenWebUi);
+        assert_eq!(instance.backend_preset, BackendPreset::OpenAiCompatible);
     }
 
     #[test]
@@ -859,11 +803,13 @@ mod tests {
     #[test]
     fn resolve_provider_instance_rejects_unknown_cli_provider() {
         let mut cfg = XiConfig::default();
-        cfg.providers
-            .push(ProviderInstance::new("openai", BackendPreset::OpenAi));
+        cfg.providers.push(ProviderInstance::new(
+            "openai",
+            BackendPreset::OpenAiCompatible,
+        ));
         cfg.providers.push(ProviderInstance::new(
             "work-webui",
-            BackendPreset::OpenWebUi,
+            BackendPreset::OpenAiCompatible,
         ));
 
         let err = provider_setup::resolve_provider_instance(Some("does-not-exist"), &cfg)
@@ -878,17 +824,19 @@ mod tests {
             provider: Some("work-webui".to_string()),
             ..XiConfig::default()
         };
-        cfg.providers
-            .push(ProviderInstance::new("openai", BackendPreset::OpenAi));
+        cfg.providers.push(ProviderInstance::new(
+            "openai",
+            BackendPreset::OpenAiCompatible,
+        ));
         cfg.providers.push(ProviderInstance::new(
             "work-webui",
-            BackendPreset::OpenWebUi,
+            BackendPreset::OpenAiCompatible,
         ));
 
         let instance = provider_setup::resolve_default_provider_instance(&cfg);
 
         assert_eq!(instance.id, "work-webui");
-        assert_eq!(instance.backend_preset, BackendPreset::OpenWebUi);
+        assert_eq!(instance.backend_preset, BackendPreset::OpenAiCompatible);
     }
 
     #[test]
@@ -897,14 +845,15 @@ mod tests {
 
         let instance = provider_setup::resolve_default_provider_instance(&cfg);
 
-        // First effective provider is the first built-in alphabetically: gemini.
-        assert_eq!(instance.id, "gemini");
-        assert_eq!(instance.backend_preset, BackendPreset::Gemini);
+        // Only user-configured providers exist; with no config, fall back to
+        // the openai-compatible default instance.
+        assert_eq!(instance.id, "openai-compatible");
+        assert_eq!(instance.backend_preset, BackendPreset::OpenAiCompatible);
     }
 
     #[test]
     fn resolve_model_uses_instance_model() {
-        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
+        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAiCompatible);
         inst.model = Some("gpt-5".to_string());
         let model = provider_setup::resolve_model_for_instance(None, &inst);
         assert_eq!(model, "gpt-5");
@@ -912,14 +861,14 @@ mod tests {
 
     #[test]
     fn resolve_model_falls_back_to_service_default() {
-        let inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
+        let inst = ProviderInstance::new("openai", BackendPreset::OpenAiCompatible);
         let model = provider_setup::resolve_model_for_instance(None, &inst);
-        assert_eq!(model, BackendPreset::OpenAi.default_model());
+        assert_eq!(model, BackendPreset::OpenAiCompatible.default_model());
     }
 
     #[test]
     fn with_resolved_model_applies_cli_override() {
-        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
+        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAiCompatible);
         inst.model = Some("gpt-4o".to_string());
 
         let resolved = with_resolved_model(Some("gpt-5"), &inst);
@@ -930,7 +879,7 @@ mod tests {
 
     #[test]
     fn with_resolved_model_preserves_instance_model_without_override() {
-        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAi);
+        let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAiCompatible);
         inst.model = Some("gpt-4o".to_string());
 
         let resolved = with_resolved_model(None, &inst);
@@ -971,20 +920,28 @@ mod tests {
 
     #[test]
     fn provider_display_name_uses_backend_label() {
-        let instance = ProviderInstance::new("work-webui", BackendPreset::OpenWebUi);
-        assert_eq!(provider_display_name(&instance), "Open WebUI");
+        let instance = ProviderInstance::new("compat", BackendPreset::OpenAiCompatible);
+        assert_eq!(
+            provider_display_name(&instance),
+            "OpenAI-compatible endpoint"
+        );
     }
 
     #[test]
     fn print_mode_error_format_uses_backend_label() {
-        let instance = ProviderInstance::new("work-webui", BackendPreset::OpenWebUi);
-        let err = ProviderError::server_error("OpenAI", 524, "error code: 524");
+        let instance = ProviderInstance::new("compat", BackendPreset::OpenAiCompatible);
+        let err = ProviderError {
+            kind: crate::llm::ProviderErrorKind::ServerError,
+            status_code: Some(524),
+            source: "OpenAI".to_string(),
+            message: "error code: 524".to_string(),
+        };
 
         let rendered = format_provider_error_for_display(&provider_display_name(&instance), &err);
 
         assert_eq!(
             rendered,
-            "Open WebUI timed out on the backend (524).\nProvider message: error code: 524"
+            "OpenAI-compatible endpoint timed out on the backend (524).\nProvider message: error code: 524"
         );
     }
 }

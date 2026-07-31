@@ -41,12 +41,6 @@ pub static COMMANDS: &[SlashCommand] = &[
         takes_arg: true,
     },
     SlashCommand {
-        name: "login",
-        usage: "/login <provider>",
-        description: "Authenticate provider (gemini)",
-        takes_arg: true,
-    },
-    SlashCommand {
         name: "resume",
         usage: "/resume",
         description: "Open session picker and resume a saved conversation",
@@ -101,12 +95,8 @@ pub enum CommandAction {
     Provider(String),
     /// `/provider` typed with no argument — show interactive selection menu.
     ProviderNoArg,
-    /// Authenticate with provider by name (`gemini`).
-    Login(String),
     /// Set thinking/reasoning level.
     Thinking(String),
-    /// `/login` with no argument — show login provider picker.
-    LoginNoArg,
     /// `/thinking` with no argument.
     ThinkingNoArg,
     /// Resume a specific session by id (internal command form).
@@ -160,8 +150,6 @@ pub fn parse(input: &str) -> Option<CommandAction> {
         "provider" => Some(CommandAction::ProviderNoArg),
         "thinking" if !arg.is_empty() => Some(CommandAction::Thinking(arg.to_string())),
         "thinking" => Some(CommandAction::ThinkingNoArg),
-        "login" if !arg.is_empty() => Some(CommandAction::Login(arg.to_string())),
-        "login" => Some(CommandAction::LoginNoArg),
         "resume" if !arg.is_empty() => Some(CommandAction::Resume(arg.to_string())),
         "resume" => Some(CommandAction::ResumeNoArg),
         "compact" if !arg.is_empty() => Some(CommandAction::Compact(Some(arg.to_string()))),
@@ -202,10 +190,6 @@ mod tests {
         assert!(matches!(
             parse("/thinking high"),
             Some(CommandAction::Thinking(l)) if l == "high"
-        ));
-        assert!(matches!(
-            parse("/login gemini"),
-            Some(CommandAction::Login(p)) if p == "gemini"
         ));
         assert!(matches!(
             parse("/resume abc123"),

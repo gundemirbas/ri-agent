@@ -13,7 +13,8 @@ use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
 use rig_core::completion::request::Usage as RigUsage;
 use rig_core::completion::{
-    CompletionModel, CompletionRequest, GetTokenUsage, ToolDefinition as RigToolDefinition,
+    CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
+    ToolDefinition as RigToolDefinition,
 };
 use rig_core::message as rig_message;
 use rig_core::message::Message as RigMessage;
@@ -24,13 +25,12 @@ use super::{
     AssistantPhase, LlmEvent, LlmRequestContext, LlmStream, Message, ModelListFuture, Role,
     ToolDefinition, UsageStats,
 };
-use crate::llm::ProviderError;
+use crate::llm::{ProviderError, ProviderErrorKind};
 
 /// OpenAI-compatible provider built on rig.
 pub struct RigOpenAiProvider {
     client: CompletionsClient,
     model: String,
-    reasoning_effort: Option<String>,
 }
 
 impl RigOpenAiProvider {
@@ -76,15 +76,7 @@ impl RigOpenAiProvider {
         Ok(Self {
             client,
             model: model.into(),
-            reasoning_effort: None,
         })
-    }
-
-    /// Set the `reasoning_effort` request parameter (OpenAI o-series /
-    /// DeepSeek convention).  `None` omits the parameter entirely.
-    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
-        self.reasoning_effort = effort;
-        self
     }
 }
 
@@ -190,8 +182,30 @@ fn to_usage_stats(u: &RigUsage) -> UsageStats {
 }
 
 /// Convert a rig completion error into a xi-agent [`ProviderError`].
-fn to_provider_error(e: rig_core::completion::CompletionError) -> ProviderError {
-    ProviderError::other("openai-compatible", e.to_string())
+///
+/// Preserves the HTTP status (recoverable from rig's transport errors) so the
+/// UI can render provider-appropriate messages for auth, rate-limit, and server
+/// failures instead of a generic "could not process the request".
+fn to_provider_error(e: CompletionError) -> ProviderError {
+    let source = "openai-compatible";
+    let status = e.provider_response_status();
+    let body = e.provider_response_body().unwrap_or("").trim().to_string();
+    let message = if body.is_empty() { e.to_string() } else { body };
+    match status {
+        Some(s) if s == http::StatusCode::UNAUTHORIZED => {
+            ProviderError::unauthorized(source, message)
+        }
+        Some(s) if s == http::StatusCode::FORBIDDEN => ProviderError::forbidden(source, message),
+        Some(s) if s == http::StatusCode::TOO_MANY_REQUESTS => {
+            ProviderError::rate_limited(source, message)
+        }
+        Some(s) if s.is_server_error() => ProviderError::server_error(source, s.as_u16(), message),
+        Some(s) => ProviderError::new(ProviderErrorKind::Other, Some(s.as_u16()), source, message),
+        None if matches!(e, CompletionError::HttpError(_)) => {
+            ProviderError::network(source, message)
+        }
+        None => ProviderError::other(source, message),
+    }
 }
 
 // ── LlmProvider impl ──────────────────────────────────────────────────────────
@@ -237,7 +251,6 @@ impl super::LlmProvider for RigOpenAiProvider {
     ) -> LlmStream {
         let client = self.client.clone();
         let model_name = self.model.clone();
-        let reasoning = self.reasoning_effort.clone();
         let rig_messages = to_rig_messages(&messages);
         let rig_tools = to_rig_tools(&tools);
 
@@ -253,7 +266,7 @@ impl super::LlmProvider for RigOpenAiProvider {
                 temperature: None,
                 max_tokens: None,
                 tool_choice: None,
-                additional_params: reasoning.map(|r| serde_json::json!({ "reasoning_effort": r })),
+                additional_params: None,
                 output_schema: None,
                 record_telemetry_content: false,
             };
@@ -403,5 +416,44 @@ mod tests {
         assert_eq!(s.input_tokens, None);
         assert_eq!(s.output_tokens, None);
         assert_eq!(s.total_tokens, None);
+    }
+
+    #[test]
+    fn maps_rig_errors_to_typed_provider_errors() {
+        use rig_core::completion::CompletionError;
+        use rig_core::http_client::Error as HttpError;
+
+        // Unauthorized from a non-2xx HTTP response (auth failures common with
+        // expired API keys).
+        let unauthorized =
+            CompletionError::from_http_response(http::StatusCode::UNAUTHORIZED, "invalid api key");
+        let err = to_provider_error(unauthorized);
+        assert_eq!(err.kind, ProviderErrorKind::Unauthorized);
+        assert_eq!(err.status_code, Some(401));
+        assert!(err.message.contains("invalid api key"));
+
+        // 429 rate limit.
+        let limited =
+            CompletionError::from_http_response(http::StatusCode::TOO_MANY_REQUESTS, "slow down");
+        assert_eq!(
+            to_provider_error(limited).kind,
+            ProviderErrorKind::RateLimited
+        );
+
+        // 5xx server error.
+        let server = CompletionError::from_http_response(http::StatusCode::BAD_GATEWAY, "boom");
+        let err = to_provider_error(server);
+        assert_eq!(err.kind, ProviderErrorKind::ServerError);
+        assert_eq!(err.status_code, Some(502));
+
+        // Transport-level failure -> network.
+        let network = CompletionError::HttpError(HttpError::Instance(Box::new(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "conn refused"),
+        )));
+        assert_eq!(to_provider_error(network).kind, ProviderErrorKind::Network);
+
+        // Plain provider diagnostic -> other.
+        let other = CompletionError::ProviderError("model not found".to_string());
+        assert_eq!(to_provider_error(other).kind, ProviderErrorKind::Other);
     }
 }

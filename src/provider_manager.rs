@@ -19,7 +19,7 @@ use crate::thinking::ThinkingLevel;
 pub(crate) enum ProviderSetupStep {
     #[default]
     Idle,
-    /// User is typing an endpoint URL (covers Ollama, Open WebUI, generic endpoints).
+    /// User is typing an endpoint URL for a generic provider instance.
     Endpoint,
     /// User is typing an API key / token. Holds the URL captured in a prior `Endpoint` step.
     ApiKey { pending_url: Option<String> },
@@ -185,12 +185,6 @@ impl ProviderManager {
         }
     }
 
-    pub fn set_pending_api_type(&mut self, api_type: ApiType) {
-        if let Some(setup) = self.pending_setup.as_mut() {
-            setup.api_type = Some(api_type);
-        }
-    }
-
     // ── ID generation helpers ─────────────────────────────────────────────────
 
     pub fn normalize_id(raw: &str) -> Option<String> {
@@ -218,13 +212,7 @@ impl ProviderManager {
 
     pub fn type_suffix(backend_preset: &BackendPreset) -> &'static str {
         match backend_preset {
-            BackendPreset::Ollama => "ollama",
-            BackendPreset::OpenWebUi => "open-webui",
             BackendPreset::OpenAiCompatible => "openai-compatible",
-            BackendPreset::OpenAi => "openai",
-            BackendPreset::OpenRouter => "openrouter",
-            BackendPreset::Gemini => "gemini",
-            BackendPreset::OllamaCom => "ollama-com",
             BackendPreset::Test => "test",
         }
     }
@@ -241,10 +229,7 @@ impl ProviderManager {
             .and_then(|base| reqwest::Url::parse(base).ok())
             .and_then(|url| url.host_str().map(ToOwned::to_owned))
             .unwrap_or_else(|| backend_preset.id().to_string());
-        let raw = match backend_preset {
-            BackendPreset::Ollama => format!("ollama-{host}"),
-            _ => format!("{}-{}", host, Self::type_suffix(backend_preset)),
-        };
+        let raw = format!("{}-{}", host, Self::type_suffix(backend_preset));
         Self::normalize_id(&raw)
     }
 
@@ -339,11 +324,7 @@ impl SetupInputKind {
             },
             Self::ApiKey => match instance {
                 Some(p) => match p.backend_preset.def().auth_mode {
-                    AuthMode::ApiKey => match p.backend_preset {
-                        BackendPreset::OpenRouter => "OpenRouter API key: ".to_string(),
-                        BackendPreset::OpenWebUi => "open-webui token: ".to_string(),
-                        _ => "API key: ".to_string(),
-                    },
+                    AuthMode::ApiKey => "API key: ".to_string(),
                     _ => "token: ".to_string(),
                 },
                 None => "API key: ".to_string(),

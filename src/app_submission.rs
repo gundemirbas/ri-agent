@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::agent::types::CancelLevel;
 use crate::agent::{AgentLoopConfig, ToolOutputLog, run_agent_loop};
-use crate::app::{App, DynProvider, RetryTarget, StreamingStatus};
+use crate::app::{App, DynProvider, StreamingStatus};
 use crate::at_file::{AtFileResult, parse_at_tokens, resolve_at_tokens};
 use crate::live_turn::LiveToolResult;
 use crate::llm::{Message, Role};
@@ -82,8 +82,6 @@ impl App {
     /// Set streaming flags and spawn the agent task using the current history.
     ///
     /// Call after pushing any new user message(s) and persisting state.
-    /// Does **not** perform the pre-flight token check — callers are
-    /// responsible for calling `check_token_preflight` before this.
     pub(crate) fn launch_turn(&mut self, provider: &DynProvider) {
         self.clear_abort_status_notice();
         self.session.live_turn.notices.clear();
@@ -93,7 +91,6 @@ impl App {
             "launch_turn called before session_state was initialised"
         );
         self.agent_turn.start();
-        self.login.auth_retry_budget = 1;
         self.log_view.auto_scroll = true;
         self.runtime.reset_abort_stages();
         self.start_agent_task(provider);
@@ -104,7 +101,7 @@ impl App {
         let lines: Vec<String> = self.textarea.lines().to_vec();
         let text = lines.join("\n");
         let trimmed = text.trim().to_string();
-        if trimmed.is_empty() || !self.streaming() || self.login.active {
+        if trimmed.is_empty() || !self.streaming() {
             return;
         }
 
@@ -125,19 +122,14 @@ impl App {
         instructions: Option<String>,
         provider: &DynProvider,
     ) {
-        if self.streaming() || self.login.active {
+        if self.streaming() {
             return;
         }
 
         self.ensure_event_log_for_submit();
         self.session.pending_manual_compaction_instructions = instructions;
 
-        if self.check_token_preflight(RetryTarget::AgentTurn) {
-            return;
-        }
-
         self.agent_turn.start();
-        self.login.auth_retry_budget = 1;
         self.log_view.auto_scroll = true;
         self.start_agent_task(provider);
     }
@@ -236,7 +228,7 @@ impl App {
         let lines: Vec<String> = self.textarea.lines().to_vec();
         let text = lines.join("\n");
         let trimmed = text.trim().to_string();
-        if trimmed.is_empty() || self.streaming() || self.login.active {
+        if trimmed.is_empty() || self.streaming() {
             return;
         }
 
@@ -266,7 +258,7 @@ impl App {
     /// textarea.  Used by `/skill:<name>` command expansion.
     pub fn submit_with_text(&mut self, text: String, _provider: &DynProvider) {
         let trimmed = text.trim().to_string();
-        if trimmed.is_empty() || self.streaming() || self.login.active {
+        if trimmed.is_empty() || self.streaming() {
             return;
         }
         self.append_user_message(trimmed);
@@ -295,17 +287,11 @@ impl App {
 
         self.persist_messages();
 
-        // Proactive token refresh check before starting the request.
-        if self.check_token_preflight(RetryTarget::AgentTurn) {
-            // Refresh triggered; request will be retried after refresh completes.
-            return;
-        }
-
         self.launch_turn(provider);
     }
 
     pub fn retry_last_request(&mut self, provider: &DynProvider) {
-        if self.streaming() || self.login.active {
+        if self.streaming() {
             return;
         }
 

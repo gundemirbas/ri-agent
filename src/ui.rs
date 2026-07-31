@@ -2,7 +2,7 @@ mod info;
 mod input;
 mod layout;
 mod log;
-mod login;
+
 mod menu;
 mod pending;
 mod status;
@@ -29,7 +29,6 @@ use self::{
     input::{render_input_panel, split_scrollbar_column, style_textarea},
     layout::{PanelInputs, compute_panel_heights, input_visual_line_count},
     log::{ToolBodyConfig, build_log_lines, dim_lines},
-    login::build_login_content_lines,
     menu::{build_completion_lines, build_selection_lines},
 };
 
@@ -119,18 +118,14 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
 
     let layout = compute_panel_heights(PanelInputs {
         terminal_height,
-        width,
         input_line_count,
         show_info: app.show_info,
-        login_active: app.login.active,
         selection_mode: app.selection.active,
         selection_items_len: app.selection.items.len(),
         completions_len: app.completion.completions.len(),
         resume_hint_visible,
         ask_user_selection_no_freeform: app.ask_user_selection_no_freeform(),
         ask_user_header_lines,
-        login_url: app.login.url.as_deref(),
-        has_login_code: app.login.code.is_some(),
         has_activity: app.throbber_visible() || app.log_view.full_output,
         has_provider_status: app.provider_status_visible(),
         queued_steering_len: app.queued_steering().len(),
@@ -146,8 +141,6 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
             Constraint::Length(layout.completion_height),
             Constraint::Length(layout.selection_header_height),
             Constraint::Length(layout.selection_items_height),
-            Constraint::Length(layout.login_header_height),
-            Constraint::Length(layout.login_content_height),
             Constraint::Length(layout.halfblock_height),
             Constraint::Length(layout.input_height),
             Constraint::Length(layout.halfblock_height),
@@ -162,12 +155,10 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let completion_area = chunks[4];
     let sel_header_area = chunks[5];
     let sel_items_area = chunks[6];
-    let login_hdr_area = chunks[7];
-    let login_body_area = chunks[8];
-    let top_hb_area = chunks[9];
-    let input_area = chunks[10];
-    let bot_hb_area = chunks[11];
-    let info_area = chunks[12];
+    let top_hb_area = chunks[7];
+    let input_area = chunks[8];
+    let bot_hb_area = chunks[9];
+    let info_area = chunks[10];
 
     let inner_height = log_area.height as usize;
     let (log_content_area, log_scrollbar_area) = split_scrollbar_column(log_area);
@@ -406,40 +397,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
         }
     }
 
-    if app.login.active {
-        const LOGIN_HINTS: &str = "Enter actions   Esc cancel  ";
-        let provider = app.login.provider.as_deref().unwrap_or("provider");
-        let title = format!("  Authenticating: {provider}");
-        let gap = width.saturating_sub(title.width() + LOGIN_HINTS.width());
-        let header_bg = app
-            .theme
-            .login
-            .header
-            .bg
-            .unwrap_or(ratatui::style::Color::Rgb(20, 30, 60));
-        let header_line = Line::from(vec![
-            Span::styled(
-                title,
-                Style::default()
-                    .fg(Color::White)
-                    .bg(header_bg)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-            Span::styled(" ".repeat(gap), Style::default().bg(header_bg)),
-            Span::styled(
-                LOGIN_HINTS,
-                Style::default()
-                    .bg(header_bg)
-                    .add_modifier(ratatui::style::Modifier::DIM),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(vec![header_line]), login_hdr_area);
-
-        let content_lines = build_login_content_lines(app, width);
-        f.render_widget(Paragraph::new(content_lines), login_body_area);
-    }
-
-    if !app.login.active && !app.ask_user_selection_no_freeform() {
+    if !app.ask_user_selection_no_freeform() {
         let panel_bg = if app.input_mode == InputMode::Shell {
             app.theme.input.shell.bg.unwrap_or(Color::Rgb(24, 34, 32))
         } else if app.ask_user_freeform_mode() {
@@ -473,7 +431,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
         status::render_provider_status(f, provider_status_area, app);
     }
 
-    if !app.login.active && !app.ask_user_selection_no_freeform() {
+    if !app.ask_user_selection_no_freeform() {
         let is_shell = app.input_mode == InputMode::Shell;
         let panel_bg = if is_shell {
             app.theme.input.shell.bg.unwrap_or(Color::Rgb(24, 34, 32))
@@ -614,7 +572,6 @@ mod tests {
     use crate::ui::log::append_tool_result_block;
     use crate::{
         agent::AgentLoopConfig,
-        auth::AuthFlow,
         completion::CompletionItem,
         llm::{AssistantPhase, Message},
         thinking::ThinkingLevel,
@@ -632,7 +589,7 @@ mod tests {
         use crate::config::DisplayConfig;
         let instance = crate::provider_instance::ProviderInstance::new(
             "openai",
-            crate::provider_instance::BackendPreset::OpenAi,
+            crate::provider_instance::BackendPreset::OpenAiCompatible,
         );
         App::new(
             instance,
@@ -713,346 +670,6 @@ mod tests {
         let lines = vec!["short".to_string(), "12345 67890".to_string()];
         let count = input_visual_line_count(&lines, 6);
         assert_eq!(count, 3);
-    }
-
-    #[test]
-    fn layout_uses_visual_input_line_count_for_wrapped_input() {
-        let wrapped_lines = input_visual_line_count(&["a very long single line".to_string()], 8);
-        assert!(wrapped_lines > 1);
-
-        let heights = compute_panel_heights(PanelInputs {
-            terminal_height: 20,
-            width: 8,
-            input_line_count: wrapped_lines,
-            show_info: false,
-            login_active: false,
-            selection_mode: false,
-            selection_items_len: 0,
-            completions_len: 0,
-            resume_hint_visible: false,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: None,
-            has_login_code: false,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-
-        assert_eq!(heights.input_height as usize, wrapped_lines);
-    }
-
-    #[test]
-    fn layout_hides_input_and_halfblocks_when_login_active() {
-        let heights = compute_panel_heights(PanelInputs {
-            terminal_height: 40,
-            width: 100,
-            input_line_count: 8,
-            show_info: false,
-            login_active: true,
-            selection_mode: false,
-            selection_items_len: 0,
-            completions_len: 3,
-            resume_hint_visible: false,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: None,
-            has_login_code: false,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-
-        assert_eq!(heights.input_height, 0);
-        assert_eq!(heights.halfblock_height, 0);
-        assert_eq!(heights.login_header_height, 1);
-        assert!(heights.login_content_height >= 2);
-    }
-
-    #[test]
-    fn layout_hides_completion_when_login_or_selection_active() {
-        let login = compute_panel_heights(PanelInputs {
-            terminal_height: 40,
-            width: 100,
-            input_line_count: 2,
-            show_info: false,
-            login_active: true,
-            selection_mode: false,
-            selection_items_len: 0,
-            completions_len: 5,
-            resume_hint_visible: false,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: None,
-            has_login_code: false,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-        let selection = compute_panel_heights(PanelInputs {
-            terminal_height: 40,
-            width: 100,
-            input_line_count: 2,
-            show_info: false,
-            login_active: false,
-            selection_mode: true,
-            selection_items_len: 4,
-            completions_len: 5,
-            resume_hint_visible: false,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: None,
-            has_login_code: false,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-
-        assert_eq!(login.completion_height, 0);
-        assert_eq!(selection.completion_height, 0);
-    }
-
-    #[test]
-    fn layout_shows_resume_hint_row_when_applicable() {
-        let heights = compute_panel_heights(PanelInputs {
-            terminal_height: 30,
-            width: 100,
-            input_line_count: 1,
-            show_info: false,
-            login_active: false,
-            selection_mode: false,
-            selection_items_len: 0,
-            completions_len: 0,
-            resume_hint_visible: true,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: None,
-            has_login_code: false,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-        assert_eq!(heights.completion_height, 1);
-    }
-
-    #[test]
-    fn layout_selection_item_rows_are_clamped_to_max_visible() {
-        let heights = compute_panel_heights(PanelInputs {
-            terminal_height: 40,
-            width: 100,
-            input_line_count: 1,
-            show_info: false,
-            login_active: false,
-            selection_mode: true,
-            selection_items_len: MAX_SELECTION_VISIBLE + 10,
-            completions_len: 0,
-            resume_hint_visible: false,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: None,
-            has_login_code: false,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-
-        assert_eq!(heights.selection_header_height, 1);
-        assert_eq!(
-            heights.selection_items_height as usize,
-            MAX_SELECTION_VISIBLE
-        );
-    }
-
-    #[test]
-    fn layout_input_height_is_capped_at_40_percent_of_terminal() {
-        let heights = compute_panel_heights(PanelInputs {
-            terminal_height: 20,
-            width: 80,
-            input_line_count: 99,
-            show_info: false,
-            login_active: false,
-            selection_mode: false,
-            selection_items_len: 0,
-            completions_len: 0,
-            resume_hint_visible: false,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: None,
-            has_login_code: false,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-        assert_eq!(heights.input_height, 8);
-        assert_eq!(heights.halfblock_height, 1);
-    }
-
-    #[test]
-    fn layout_info_bar_height_follows_toggle() {
-        let hidden = compute_panel_heights(PanelInputs {
-            terminal_height: 20,
-            width: 80,
-            input_line_count: 1,
-            show_info: false,
-            login_active: false,
-            selection_mode: false,
-            selection_items_len: 0,
-            completions_len: 0,
-            resume_hint_visible: false,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: None,
-            has_login_code: false,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-        let shown = compute_panel_heights(PanelInputs {
-            terminal_height: 20,
-            width: 80,
-            input_line_count: 1,
-            show_info: true,
-            login_active: false,
-            selection_mode: false,
-            selection_items_len: 0,
-            completions_len: 0,
-            resume_hint_visible: false,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: None,
-            has_login_code: false,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-
-        assert_eq!(hidden.info_height, 0);
-        assert_eq!(shown.info_height, 1);
-    }
-
-    #[test]
-    fn layout_handles_small_terminals_without_underflow() {
-        let heights = compute_panel_heights(PanelInputs {
-            terminal_height: 1,
-            width: 2,
-            input_line_count: 0,
-            show_info: true,
-            login_active: true,
-            selection_mode: true,
-            selection_items_len: 0,
-            completions_len: 0,
-            resume_hint_visible: true,
-            ask_user_selection_no_freeform: false,
-            ask_user_header_lines: 0,
-            login_url: Some("https://example.com/very/long/url"),
-            has_login_code: true,
-            has_activity: false,
-            has_provider_status: false,
-            queued_steering_len: 0,
-        });
-
-        assert!(heights.input_height <= 1);
-        assert_eq!(heights.selection_header_height, 1);
-        assert_eq!(heights.selection_items_height, 1);
-        assert!(heights.login_content_height >= 2);
-    }
-
-    #[test]
-    fn draw_login_mode_renders_auth_header_and_hides_input_textarea() {
-        let mut app = make_app();
-        app.login.active = true;
-        app.login.provider = Some("gemini".to_string());
-        app.login.info = "Waiting for browser".to_string();
-
-        app.textarea.insert_char('x');
-
-        let lines = render_to_plain_lines(&mut app, 80, 20);
-        let joined = lines.join("\n");
-        assert!(joined.contains("Authenticating: gemini"), "{joined}");
-        assert!(!joined.contains('x'), "{joined}");
-    }
-
-    #[test]
-    fn draw_selection_mode_renders_title_and_visible_items() {
-        let mut app = make_app();
-        app.selection.active = true;
-        app.selection.title = "  Pick item  ";
-        app.selection.items = vec![
-            CompletionItem {
-                label: "alpha".to_string(),
-                detail: String::new(),
-                complete_to: String::new(),
-                loading: false,
-                error: false,
-                match_range: None,
-            },
-            CompletionItem {
-                label: "beta".to_string(),
-                detail: String::new(),
-                complete_to: String::new(),
-                loading: false,
-                error: false,
-                match_range: None,
-            },
-        ];
-
-        let lines = render_to_plain_lines(&mut app, 80, 20);
-        let joined = lines.join("\n");
-        assert!(joined.contains("Pick item"), "{joined}");
-        assert!(joined.contains("alpha"), "{joined}");
-        assert!(joined.contains("beta"), "{joined}");
-    }
-
-    #[test]
-    fn draw_info_bar_renders_provider_model_context_sections() {
-        let mut app = make_app();
-        app.show_info = true;
-
-        let lines = render_to_plain_lines(&mut app, 120, 20);
-        let joined = lines.join("\n");
-        assert!(joined.contains("provider openai"), "{joined}");
-        assert!(joined.contains("model gpt-4o"), "{joined}");
-        assert!(joined.contains("context"), "{joined}");
-    }
-
-    #[test]
-    fn login_content_uses_redirect_flow_instruction() {
-        let mut app = make_app();
-        app.login.auth_flow = Some(AuthFlow::RedirectCallback);
-        app.login.info = "Waiting".to_string();
-
-        let lines = build_login_content_lines(&mut app, 80);
-        let row0 = line_text(&lines[0]);
-        assert!(row0.contains("redirect back automatically"), "{row0}");
-    }
-
-    #[test]
-    fn login_content_wraps_url_for_narrow_width() {
-        let mut app = make_app();
-        app.login.info = "Waiting".to_string();
-        app.login.url = Some("https://example.com/very/long/path/that/should/wrap".to_string());
-
-        let lines = build_login_content_lines(&mut app, 20);
-        assert!(
-            lines.len() >= 5,
-            "expected wrapped URL rows, got {}",
-            lines.len()
-        );
-        assert!(lines.iter().any(|l| line_text(l).contains("URL:")));
-    }
-
-    #[test]
-    fn login_content_shows_code_row_only_when_present() {
-        let mut without_code = make_app();
-        without_code.login.info = "Waiting".to_string();
-        let lines_without = build_login_content_lines(&mut without_code, 80);
-        assert!(!lines_without.iter().any(|l| line_text(l).contains("Code:")));
-
-        let mut with_code = make_app();
-        with_code.login.info = "Waiting".to_string();
-        with_code.login.code = Some("ABCD-1234".to_string());
-        let lines_with = build_login_content_lines(&mut with_code, 80);
-        assert!(lines_with.iter().any(|l| line_text(l).contains("Code:")));
     }
 
     #[test]

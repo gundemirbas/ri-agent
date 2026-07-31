@@ -4,9 +4,8 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::agent::compaction::CompactionOutcome;
 use crate::agent::types::AgentEvent;
-use crate::app::{App, RetryTarget, StreamingStatus};
+use crate::app::{App, StreamingStatus};
 use crate::app_event::AppEvent;
-use crate::context_window::context_window_for_model;
 use crate::live_turn::{LiveToolEntry, LiveToolResult};
 use crate::llm::{AssistantPhase, DisplayRange, UsageStats};
 use crate::provider_manager::{active_provider_display_name, format_provider_error_for_display};
@@ -49,7 +48,6 @@ impl App {
                 self.drain_app_events();
             }
             AppEvent::ModelsReady(result) => self.apply_model_list(result),
-            AppEvent::Login(ev) => self.apply_login_event(ev),
             AppEvent::AskUser(req) => self.receive_ask_request(req),
             AppEvent::ShellComplete { call_id, result } => self.on_shell_complete(call_id, result),
         }
@@ -420,35 +418,6 @@ impl App {
         self.finalise_assistant_turn_event();
         self.flush_turn_events();
         self.persist_messages();
-
-        // If the context window is still unknown for an Ollama model,
-        // the first turn may have just loaded it — refresh /api/ps.
-        self.maybe_refresh_ollama_context();
-    }
-
-    /// If the current provider is Ollama (or Open WebUI with Ollama API)
-    /// and the context window is unknown, query `/api/ps` to see if the
-    /// model was loaded during the just-completed turn.
-    fn maybe_refresh_ollama_context(&self) {
-        use crate::provider_instance::ApiType;
-
-        if context_window_for_model(&self.provider.current_model).is_some() {
-            return;
-        }
-        let instance = &self.provider.current_instance;
-        if instance.api_type != ApiType::OllamaChatApi {
-            return;
-        }
-        let base_url = instance
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
-        let api_key = instance.api_key.clone();
-
-        tokio::spawn(async move {
-            crate::llm::ollama::fetch_and_cache_running_contexts(&base_url, api_key.as_deref())
-                .await;
-        });
     }
 
     fn on_agent_done(&mut self) {
@@ -470,41 +439,22 @@ impl App {
         self.runtime.steering_tx = None;
         self.runtime.queued_steering.clear();
 
-        let is_unauthorized = e.kind == crate::llm::ProviderErrorKind::Unauthorized;
-
-        if is_unauthorized
-            && self.login.auth_retry_budget > 0
-            && self.trigger_auth_refresh(RetryTarget::AgentTurn)
-        {
-            log::debug!(
-                "received 401, refresh triggered: provider={} remaining_budget= {}",
-                self.provider.current_instance.id,
-                self.login.auth_retry_budget
-            );
-            self.login.auth_retry_budget -= 1;
-            // Discard pending events and in-flight turn state — the turn will be
-            // retried after the token refresh completes. The throbber stays
-            // visible via login.refresh_in_progress while the refresh is in flight.
-            self.session.pending_turn_events.clear();
-            self.session.live_turn.clear_turn();
-        } else {
-            let provider_label = active_provider_display_name(
-                &self.provider.current_instance.id,
-                &self.provider.instances,
-            );
-            let rendered = format_provider_error_for_display(&provider_label, &e);
-            // Discard any partially accumulated assistant/tool events
-            // and append a TurnError instead. Provider errors are already
-            // shown in the output area via the committed TurnError, so do not
-            // also keep them as persistent status/notices.
-            self.session.pending_turn_events.clear();
-            self.session.live_turn.clear_turn();
-            self.append_event_immediate(SessionEvent::TurnError {
-                message: format!("[Error: {rendered}]"),
-                timestamp: Self::now_ts(),
-            });
-            self.persist_messages();
-        }
+        let provider_label = active_provider_display_name(
+            &self.provider.current_instance.id,
+            &self.provider.instances,
+        );
+        let rendered = format_provider_error_for_display(&provider_label, &e);
+        // Discard any partially accumulated assistant/tool events
+        // and append a TurnError instead. Provider errors are already
+        // shown in the output area via the committed TurnError, so do not
+        // also keep them as persistent status/notices.
+        self.session.pending_turn_events.clear();
+        self.session.live_turn.clear_turn();
+        self.append_event_immediate(SessionEvent::TurnError {
+            message: format!("[Error: {rendered}]"),
+            timestamp: Self::now_ts(),
+        });
+        self.persist_messages();
     }
 
     /// Assemble the `AssistantMessage` session event from `LiveTurnState` fields

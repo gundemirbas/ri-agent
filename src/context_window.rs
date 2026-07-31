@@ -1,33 +1,9 @@
-use crate::llm::ollama::OllamaProvider;
-
-/// Return the context-window size (in tokens) for a known model name.
+/// Return the context-window size (in tokens) for a known model name using the
+/// hard-coded fallback table for providers/models without live metadata.
 ///
-/// Checks the Ollama `/api/ps` runtime cache (actual context for currently
-/// loaded models) first, and finally a hard-coded fallback table for providers
-/// and models not covered above.
-///
-/// Returns `None` for unrecognised models or Ollama models that are not
-/// currently loaded (we cannot trust the GGUF `context_length` from
-/// `/api/show` because the server may override it with `num_ctx`).
+/// Returns `None` for unrecognised models.
 pub fn context_window_for_model(model: &str) -> Option<usize> {
-    // Primary: runtime context from Ollama /api/ps (loaded models only).
-    if let Some(cw) = OllamaProvider::cached_context_window(model) {
-        return Some(cw);
-    }
-
-    // If we know this is an Ollama model but /api/ps didn't have it,
-    // don't fall back to hard-coded guesses — the runtime context size
-    // is configurable per model and we can't know it until loaded.
-    if OllamaProvider::is_known_model(model) {
-        return None;
-    }
-
-    // Fallback: hard-coded table for all other providers and cold-start.
-    if let Some(cw) = hardcoded_context_window(model) {
-        return Some(cw);
-    }
-
-    None
+    hardcoded_context_window(model)
 }
 
 /// Hard-coded context window table for known model families.

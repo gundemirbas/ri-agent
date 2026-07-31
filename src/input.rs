@@ -10,8 +10,8 @@ use crate::{
     keybindings::{self, KeyBindingId},
     llm::{LlmProvider, Message},
     provider::{ThinkingSupport, thinking_support_for_instance},
-    provider_instance::{AuthMode, BackendPreset, EndpointBehavior, ProviderInstance},
-    provider_manager::{PendingProviderSetup, ProviderSetupStep},
+    provider_instance::{AuthMode, ProviderInstance},
+    provider_manager::ProviderSetupStep,
     provider_setup::resolve_default_provider_instance,
     thinking::ThinkingLevel,
 };
@@ -21,7 +21,6 @@ use crate::{
 pub(crate) enum RunResult {
     Quit,
     Suspend,
-    RebuildProvider,
     ReloadContext,
     /// Start a fresh session: clear session state, reset the file tracker,
     /// and reload skills/tools/system-prompt.
@@ -58,19 +57,8 @@ pub(crate) fn normalize_paste_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn provider_setup_requires_endpoint(instance: &ProviderInstance) -> bool {
-    matches!(
-        instance.backend_preset.def().endpoint_behavior,
-        EndpointBehavior::UserSupplied
-    )
-}
-
 pub(crate) fn provider_setup_requires_api_key(instance: &ProviderInstance) -> bool {
     instance.backend_preset.def().auth_mode == AuthMode::ApiKey
-}
-
-fn enter_provider_endpoint_input(app: &mut App, _instance: &ProviderInstance) {
-    app.enter_provider_endpoint_input_mode();
 }
 
 fn resolve_current_run_instance(app: &App, config: &XiConfig) -> ProviderInstance {
@@ -201,10 +189,7 @@ fn handle_global_key_shortcuts(
                 "[Ctrl-C is for aborting the agent loop. Press Ctrl-D to exit shell mode]"
                     .to_string(),
             ));
-        } else if app.selection.active
-            || app.login.active
-            || app.provider.setup_step != ProviderSetupStep::Idle
-        {
+        } else if app.selection.active || app.provider.setup_step != ProviderSetupStep::Idle {
             app.push_notice(Message::assistant(
                 "[Ctrl-C is for aborting the agent loop. Press Esc to go back]".to_string(),
             ));
@@ -228,10 +213,6 @@ fn handle_global_key_shortcuts(
         } else if app.runtime.pending_finalize {
             app.push_notice(Message::assistant(
                 "[Cannot suspend while a submission is being finalised]".to_string(),
-            ));
-        } else if app.login.refresh_in_progress {
-            app.push_notice(Message::assistant(
-                "[Cannot suspend while authentication refresh is running]".to_string(),
             ));
         } else if !app.ui_is_suspend_idle() {
             app.push_notice(Message::assistant(
@@ -284,10 +265,7 @@ fn handle_global_key_shortcuts(
         }
 
         // Input is non-empty — show hint.
-        if app.selection.active
-            || app.login.active
-            || app.provider.setup_step != ProviderSetupStep::Idle
-        {
+        if app.selection.active || app.provider.setup_step != ProviderSetupStep::Idle {
             app.push_notice(Message::assistant(
                 "[Press Ctrl-D again on an empty line to quit. Press Esc to close this first]"
                     .to_string(),
@@ -478,49 +456,6 @@ fn handle_selection_enter(app: &mut App) -> KeyDispatch {
         Some(SelectionResult::RemoveProvider(id)) => {
             KeyDispatch::Return(RunResult::RemoveProvider(id))
         }
-        Some(SelectionResult::ProviderApiType(api_type)) => {
-            app.set_pending_provider_api_type(api_type);
-            if let Some(instance) = app.pending_provider_instance() {
-                if provider_setup_requires_endpoint(&instance) {
-                    enter_provider_endpoint_input(app, &instance);
-                } else if provider_setup_requires_api_key(&instance) {
-                    app.enter_provider_api_key_input_mode();
-                } else {
-                    app.enter_provider_name_input_mode();
-                }
-            }
-            KeyDispatch::Continue
-        }
-        Some(SelectionResult::LoginProvider(p)) => {
-            if p.is_empty() {
-                // Login menu was already opened by the caller (e.g. from /provider).
-            } else {
-                let preset = BackendPreset::from_id(&p);
-                match preset.as_ref().map(|pr| pr.def().auth_mode) {
-                    Some(AuthMode::OAuthLogin) => {
-                        app.start_login(&p);
-                    }
-                    _ => {
-                        // Non-OAuth providers: start the add-provider flow.
-                        if let Some(preset) = preset {
-                            let instance = ProviderInstance::new(p.clone(), preset.clone());
-                            app.provider.pending_setup =
-                                Some(PendingProviderSetup::from_instance(&instance));
-                            if preset.def().user_selects_api {
-                                app.enter_provider_api_type_selection_mode(&preset);
-                            } else if provider_setup_requires_endpoint(&instance) {
-                                enter_provider_endpoint_input(app, &instance);
-                            } else if provider_setup_requires_api_key(&instance) {
-                                app.enter_provider_api_key_input_mode();
-                            } else {
-                                app.enter_provider_name_input_mode();
-                            }
-                        }
-                    }
-                }
-            }
-            KeyDispatch::Continue
-        }
         Some(SelectionResult::ResumeSession(id)) => {
             app.resume_session_by_id(&id);
             KeyDispatch::Continue
@@ -537,10 +472,6 @@ fn handle_selection_enter(app: &mut App) -> KeyDispatch {
             }
             KeyDispatch::Continue
         }
-        Some(SelectionResult::LoginAction(action)) => {
-            app.apply_login_action(action);
-            KeyDispatch::Continue
-        }
         None => KeyDispatch::Continue,
     }
 }
@@ -553,13 +484,6 @@ fn handle_chat_mode_key(
 ) -> KeyDispatch {
     if key.code == KeyCode::Esc {
         app.handle_escape_in_chat_mode();
-        return KeyDispatch::Continue;
-    }
-
-    if app.login.active {
-        if key.code == KeyCode::Enter && key.modifiers.is_empty() {
-            app.enter_login_action_menu();
-        }
         return KeyDispatch::Continue;
     }
 
@@ -632,7 +556,7 @@ fn handle_chat_submit(
     match app.provider.setup_step.clone() {
         ProviderSetupStep::Endpoint => {
             // Determine whether this is the two-step URL→token flow (e.g. OpenWebUI)
-            // or a single-step URL entry (e.g. Ollama, generic endpoint).
+            // or a single-step URL entry for a generic endpoint.
             let needs_api_key = app
                 .pending_provider_instance()
                 .as_ref()
@@ -653,23 +577,12 @@ fn handle_chat_submit(
 
             if is_two_step {
                 // Submit URL and transition to ApiKey step (carries pending_url).
-                app.submit_open_webui_url_input();
+                app.submit_pending_provider_endpoint_input();
                 return KeyDispatch::Continue;
             }
 
-            // Single-step: for Ollama use the Ollama-specific normalizer, otherwise generic.
-            let url_opt = {
-                let instance_opt = app.pending_provider_instance();
-                let is_ollama = instance_opt
-                    .as_ref()
-                    .map(|i| i.backend_preset == crate::BackendPreset::Ollama)
-                    .unwrap_or(false);
-                if is_ollama {
-                    app.take_ollama_endpoint_input()
-                } else {
-                    app.submit_pending_provider_base_url()
-                }
-            };
+            // Single-step: generic endpoint normalisation.
+            let url_opt = app.submit_pending_provider_base_url();
 
             if let Some(url) = url_opt {
                 if let Some(setup) = app.provider.pending_setup.as_mut() {
@@ -681,7 +594,7 @@ fn handle_chat_submit(
         }
 
         ProviderSetupStep::ApiKey { .. } => {
-            if let Some((url, token)) = app.take_open_webui_token_input() {
+            if let Some((url, token)) = app.take_pending_provider_url_and_token() {
                 if app.pending_provider_setup_is_edit() {
                     // Store URL+token in pending setup and proceed to name step
                     // so the user can rename the instance.
@@ -810,34 +723,6 @@ fn handle_slash_submit(
             app.enter_thinking_selection_mode();
         }
         Some(CommandAction::ThinkingNoArg) => {}
-        Some(CommandAction::Login(provider_name)) => {
-            let preset = BackendPreset::from_id(&provider_name);
-            match preset.as_ref().map(|pr| pr.def().auth_mode) {
-                Some(AuthMode::OAuthLogin) => {
-                    app.start_login(&provider_name);
-                }
-                _ => {
-                    // Non-OAuth providers: start the add-provider flow.
-                    if let Some(preset) = preset {
-                        let instance = ProviderInstance::new(provider_name.clone(), preset.clone());
-                        app.provider.pending_setup =
-                            Some(PendingProviderSetup::from_instance(&instance));
-                        if preset.def().user_selects_api {
-                            app.enter_provider_api_type_selection_mode(&preset);
-                        } else if provider_setup_requires_endpoint(&instance) {
-                            enter_provider_endpoint_input(app, &instance);
-                        } else if provider_setup_requires_api_key(&instance) {
-                            app.enter_provider_api_key_input_mode();
-                        } else {
-                            app.enter_provider_name_input_mode();
-                        }
-                    }
-                }
-            }
-        }
-        Some(CommandAction::LoginNoArg) => {
-            app.enter_login_selection_mode();
-        }
         Some(CommandAction::Resume(session_id)) => {
             app.resume_session_by_id(&session_id);
         }

@@ -2,14 +2,12 @@
 //! methods split out of `app.rs`.
 
 use crate::agent::types::{AskRequest, AskUserResponse};
-use crate::app::{App, DEFAULT_OLLAMA_ENDPOINT, SelectionResult};
+use crate::app::{App, SelectionResult};
 use crate::ask_user_state::PendingAsk;
-use crate::auth::LoginEvent;
 use crate::completion::CompletionItem;
 use crate::export;
 use crate::llm::Message;
-use crate::login_state::LoginActionKind;
-use crate::provider_instance::{ApiType, BackendPreset, ProviderInstance};
+use crate::provider_instance::{BackendPreset, ProviderInstance};
 use crate::provider_manager::{PendingProviderRemoval, PendingProviderSetup, ProviderSetupStep};
 use crate::selection_state::{MAX_SELECTION_VISIBLE, SelectionKind};
 use crate::thinking::ThinkingLevel;
@@ -32,12 +30,9 @@ impl App {
             Some(SelectionKind::Provider) => {
                 Some(format!("/provider {}", self.provider.current_instance.id))
             }
-            Some(SelectionKind::LoginProvider)
-            | Some(SelectionKind::ResumeSession)
+            Some(SelectionKind::ResumeSession)
             | Some(SelectionKind::AskUser)
-            | Some(SelectionKind::LoginAction)
             | Some(SelectionKind::ConfirmProviderRemoval)
-            | Some(SelectionKind::ProviderApiType)
             | Some(SelectionKind::Agent)
             | Some(SelectionKind::KeybindingHelp)
             | None => None,
@@ -155,17 +150,13 @@ impl App {
     }
 
     /// Open the provider selection menu showing configured instances.
-    ///
-    /// When no providers are configured, shows a placeholder with a hint to
-    /// use `/login`.  A "Login to a service…" entry is always present at the
-    /// bottom to jump to the login menu.
     pub fn enter_provider_selection_mode(&mut self, instances: &[ProviderInstance]) {
         self.reset_textarea();
         self.session.live_turn.notices.clear();
-        let mut items: Vec<CompletionItem> = if instances.is_empty() {
+        let items: Vec<CompletionItem> = if instances.is_empty() {
             vec![CompletionItem {
                 label: "No providers configured".to_string(),
-                detail: "Use /login to connect to a service".to_string(),
+                detail: "Configure one with /provider".to_string(),
                 complete_to: String::new(),
                 loading: false,
                 error: false,
@@ -177,14 +168,6 @@ impl App {
                 .map(|p| CompletionItem::from_provider(&p.id, &p.label()))
                 .collect()
         };
-        items.push(CompletionItem {
-            label: "Login to a service…".to_string(),
-            detail: "Connect to a new provider".to_string(),
-            complete_to: "/login".to_string(),
-            loading: false,
-            error: false,
-            match_range: None,
-        });
         self.selection
             .activate(SelectionKind::Provider, "  Select provider  ", items);
         self.select_current_default();
@@ -237,14 +220,6 @@ impl App {
         self.exit_selection_mode();
         self.reset_textarea();
         self.provider.setup_step = ProviderSetupStep::Endpoint;
-        // Pre-fill with the default endpoint hint for Ollama when adding a new instance.
-        if !self.pending_provider_setup_is_edit()
-            && self
-                .pending_provider_instance()
-                .is_some_and(|i| i.backend_preset == BackendPreset::Ollama)
-        {
-            self.textarea.insert_str(DEFAULT_OLLAMA_ENDPOINT);
-        }
     }
 
     /// Enter freeform input mode for a provider API key / token.
@@ -297,35 +272,11 @@ impl App {
         self.reset_textarea();
         Some(token)
     }
-    /// Show the API-type menu for the pending provider instance.
-    pub fn enter_provider_api_type_selection_mode(&mut self, backend_preset: &BackendPreset) {
-        self.reset_textarea();
-        self.session.live_turn.notices.clear();
-        let items = backend_preset
-            .def()
-            .allowed_apis
-            .iter()
-            .map(|api| CompletionItem {
-                label: api.label().to_string(),
-                detail: String::new(),
-                complete_to: format!("/provider_api {}", api.label()),
-                loading: false,
-                error: false,
-                match_range: None,
-            })
-            .collect();
-        self.selection
-            .activate(SelectionKind::ProviderApiType, "  Select API type  ", items);
-    }
 
     // Used by tests in app.rs.
     #[allow(dead_code)]
     pub fn set_pending_provider_backend_preset(&mut self, backend_preset: BackendPreset) {
         self.provider.set_pending_backend_preset(backend_preset);
-    }
-
-    pub fn set_pending_provider_api_type(&mut self, api_type: ApiType) {
-        self.provider.set_pending_api_type(api_type);
     }
 
     pub fn pending_provider_instance(&self) -> Option<ProviderInstance> {
@@ -379,22 +330,11 @@ impl App {
         self.provider.clear_removal();
     }
 
-    /// Read the textarea as an Ollama endpoint URL, normalize shorthand
-    /// forms, and return `Some(url)` if it looks valid, `None` otherwise.
-    pub fn take_ollama_endpoint_input(&mut self) -> Option<String> {
-        let raw = self.textarea.lines().join("");
-        let norm = BackendPreset::Ollama.def().url_normalization.as_ref()?;
-        let url = norm.normalize(&raw)?;
-        self.provider.setup_step = ProviderSetupStep::Idle;
-        self.reset_textarea();
-        Some(url)
-    }
+    // ── Provider endpoint + token setup ──────────────────────────────────────
 
-    // ── Open WebUI interactive setup ──────────────────────────────────────────
-
-    /// Submit the URL typed in Open WebUI URL input mode.
-    /// Returns the normalised URL if valid, and transitions to token input mode.
-    pub fn submit_open_webui_url_input(&mut self) -> Option<String> {
+    /// Submit the endpoint URL and transition to token input mode.
+    /// Returns the normalised URL if valid.
+    pub fn submit_pending_provider_endpoint_input(&mut self) -> Option<String> {
         let instance = self.pending_provider_instance()?;
         let raw = self.textarea.lines().join("");
         let norm = instance.backend_preset.def().url_normalization.as_ref()?;
@@ -421,7 +361,7 @@ impl App {
 
     /// Submit the token typed in Open WebUI token input mode.
     /// Returns `Some((url, token))` if a pending URL exists and the token is non-empty.
-    pub fn take_open_webui_token_input(&mut self) -> Option<(String, String)> {
+    pub fn take_pending_provider_url_and_token(&mut self) -> Option<(String, String)> {
         let token = self.submit_pending_provider_api_key()?;
         let url = if let ProviderSetupStep::ApiKey { pending_url } = &self.provider.setup_step {
             pending_url.clone()
@@ -438,13 +378,6 @@ impl App {
         })?;
         self.provider.setup_step = ProviderSetupStep::Idle;
         Some((url, token))
-    }
-
-    /// Open provider picker for `/login` command.
-    pub fn enter_login_selection_mode(&mut self) {
-        self.reset_textarea();
-        self.session.live_turn.notices.clear();
-        self.login.enter_login_selection_mode(&mut self.selection);
     }
 
     /// Dismiss the selection menu without applying a choice.
@@ -469,25 +402,16 @@ impl App {
     pub fn selection_filter_enabled(&self) -> bool {
         !matches!(
             self.selection.kind,
-            Some(SelectionKind::LoginAction)
-                | Some(SelectionKind::ConfirmProviderRemoval)
-                | Some(SelectionKind::KeybindingHelp)
+            Some(SelectionKind::ConfirmProviderRemoval) | Some(SelectionKind::KeybindingHelp)
         )
     }
 
     pub fn selection_add_char(&mut self, c: char) {
-        // The login action menu is a small fixed list; filtering adds no value.
-        if self.selection.kind == Some(SelectionKind::LoginAction) {
-            return;
-        }
         self.selection.query.push(c);
         self.apply_selection_filter();
     }
 
     pub fn selection_backspace(&mut self) {
-        if self.selection.kind == Some(SelectionKind::LoginAction) {
-            return;
-        }
         self.selection.query.pop();
         self.apply_selection_filter();
     }
@@ -571,16 +495,10 @@ impl App {
                 .strip_prefix("/thinking ")
                 .and_then(ThinkingLevel::parse)
                 .map(SelectionResult::Thinking),
-            Some(SelectionKind::Provider) => {
-                if let Some(name) = item.complete_to.strip_prefix("/provider ") {
-                    Some(SelectionResult::Provider(name.to_string()))
-                } else if item.complete_to == "/login" {
-                    self.enter_login_selection_mode();
-                    return None;
-                } else {
-                    None
-                }
-            }
+            Some(SelectionKind::Provider) => item
+                .complete_to
+                .strip_prefix("/provider ")
+                .map(|name| SelectionResult::Provider(name.to_string())),
             Some(SelectionKind::ConfirmProviderRemoval) => match item.complete_to.as_str() {
                 "/provider_remove_confirm" => self
                     .provider
@@ -590,26 +508,6 @@ impl App {
                 "/provider_remove_cancel" => Some(SelectionResult::CancelProviderRemoval),
                 _ => None,
             },
-            Some(SelectionKind::ProviderApiType) => item
-                .complete_to
-                .strip_prefix("/provider_api ")
-                .and_then(|label| {
-                    self.provider
-                        .pending_setup
-                        .as_ref()?
-                        .backend_preset
-                        .as_ref()?
-                        .def()
-                        .allowed_apis
-                        .iter()
-                        .find(|api| api.label() == label)
-                        .cloned()
-                })
-                .map(SelectionResult::ProviderApiType),
-            Some(SelectionKind::LoginProvider) => item
-                .complete_to
-                .strip_prefix("/login ")
-                .map(|name| SelectionResult::LoginProvider(name.to_string())),
             Some(SelectionKind::ResumeSession) => item
                 .complete_to
                 .strip_prefix("/resume_session ")
@@ -622,21 +520,6 @@ impl App {
                     (item.complete_to == "/ask_user_freeform")
                         .then_some(SelectionResult::AskFreeform)
                 }),
-            Some(SelectionKind::LoginAction) => match item.complete_to.as_str() {
-                crate::login_state::LOGIN_ACTION_OPEN_BROWSER => {
-                    Some(SelectionResult::LoginAction(LoginActionKind::OpenBrowser))
-                }
-                crate::login_state::LOGIN_ACTION_COPY_URL => {
-                    Some(SelectionResult::LoginAction(LoginActionKind::CopyUrl))
-                }
-                crate::login_state::LOGIN_ACTION_COPY_CODE => {
-                    Some(SelectionResult::LoginAction(LoginActionKind::CopyCode))
-                }
-                crate::login_state::LOGIN_ACTION_CANCEL => {
-                    Some(SelectionResult::LoginAction(LoginActionKind::Cancel))
-                }
-                _ => None,
-            },
             Some(SelectionKind::Agent) => item
                 .complete_to
                 .strip_prefix("/agent ")
@@ -965,41 +848,6 @@ impl App {
         self.ask_user.freeform_mode = false;
         self.exit_selection_mode();
         self.reset_textarea();
-    }
-
-    // ── Login panel actions ───────────────────────────────────────────────────
-
-    // ── Login panel actions ───────────────────────────────────────────────────
-
-    /// Open the action selection menu for the active login panel.
-    pub fn enter_login_action_menu(&mut self) {
-        self.session.live_turn.notices.clear();
-        self.login.enter_login_action_menu(&mut self.selection);
-    }
-
-    /// Execute a login action chosen from the action menu.
-    pub fn apply_login_action(&mut self, action: LoginActionKind) {
-        self.login.apply_login_action(action, &mut self.selection);
-    }
-
-    pub fn start_login(&mut self, provider: &str) {
-        let tx = self.app_event_tx();
-        self.login.start_login(provider, tx);
-    }
-
-    pub fn cancel_login(&mut self) {
-        self.login.cancel_login();
-    }
-
-    pub fn apply_login_event(&mut self, ev: LoginEvent) {
-        let App {
-            login,
-            session,
-            selection,
-            log_view,
-            ..
-        } = self;
-        login.apply_login_event(ev, session, selection, &mut log_view.log_cache);
     }
 
     // ── Conversation management ───────────────────────────────────────────────

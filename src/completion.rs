@@ -318,18 +318,6 @@ pub fn completions_for(
                     .filter(|p| p.id.starts_with(arg))
                     .map(|p| CompletionItem::from_provider(&p.id, &p.label()))
                     .collect(),
-                "login" => ["gemini"]
-                    .iter()
-                    .filter(|p| p.starts_with(arg))
-                    .map(|p| CompletionItem {
-                        label: (*p).to_string(),
-                        detail: String::new(),
-                        complete_to: format!("/login {p}"),
-                        loading: false,
-                        error: false,
-                        match_range: None,
-                    })
-                    .collect(),
                 "thinking" if thinking_enabled => ThinkingLevel::all()
                     .iter()
                     .map(|lvl| lvl.as_str())
@@ -514,11 +502,11 @@ mod tests {
         let providers = vec![
             crate::provider_instance::ProviderInstance::new(
                 "gemini",
-                crate::provider_instance::BackendPreset::Gemini,
+                crate::provider_instance::BackendPreset::OpenAiCompatible,
             ),
             crate::provider_instance::ProviderInstance::new(
                 "gpu-box",
-                crate::provider_instance::BackendPreset::Ollama,
+                crate::provider_instance::BackendPreset::OpenAiCompatible,
             ),
         ];
         let provider_items = completions_for(

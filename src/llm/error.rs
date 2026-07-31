@@ -32,7 +32,7 @@ pub struct ProviderError {
 }
 
 impl ProviderError {
-    fn new(
+    pub(crate) fn new(
         kind: ProviderErrorKind,
         status_code: Option<u16>,
         source: impl Into<String>,
@@ -103,43 +103,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unauthorized_constructor() {
-        let err = ProviderError::unauthorized("openai", "token expired");
-        assert_eq!(err.kind, ProviderErrorKind::Unauthorized);
-        assert_eq!(err.status_code, Some(401));
-        assert_eq!(err.source, "openai");
-        assert_eq!(err.message, "token expired");
-    }
-
-    #[test]
-    fn forbidden_constructor() {
-        let err = ProviderError::forbidden("openai", "quota exceeded");
-        assert_eq!(err.kind, ProviderErrorKind::Forbidden);
-        assert_eq!(err.status_code, Some(403));
-    }
-
-    #[test]
-    fn rate_limited_constructor() {
-        let err = ProviderError::rate_limited("openai", "too many requests");
-        assert_eq!(err.kind, ProviderErrorKind::RateLimited);
-        assert_eq!(err.status_code, Some(429));
-    }
-
-    #[test]
-    fn server_error_constructor() {
-        let err = ProviderError::server_error("gemini", 503, "service unavailable");
-        assert_eq!(err.kind, ProviderErrorKind::ServerError);
-        assert_eq!(err.status_code, Some(503));
-    }
-
-    #[test]
-    fn network_constructor() {
-        let err = ProviderError::network("ollama", "connection refused");
-        assert_eq!(err.kind, ProviderErrorKind::Network);
-        assert!(err.status_code.is_none());
-    }
-
-    #[test]
     fn other_constructor() {
         let err = ProviderError::other("custom", "parse error");
         assert_eq!(err.kind, ProviderErrorKind::Other);
@@ -148,21 +111,26 @@ mod tests {
 
     #[test]
     fn display_with_status_code() {
-        let err = ProviderError::unauthorized("openai", "invalid token");
+        let err = ProviderError {
+            kind: ProviderErrorKind::Unauthorized,
+            status_code: Some(401),
+            source: "openai".to_string(),
+            message: "invalid token".to_string(),
+        };
         assert_eq!(format!("{err}"), "openai (401): invalid token");
     }
 
     #[test]
     fn display_without_status_code() {
-        let err = ProviderError::network("openai", "connection timeout");
+        let err = ProviderError::other("openai", "connection timeout");
         assert_eq!(format!("{err}"), "openai: connection timeout");
     }
 
     #[test]
     fn source_is_preserved_even_when_ui_uses_other_identity() {
-        let err = ProviderError::server_error("OpenAI", 524, "error code: 524");
+        let err = ProviderError::other("OpenAI", "error code: 524");
         assert_eq!(err.source, "OpenAI");
-        assert_eq!(err.status_code, Some(524));
+        assert!(err.status_code.is_none());
         assert_eq!(err.message, "error code: 524");
     }
 }

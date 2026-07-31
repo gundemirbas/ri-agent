@@ -226,9 +226,6 @@ async fn stream_assistant_turn(
                 }
                 return TurnOutcome::Error(e);
             }
-            LlmEvent::StatusUpdate(msg) => {
-                tx.send_ignore(AppEvent::Agent(AgentEvent::StatusUpdate(msg.clone())));
-            }
         }
     }
 

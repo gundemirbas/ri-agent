@@ -18,7 +18,7 @@ pub fn project_dirs() -> anyhow::Result<&'static ProjectDirs> {
         .context("Could not resolve platform directories for xi")
 }
 
-/// Print all paths xi uses to stdout, one labelled entry per line.
+/// Print all paths ri uses to stdout, one labelled entry per line.
 /// Called by `--print-dirs`.
 pub fn print_dirs() {
     let Some(dirs) = PROJECT_DIRS.as_ref() else {
@@ -31,11 +31,6 @@ pub fn print_dirs() {
             "config",
             "config.toml  — provider, model, and general settings",
             &|| dirs.config_dir().join("config.toml"),
-        ),
-        (
-            "auth",
-            "auth.toml    — stored authentication tokens",
-            &|| dirs.data_dir().join("auth.toml"),
         ),
         ("sessions", "sessions/    — conversation history", &|| {
             dirs.data_dir().join("sessions")

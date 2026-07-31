@@ -287,9 +287,6 @@ pub enum LlmEvent {
         name: String,
         args: serde_json::Value,
     },
-    /// A transient status message from the provider (e.g. "Rate limited, retrying in 7s…").
-    /// Should be shown to the user but is not part of the conversation history.
-    StatusUpdate(String),
     /// The stream finished successfully.
     Done,
     /// The request failed.
@@ -351,16 +348,12 @@ pub trait LlmProvider: Send + Sync {
 
     /// Return the list of model names available from this provider.
     /// The default implementation returns an empty list; providers that
-    /// support model discovery (e.g. Ollama) should override this.
+    /// support model discovery should override this.
     fn list_models(&self) -> ModelListFuture {
         Box::pin(async { Ok(vec![]) })
     }
 }
 
-pub mod common;
-pub mod gemini;
-pub mod ollama;
-pub mod provider_format;
 pub mod rig_provider;
 pub mod test_provider;
 

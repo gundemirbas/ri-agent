@@ -444,7 +444,6 @@ async fn collect_summary(
             LlmEvent::ToolCallStart { .. } => {}
             LlmEvent::ToolCallArgsDelta { .. } => {}
             LlmEvent::ToolCall { .. } => {}
-            LlmEvent::StatusUpdate(_) => {}
             LlmEvent::Done => break,
             LlmEvent::Error(e) => return Err(e),
         }

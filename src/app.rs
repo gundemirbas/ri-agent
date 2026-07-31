@@ -4,13 +4,12 @@ use std::sync::Arc;
 use crate::{
     agent::AgentLoopConfig,
     app_event::{AppEvent, AppEventTx},
-    auth::{self},
     completion::{self, CompletionItem},
     config::DisplayConfig,
     keybindings::{BindingContext, KEYBINDINGS},
     live_turn::compose_display,
     llm::{LlmProvider, Message, UsageStats},
-    provider_instance::{ApiType, ProviderInstance},
+    provider_instance::ProviderInstance,
     session::SessionStore,
     session_state::SessionState,
     skills::SkillMeta,
@@ -23,7 +22,6 @@ use crate::agent_turn_state::AgentTurnState;
 use crate::ask_user_state::AskUserState;
 use crate::completion_state::CompletionState;
 use crate::log_view_state::LogViewState;
-use crate::login_state::{LoginActionKind, LoginState};
 use crate::mouse_select::MouseSelectState;
 use crate::provider_manager::{
     ProviderManager, ProviderSetupStep, active_provider_display_name,
@@ -38,8 +36,6 @@ use crate::step_back_state::StepBackState;
 use crate::tracked::Tracked;
 
 // ── Streaming status ──────────────────────────────────────────────────────────
-
-pub const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 
 /// Describes what the agent/provider is currently doing while a turn is active.
 #[derive(Debug, Clone)]
@@ -59,29 +55,15 @@ pub enum SelectionResult {
     Model(String),
     Thinking(ThinkingLevel),
     Provider(String),
-    LoginProvider(String),
     ResumeSession(String),
     AskOption(String),
     AskFreeform,
-    /// A login-panel action was selected.
-    LoginAction(LoginActionKind),
     /// The user cancelled a pending provider removal confirmation.
     CancelProviderRemoval,
     /// The user confirmed removing a custom provider instance.
     RemoveProvider(String),
-    /// A provider API type was chosen during add-provider setup.
-    ProviderApiType(ApiType),
     /// The user selected an agent name from the picker.
     Agent(String),
-}
-
-/// Target operation to retry after token refresh completes.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RetryTarget {
-    /// Retry the last agent turn (chat request).
-    AgentTurn,
-    /// Retry the model list fetch.
-    ModelFetch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,9 +118,6 @@ pub struct App {
     /// submits a new message.
     pub(crate) cache_miss_warning: bool,
 
-    // ── Login panel ───────────────────────────────────────────────────────────
-    pub(crate) login: LoginState,
-
     // ── Session persistence + state ───────────────────────────────────────────
     /// All session-related state: persistence store, committed state, live
     /// turn overlay, and pending event buffer.
@@ -191,7 +170,6 @@ impl App {
             show_info: false,
             latest_usage: None,
             cache_miss_warning: false,
-            login: LoginState::new(),
             session: Tracked::new(SessionManager::new()),
             ask_user: AskUserState::new(),
             runtime: AgentRuntime::new(),
@@ -209,11 +187,7 @@ impl App {
 
     /// Advance the throbber animation frame.  Called on every UI tick.
     pub fn tick(&mut self) {
-        if self.login.refresh_in_progress {
-            self.agent_turn.tick = self.agent_turn.tick.wrapping_add(1);
-        } else {
-            self.agent_turn.advance_tick();
-        }
+        self.agent_turn.advance_tick();
     }
 
     /// Record a model/provider change in the event log.
@@ -250,17 +224,12 @@ impl App {
     /// - Token refresh in progress: throbber visible regardless of turn state,
     ///   so the user sees activity during the ~500ms refresh window.
     pub fn throbber_visible(&self) -> bool {
-        self.login.refresh_in_progress
-            || self
-                .agent_turn
-                .throbber_visible(self.has_pending_ask() || self.ask_user_freeform_mode())
+        self.agent_turn
+            .throbber_visible(self.has_pending_ask() || self.ask_user_freeform_mode())
     }
 
     /// Returns true when provider/system status text should be visible.
     pub fn provider_status_visible(&self) -> bool {
-        if self.login.active {
-            return false;
-        }
         matches!(
             self.agent_turn.status,
             Some(StreamingStatus::Message(_) | StreamingStatus::CompletedMessage(_))
@@ -429,7 +398,6 @@ impl App {
 
     pub(crate) fn ui_is_suspend_idle(&self) -> bool {
         !self.selection.active
-            && !self.login.active
             && self.provider.setup_step == ProviderSetupStep::Idle
             && self.input_mode == InputMode::Chat
     }
@@ -623,92 +591,6 @@ impl App {
         TextArea::default()
     }
 
-    fn provider_supports_token_refresh(&self) -> bool {
-        self.provider
-            .current_instance
-            .backend_preset
-            .def()
-            .auth_mode
-            == crate::provider_instance::AuthMode::OAuthLogin
-    }
-
-    /// Trigger a token refresh for unauthorized errors and set up automatic retry.
-    ///
-    /// Returns `true` if refresh was triggered, `false` if conditions weren't met
-    /// (already refreshing, provider doesn't support refresh, etc.).
-    pub(crate) fn trigger_auth_refresh(&mut self, target: RetryTarget) -> bool {
-        if !self.provider_supports_token_refresh() || self.login.refresh_in_progress {
-            return false;
-        }
-
-        log::debug!(
-            "triggering token refresh: provider={} target={:?}",
-            self.provider.current_instance.id,
-            target
-        );
-
-        self.login.refresh_in_progress = true;
-
-        match target {
-            RetryTarget::AgentTurn => {
-                self.login.retry_after_refresh = true;
-            }
-            RetryTarget::ModelFetch => {
-                self.login.retry_model_fetch_after_refresh = true;
-            }
-        }
-
-        let provider = self.provider.current_instance.id.clone();
-        let tx = self.app_event_tx();
-        tokio::spawn(async move {
-            auth::refresh_provider(&provider, tx).await;
-        });
-
-        true
-    }
-
-    /// Check if the current provider's token needs proactive refresh before
-    /// making a request. If so, trigger refresh and return `true`.
-    ///
-    /// This prevents requests from failing mid-flight due to known token expiry.
-    /// Guards: only triggers when not already streaming and not already refreshing.
-    pub(crate) fn check_token_preflight(&mut self, target: RetryTarget) -> bool {
-        if self.streaming()
-            || self.login.refresh_in_progress
-            || !self.provider_supports_token_refresh()
-        {
-            return false;
-        }
-
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let state = match auth::token_state(
-            &self.provider.current_instance.id,
-            now_secs,
-            auth::AUTH_REFRESH_LEEWAY_SECS,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("preflight token check failed: {e}");
-                return false;
-            }
-        };
-
-        match state {
-            auth::AuthTokenState::Expired | auth::AuthTokenState::ExpiringSoon => {
-                log::debug!(
-                    "preflight: token {:?}, triggering refresh before request",
-                    state
-                );
-                self.trigger_auth_refresh(target)
-            }
-            _ => false,
-        }
-    }
-
     /// Reset the chat input area to a blank state between submissions.
     /// Also clears any active completion state.
     pub fn reset_textarea(&mut self) {
@@ -738,7 +620,7 @@ impl App {
     pub fn submit_shell_command(&mut self) {
         let lines: Vec<String> = self.shell.textarea.lines().to_vec();
         let command = lines.join("\n").trim().to_string();
-        if command.is_empty() || self.streaming() || self.login.active {
+        if command.is_empty() || self.streaming() {
             return;
         }
 
@@ -846,11 +728,9 @@ impl App {
     /// 1) cancel pending ask
     /// 2) cancel slash-command input/completion
     /// 3) cancel provider-name input
-    /// 4) cancel Ollama endpoint input
-    /// 5) cancel Open WebUI setup input
-    /// 6) cancel login flow
-    /// 7) when streaming, show a Ctrl-C hint instead of aborting
-    /// 8) when idle, clear non-empty input
+    /// 4) cancel provider endpoint setup input
+    /// 5) when streaming, show a Ctrl-C hint instead of aborting
+    /// 6) when idle, clear non-empty input
     pub fn handle_escape_in_chat_mode(&mut self) {
         if self.is_stepping() {
             // Clean up any in-flight ask_user UI state before cancelling.
@@ -869,8 +749,6 @@ impl App {
             self.clear_pending_provider_removal();
         } else if self.provider.setup_step != ProviderSetupStep::Idle {
             self.cancel_setup_input();
-        } else if self.login.active {
-            self.cancel_login();
         } else if self.streaming() {
             // Esc no longer aborts the agent loop — use Ctrl-C for that.
             self.push_notice(Message::assistant(
@@ -937,12 +815,6 @@ impl App {
 
     /// Spawn a background task to fetch the model list from the provider.
     pub fn start_model_fetch(&mut self, provider: &DynProvider) {
-        // Proactive token refresh check before fetching models
-        if self.check_token_preflight(RetryTarget::ModelFetch) {
-            // Refresh triggered; fetch will be retried after refresh completes
-            return;
-        }
-
         self.completion.models_loading = true;
         self.completion.model_fetch_error = None;
         let future = provider.list_models();
@@ -962,34 +834,23 @@ impl App {
                 self.completion.model_fetch_error = None;
             }
             Err(e) => {
-                let is_unauthorized = e.kind == crate::llm::ProviderErrorKind::Unauthorized;
-
-                if is_unauthorized && self.trigger_auth_refresh(RetryTarget::ModelFetch) {
-                    // Refresh triggered; retry will happen automatically after refresh completes
-                } else {
-                    let provider_label = active_provider_display_name(
-                        &self.provider.current_instance.id,
-                        &self.provider.instances,
-                    );
-                    self.completion.model_fetch_error =
-                        Some(format_provider_error_for_display(&provider_label, &e));
-                }
+                let provider_label = active_provider_display_name(
+                    &self.provider.current_instance.id,
+                    &self.provider.instances,
+                );
+                self.completion.model_fetch_error =
+                    Some(format_provider_error_for_display(&provider_label, &e));
             }
         }
         self.update_completions();
 
         // If no model is configured and the fetch succeeded, open the model
-        // picker automatically so the user can choose one.  On a fresh install
-        // (no provider selected), redirect to the login menu instead.
+        // picker automatically so the user can choose one.
         if self.provider.current_instance.model.is_none()
             && self.completion.available_models.is_some()
             && !self.selection.active
         {
-            if !self.provider.provider_selected {
-                self.enter_login_selection_mode();
-            } else {
-                self.enter_model_selection_mode();
-            }
+            self.enter_model_selection_mode();
             return;
         }
 
@@ -1374,23 +1235,19 @@ fn folder_name(path: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, StreamingStatus, format_provider_error_for_display};
+    use super::App;
     use crate::{
-        agent::{
-            AgentLoopConfig,
-            types::{AskRequest, AskUserOption, AskUserResponse},
-        },
-        app_event::AppEvent,
-        llm::{Message, ProviderError, Role},
+        agent::AgentLoopConfig,
         provider_instance::{ApiType, BackendPreset, ProviderInstance},
         provider_manager::{PendingProviderSetup, SetupInputKind},
-        session_event::SessionEvent,
         thinking::ThinkingLevel,
     };
 
     fn make_app() -> App {
-        let instance =
-            crate::provider_instance::ProviderInstance::new("openai", BackendPreset::OpenAi);
+        let instance = crate::provider_instance::ProviderInstance::new(
+            "openai",
+            BackendPreset::OpenAiCompatible,
+        );
         App::new(
             instance,
             "gpt-4o",
@@ -1414,12 +1271,6 @@ mod tests {
         )
     }
 
-    fn install_test_agent_task(app: &mut App) {
-        app.runtime.agent_task = Some(tokio::spawn(async {
-            std::future::pending::<()>().await;
-        }));
-    }
-
     #[test]
     fn fresh_app_has_no_provider_selected() {
         let app = make_app();
@@ -1441,10 +1292,6 @@ mod tests {
         app.selection.active = true;
         assert!(!app.ui_is_suspend_idle());
         app.selection.active = false;
-
-        app.login.active = true;
-        assert!(!app.ui_is_suspend_idle());
-        app.login.active = false;
 
         app.provider.setup_step = crate::provider_manager::ProviderSetupStep::Endpoint;
         assert!(!app.ui_is_suspend_idle());
@@ -1511,57 +1358,32 @@ mod tests {
     }
 
     #[test]
-    fn setup_input_kind_uses_service_specific_prompts() {
+    fn setup_input_kind_uses_generic_openai_compatible_prompts() {
         assert_eq!(
             SetupInputKind::Name.prompt_label(None),
             "provider instance name: "
         );
 
-        let mut open_webui = ProviderInstance::new("work-webui", BackendPreset::OpenWebUi);
-        open_webui.api_type = ApiType::OpenAiCompatible;
-        assert_eq!(
-            SetupInputKind::BaseUrl.prompt_label(Some(&open_webui)),
-            "open-webui URL: "
-        );
-        assert_eq!(
-            SetupInputKind::ApiKey.prompt_label(Some(&open_webui)),
-            "open-webui token: "
-        );
-
-        let mut openrouter = ProviderInstance::new("router", BackendPreset::OpenRouter);
-        openrouter.api_type = ApiType::OpenAiCompatible;
-        assert_eq!(
-            SetupInputKind::BaseUrl.prompt_label(Some(&openrouter)),
-            "URL: "
-        );
-        assert_eq!(
-            SetupInputKind::ApiKey.prompt_label(Some(&openrouter)),
-            "OpenRouter API key: "
-        );
-
-        let mut ollama = ProviderInstance::new("gpu-box", BackendPreset::Ollama);
-        ollama.api_type = ApiType::OllamaChatApi;
-        assert_eq!(
-            SetupInputKind::BaseUrl.prompt_label(Some(&ollama)),
-            "ollama URL: "
-        );
-
-        let mut compat = ProviderInstance::new("test", BackendPreset::OpenAiCompatible);
+        let mut compat = ProviderInstance::new("compat", BackendPreset::OpenAiCompatible);
         compat.api_type = ApiType::OpenAiCompatible;
         assert_eq!(SetupInputKind::BaseUrl.prompt_label(Some(&compat)), "URL: ");
         assert_eq!(
             SetupInputKind::ApiKey.prompt_label(Some(&compat)),
             "API key: "
         );
+
+        // Without an instance, fall back to the generic labels.
+        assert_eq!(SetupInputKind::BaseUrl.prompt_label(None), "URL: ");
+        assert_eq!(SetupInputKind::ApiKey.prompt_label(None), "API key: ");
     }
 
     #[test]
     fn enter_provider_selection_mode_lists_providers_and_login_entry() {
         let mut app = make_app();
         let providers = vec![
-            ProviderInstance::new("openai", BackendPreset::OpenAi),
-            ProviderInstance::new("gpu-box", BackendPreset::Ollama),
-            ProviderInstance::new("work-webui", BackendPreset::OpenWebUi),
+            ProviderInstance::new("openai", BackendPreset::OpenAiCompatible),
+            ProviderInstance::new("gpu-box", BackendPreset::OpenAiCompatible),
+            ProviderInstance::new("work-webui", BackendPreset::OpenAiCompatible),
         ];
 
         app.enter_provider_selection_mode(&providers);
@@ -1573,7 +1395,6 @@ mod tests {
             .map(|item| item.complete_to.as_str())
             .collect();
 
-        assert!(items.contains(&"/login"));
         assert!(items.contains(&"/provider openai"));
         assert!(items.contains(&"/provider gpu-box"));
         assert!(items.contains(&"/provider work-webui"));
@@ -1582,7 +1403,7 @@ mod tests {
     #[test]
     fn enter_provider_removal_confirmation_mode_tracks_target_provider() {
         let mut app = make_app();
-        let instance = ProviderInstance::new("gpu-box", BackendPreset::Ollama);
+        let instance = ProviderInstance::new("gpu-box", BackendPreset::OpenAiCompatible);
 
         app.enter_provider_removal_confirmation_mode(&instance);
 
@@ -1613,7 +1434,7 @@ mod tests {
     #[test]
     fn apply_selection_returns_remove_provider_confirmation() {
         let mut app = make_app();
-        let instance = ProviderInstance::new("gpu-box", BackendPreset::Ollama);
+        let instance = ProviderInstance::new("gpu-box", BackendPreset::OpenAiCompatible);
         app.enter_provider_removal_confirmation_mode(&instance);
         app.selection.selected = 0;
 
@@ -1628,7 +1449,7 @@ mod tests {
     #[test]
     fn apply_selection_returns_cancel_provider_removal() {
         let mut app = make_app();
-        let instance = ProviderInstance::new("gpu-box", BackendPreset::Ollama);
+        let instance = ProviderInstance::new("gpu-box", BackendPreset::OpenAiCompatible);
         app.enter_provider_removal_confirmation_mode(&instance);
         app.selection.selected = 1;
 
@@ -1643,7 +1464,7 @@ mod tests {
     #[test]
     fn clear_pending_provider_setup_clears_pending_provider_removal() {
         let mut app = make_app();
-        let instance = ProviderInstance::new("gpu-box", BackendPreset::Ollama);
+        let instance = ProviderInstance::new("gpu-box", BackendPreset::OpenAiCompatible);
         app.enter_provider_removal_confirmation_mode(&instance);
 
         app.clear_pending_provider_setup();
@@ -1656,7 +1477,6 @@ mod tests {
         let mut app = make_app();
         app.provider.pending_setup = Some(PendingProviderSetup::new("test".to_string()));
         app.set_pending_provider_backend_preset(BackendPreset::OpenAiCompatible);
-        app.set_pending_provider_api_type(ApiType::OpenAiCompatible);
         app.enter_provider_endpoint_input_mode();
         app.textarea.insert_str("test");
 
@@ -1676,8 +1496,7 @@ mod tests {
     fn submit_pending_provider_base_url_stores_openrouter_endpoint() {
         let mut app = make_app();
         app.provider.pending_setup = Some(PendingProviderSetup::new("router".to_string()));
-        app.set_pending_provider_backend_preset(BackendPreset::OpenRouter);
-        app.set_pending_provider_api_type(ApiType::OpenAiCompatible);
+        app.set_pending_provider_backend_preset(BackendPreset::OpenAiCompatible);
         app.enter_provider_endpoint_input_mode();
         app.textarea.insert_str("openrouter.ai/api/v1");
 
@@ -1717,8 +1536,8 @@ mod tests {
     fn provider_selection_mode_reports_selected_provider_id() {
         let mut app = make_app();
         app.enter_provider_selection_mode(&[
-            ProviderInstance::new("openai", BackendPreset::OpenAi),
-            ProviderInstance::new("gpu-box", BackendPreset::Ollama),
+            ProviderInstance::new("openai", BackendPreset::OpenAiCompatible),
+            ProviderInstance::new("gpu-box", BackendPreset::OpenAiCompatible),
         ]);
         app.selection.selected = app
             .selection
@@ -1729,1831 +1548,5 @@ mod tests {
 
         assert!(app.in_provider_selection_mode());
         assert_eq!(app.selected_provider_id(), Some("gpu-box"));
-    }
-
-    #[test]
-    fn enter_ollama_endpoint_freeform_mode_prefills_default_for_new_provider() {
-        let mut app = make_app();
-        app.provider.pending_setup = Some(PendingProviderSetup::new(String::new()));
-        app.set_pending_provider_backend_preset(BackendPreset::Ollama);
-
-        app.enter_provider_endpoint_input_mode();
-
-        assert_eq!(
-            app.textarea.lines().join(""),
-            super::DEFAULT_OLLAMA_ENDPOINT
-        );
-    }
-
-    #[test]
-    fn enter_provider_edit_mode_prefills_existing_base_url() {
-        let mut app = make_app();
-        let mut instance = ProviderInstance::new("gpu-box", BackendPreset::Ollama);
-        instance.base_url = Some("http://gpu-box:11434".to_string());
-
-        app.enter_provider_edit_mode(&instance);
-
-        assert!(app.pending_provider_setup_is_edit());
-        assert_eq!(app.textarea.lines().join(""), "http://gpu-box:11434");
-    }
-
-    #[test]
-    fn submit_pending_provider_api_key_keeps_existing_value_when_editing() {
-        let mut app = make_app();
-        let mut instance = ProviderInstance::new("work-webui", BackendPreset::OpenWebUi);
-        instance.api_key = Some("sk-existing".to_string());
-        app.provider.pending_setup = Some(PendingProviderSetup::from_instance(&instance));
-        app.enter_provider_api_key_input_mode();
-
-        let token = app
-            .submit_pending_provider_api_key()
-            .expect("provider token");
-        assert_eq!(token, "sk-existing");
-        assert_eq!(
-            app.provider
-                .pending_setup
-                .as_ref()
-                .and_then(|p| p.api_key.as_deref()),
-            Some("sk-existing")
-        );
-    }
-
-    #[test]
-    fn submit_provider_name_input_slugifies_and_rejects_duplicates() {
-        let mut app = make_app();
-        let providers = vec![crate::provider_instance::ProviderInstance::new(
-            "work-webui",
-            BackendPreset::OpenWebUi,
-        )];
-
-        app.provider.pending_setup = Some(PendingProviderSetup::new(String::new()));
-        app.set_pending_provider_backend_preset(BackendPreset::OpenWebUi);
-        if let Some(setup) = app.provider.pending_setup.as_mut() {
-            setup.base_url = Some("https://work.example.com".to_string());
-        }
-        app.enter_provider_name_input_mode();
-        assert_eq!(app.textarea.lines().join(""), "work.example.com-open-webui");
-        app.textarea = App::make_textarea();
-        app.textarea.insert_str("Work WebUI");
-        assert!(app.submit_provider_name_input(&providers).is_none());
-
-        app.enter_provider_name_input_mode();
-        app.textarea = App::make_textarea();
-        app.textarea.insert_str("GPU Box");
-        let id = app
-            .submit_provider_name_input(&providers)
-            .expect("new provider id");
-        assert_eq!(id, "gpu-box");
-        assert_eq!(
-            app.provider.pending_setup.as_ref().map(|p| p.id.as_str()),
-            Some("gpu-box")
-        );
-    }
-
-    #[test]
-    fn pending_provider_instance_uses_suggested_id_when_name_not_confirmed_yet() {
-        let mut app = make_app();
-        app.provider.pending_setup = Some(PendingProviderSetup::new(String::new()));
-        app.set_pending_provider_backend_preset(BackendPreset::Ollama);
-        app.set_pending_provider_api_type(ApiType::OpenAiCompatible);
-        if let Some(setup) = app.provider.pending_setup.as_mut() {
-            setup.base_url = Some("http://mydomain.com:11434".to_string());
-        }
-
-        let instance = app
-            .pending_provider_instance()
-            .expect("pending provider instance");
-        assert_eq!(instance.id, "ollama-mydomain.com");
-        assert_eq!(instance.backend_preset, BackendPreset::Ollama);
-        assert_eq!(instance.api_type, ApiType::OpenAiCompatible);
-    }
-
-    #[test]
-    fn enter_provider_name_input_mode_prefills_existing_name_when_editing() {
-        let mut app = make_app();
-        let mut instance = ProviderInstance::new("gpu-box", BackendPreset::Ollama);
-        instance.base_url = Some("http://gpu-box:11434".to_string());
-
-        app.provider.pending_setup = Some(PendingProviderSetup::from_instance(&instance));
-        app.enter_provider_name_input_mode();
-
-        assert_eq!(app.textarea.lines().join(""), "gpu-box");
-    }
-
-    #[test]
-    fn enter_provider_name_input_mode_prefills_ollama_name_from_endpoint() {
-        let mut app = make_app();
-        app.provider.pending_setup = Some(PendingProviderSetup::new(String::new()));
-        app.set_pending_provider_backend_preset(BackendPreset::Ollama);
-        if let Some(setup) = app.provider.pending_setup.as_mut() {
-            setup.base_url = Some("http://localhost:11434".to_string());
-        }
-
-        app.enter_provider_name_input_mode();
-
-        assert_eq!(app.textarea.lines().join(""), "ollama-localhost");
-    }
-
-    #[test]
-    fn pending_provider_instance_uses_backend_based_placeholder_id_before_url_is_known() {
-        let mut app = make_app();
-        app.provider.pending_setup = Some(PendingProviderSetup::new(String::new()));
-        app.set_pending_provider_backend_preset(BackendPreset::Ollama);
-        app.set_pending_provider_api_type(ApiType::OpenAiCompatible);
-
-        let instance = app
-            .pending_provider_instance()
-            .expect("pending provider instance");
-        assert_eq!(instance.id, "ollama-ollama");
-        assert_eq!(instance.backend_preset, BackendPreset::Ollama);
-        assert_eq!(instance.api_type, ApiType::OpenAiCompatible);
-    }
-
-    #[test]
-    fn pending_provider_instance_uses_selected_service_and_api() {
-        let mut app = make_app();
-        app.provider.pending_setup = Some(PendingProviderSetup::new("gpu-box".to_string()));
-        app.set_pending_provider_backend_preset(BackendPreset::Ollama);
-        app.set_pending_provider_api_type(ApiType::OpenAiCompatible);
-
-        let instance = app
-            .pending_provider_instance()
-            .expect("pending provider instance");
-        assert_eq!(instance.id, "gpu-box");
-        assert_eq!(instance.backend_preset, BackendPreset::Ollama);
-        assert_eq!(instance.api_type, ApiType::OpenAiCompatible);
-    }
-
-    #[test]
-    fn normalize_ollama_endpoint_adds_default_scheme_only_when_port_present() {
-        let norm = BackendPreset::Ollama
-            .def()
-            .url_normalization
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            norm.normalize("gpu-box:8080"),
-            Some("http://gpu-box:8080".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_ollama_endpoint_adds_default_port_when_scheme_present() {
-        let norm = BackendPreset::Ollama
-            .def()
-            .url_normalization
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            norm.normalize("https://gpu-box"),
-            Some("https://gpu-box:11434".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_ollama_endpoint_keeps_existing_scheme_and_port() {
-        let norm = BackendPreset::Ollama
-            .def()
-            .url_normalization
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            norm.normalize("http://gpu-box:8080"),
-            Some("http://gpu-box:8080".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_ollama_endpoint_rejects_empty_input() {
-        let norm = BackendPreset::Ollama
-            .def()
-            .url_normalization
-            .as_ref()
-            .unwrap();
-        assert_eq!(norm.normalize("   "), None);
-    }
-
-    // ── receive_ask_request ───────────────────────────────────────────────────
-
-    /// When ask_user has no options, receive_ask_request must go directly into
-    /// freeform mode (not selection mode).  The question is visible in the log
-    /// tool call, so no selection header is needed.
-    #[test]
-    fn receive_ask_request_no_options_enters_freeform_mode() {
-        let mut app = make_app();
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel::<AskUserResponse>();
-        app.receive_ask_request(AskRequest {
-            question: "What is your name?".to_string(),
-            context: None,
-            options: vec![],
-            allow_multiple: false,
-            allow_freeform: true,
-            reply: reply_tx,
-        });
-
-        assert!(
-            !app.selection.active,
-            "selection mode should NOT be active for no-options"
-        );
-        assert!(
-            app.ask_user_freeform_mode(),
-            "freeform mode should be active"
-        );
-        assert!(app.has_pending_ask(), "pending ask should be set");
-        assert_eq!(
-            app.ask_user.pending.as_ref().map(|p| p.question.as_str()),
-            Some("What is your name?")
-        );
-    }
-
-    /// When ask_user has options and allow_freeform is true, the freeform
-    /// sentinel should appear after the option items.
-    #[test]
-    fn receive_ask_request_with_options_and_freeform_includes_sentinel() {
-        let mut app = make_app();
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel::<AskUserResponse>();
-        app.receive_ask_request(AskRequest {
-            question: "Choose one".to_string(),
-            context: None,
-            options: vec![
-                AskUserOption {
-                    title: "Alpha".to_string(),
-                    description: None,
-                },
-                AskUserOption {
-                    title: "Beta".to_string(),
-                    description: None,
-                },
-            ],
-            allow_multiple: false,
-            allow_freeform: true,
-            reply: reply_tx,
-        });
-
-        assert!(app.selection.active);
-        assert_eq!(app.selection.items.len(), 3); // 2 options + freeform sentinel
-        assert_eq!(app.selection.items[2].complete_to, "/ask_user_freeform");
-    }
-
-    /// When ask_user has options and allow_freeform is false, the freeform
-    /// sentinel should NOT appear.
-    #[test]
-    fn receive_ask_request_with_options_no_freeform_omits_sentinel() {
-        let mut app = make_app();
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel::<AskUserResponse>();
-        app.receive_ask_request(AskRequest {
-            question: "Choose one".to_string(),
-            context: None,
-            options: vec![
-                AskUserOption {
-                    title: "Alpha".to_string(),
-                    description: None,
-                },
-                AskUserOption {
-                    title: "Beta".to_string(),
-                    description: None,
-                },
-            ],
-            allow_multiple: false,
-            allow_freeform: false,
-            reply: reply_tx,
-        });
-
-        assert!(app.selection.active);
-        assert_eq!(app.selection.items.len(), 2); // only the 2 options
-        assert!(
-            app.selection
-                .items
-                .iter()
-                .all(|i| i.complete_to != "/ask_user_freeform")
-        );
-    }
-
-    #[test]
-    fn format_provider_error_uses_natural_english_and_message() {
-        let err = ProviderError::server_error("OpenAI", 524, "error code: 524");
-        let rendered = format_provider_error_for_display("Open WebUI", &err);
-        assert_eq!(
-            rendered,
-            "Open WebUI timed out on the backend (524).\nProvider message: error code: 524"
-        );
-    }
-
-    #[test]
-    fn format_provider_error_handles_network_failures() {
-        let err = ProviderError::network("Ollama", "connection refused");
-        let rendered = format_provider_error_for_display("Open WebUI", &err);
-        assert_eq!(
-            rendered,
-            "Could not reach Open WebUI.\nProvider message: connection refused"
-        );
-    }
-
-    #[test]
-    fn slash_submit_text_prefers_highlighted_completion() {
-        let mut app = make_app();
-        app.textarea.insert_str("/mo");
-        app.update_completions();
-
-        let selected = app
-            .completion
-            .completions
-            .get(app.completion.completion_selected)
-            .expect("expected at least one completion");
-        assert_eq!(selected.complete_to, "/model ");
-        assert_eq!(app.slash_submit_text().as_deref(), Some("/model"));
-    }
-
-    #[test]
-    fn slash_submit_text_falls_back_to_raw_input_when_no_completion() {
-        let mut app = make_app();
-        app.textarea.insert_str("/unknown");
-        app.update_completions();
-        assert!(app.completion.completions.is_empty());
-
-        assert_eq!(app.slash_submit_text().as_deref(), Some("/unknown"));
-    }
-
-    #[test]
-    fn handle_escape_in_chat_mode_prefers_slash_cancel_over_stream_abort() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let mut app = make_app();
-            app.agent_turn.start();
-            install_test_agent_task(&mut app);
-            app.textarea.insert_str("/model gpt");
-
-            app.handle_escape_in_chat_mode();
-
-            assert!(
-                app.streaming(),
-                "streaming should remain active when ESC cancels slash input"
-            );
-            assert!(
-                app.runtime.is_running(),
-                "agent task should not be aborted when ESC cancels slash input"
-            );
-            assert!(
-                app.textarea
-                    .lines()
-                    .iter()
-                    .all(|line| line.trim().is_empty()),
-                "slash input should be cleared"
-            );
-            assert!(
-                !app.session
-                    .live_turn
-                    .notices
-                    .iter()
-                    .any(|m| m.content == "[agent loop aborted]"),
-                "ESC slash cancel should not append an abort notice"
-            );
-
-            if let Some(handle) = app.runtime.agent_task.take() {
-                handle.abort();
-            }
-        });
-    }
-
-    #[test]
-    fn handle_escape_in_chat_mode_shows_notice_when_streaming() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let mut app = make_app();
-            app.agent_turn.start();
-            install_test_agent_task(&mut app);
-            app.textarea.insert_str("hello");
-
-            app.handle_escape_in_chat_mode();
-
-            // Esc no longer aborts the agent loop — it shows a notice.
-            assert!(
-                app.streaming(),
-                "streaming should remain active when Esc is pressed"
-            );
-            assert!(
-                app.runtime.is_running(),
-                "agent task should not be removed by Esc"
-            );
-            assert!(
-                app.session
-                    .live_turn
-                    .notices
-                    .iter()
-                    .any(|m| { m.content.contains("Use Ctrl-C to abort") })
-            );
-
-            // Clean up.
-            if let Some(handle) = app.runtime.agent_task.take() {
-                handle.abort();
-            }
-        });
-    }
-
-    #[test]
-    fn enter_and_exit_keybinding_help_leaves_draft_input_untouched() {
-        let mut app = make_app();
-        app.textarea =
-            ratatui_textarea::TextArea::new(vec!["hello".to_string(), "world".to_string()]);
-
-        app.enter_keybinding_help_mode();
-        assert!(
-            app.selection.active,
-            "help should open as a selection modal"
-        );
-        assert_eq!(
-            app.textarea.lines(),
-            &["hello".to_string(), "world".to_string()]
-        );
-
-        app.exit_selection_mode();
-        assert_eq!(
-            app.textarea.lines(),
-            &["hello".to_string(), "world".to_string()]
-        );
-    }
-
-    #[test]
-    fn keybinding_help_does_not_enable_selection_filter_mode() {
-        let mut app = make_app();
-        app.textarea = ratatui_textarea::TextArea::new(vec!["draft".to_string()]);
-
-        app.enter_keybinding_help_mode();
-
-        assert_eq!(
-            app.selection.kind,
-            Some(crate::selection_state::SelectionKind::KeybindingHelp)
-        );
-        assert!(
-            !app.selection_filter_enabled(),
-            "keyboard help should not replace the input field with a filter query"
-        );
-        assert_eq!(app.textarea.lines(), &["draft".to_string()]);
-    }
-
-    #[test]
-    fn f1_toggles_keybinding_help_without_clearing_draft() {
-        let provider: std::sync::Arc<dyn crate::llm::LlmProvider + Send + Sync> =
-            std::sync::Arc::new(crate::llm::test_provider::TestProvider::new());
-        let mut app = make_app();
-        app.textarea = ratatui_textarea::TextArea::new(vec!["draft".to_string()]);
-
-        let f1 = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::F(1),
-            crossterm::event::KeyModifiers::NONE,
-        );
-
-        let first = crate::input::handle_key_event(
-            &mut app,
-            &provider,
-            &crate::config::XiConfig::default(),
-            f1,
-        );
-        assert!(first.is_none());
-        assert_eq!(
-            app.selection.kind,
-            Some(crate::selection_state::SelectionKind::KeybindingHelp)
-        );
-        assert_eq!(app.textarea.lines(), &["draft".to_string()]);
-
-        let second = crate::input::handle_key_event(
-            &mut app,
-            &provider,
-            &crate::config::XiConfig::default(),
-            f1,
-        );
-        assert!(second.is_none());
-        assert!(!app.selection.active, "second F1 should close help");
-        assert_eq!(app.textarea.lines(), &["draft".to_string()]);
-    }
-
-    #[test]
-    fn escape_closes_keybinding_help_while_streaming() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let mut app = make_app();
-            app.agent_turn.start();
-            install_test_agent_task(&mut app);
-            app.textarea = ratatui_textarea::TextArea::new(vec!["draft".to_string()]);
-            app.enter_keybinding_help_mode();
-
-            let key = crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Esc,
-                crossterm::event::KeyModifiers::NONE,
-            );
-            #[allow(unused_mut)]
-            let dispatch = crate::input::handle_key_event(
-                &mut app,
-                &(std::sync::Arc::new(crate::llm::test_provider::TestProvider::new())
-                    as std::sync::Arc<dyn crate::llm::LlmProvider + Send + Sync>),
-                &crate::config::XiConfig::default(),
-                key,
-            );
-
-            assert!(dispatch.is_none());
-            assert!(!app.selection.active, "Esc should close keybinding help");
-            assert!(
-                app.streaming(),
-                "closing help should not stop the agent loop"
-            );
-            assert_eq!(app.textarea.lines(), &["draft".to_string()]);
-            assert!(
-                app.session
-                    .live_turn
-                    .notices
-                    .iter()
-                    .all(|m| !m.content.contains("Use Ctrl-C to abort")),
-                "closing help should not show the streaming abort hint"
-            );
-
-            if let Some(handle) = app.runtime.agent_task.take() {
-                handle.abort();
-            }
-        });
-    }
-
-    #[test]
-    fn abort_agent_loop_appends_error_result_for_pending_tool_call() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let path = tmp.path().join("session.jsonl");
-
-            let mut app = make_app();
-            app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-                crate::event_log::EventLog::load(&path).expect("load event log"),
-            ));
-            app.agent_turn.start();
-            install_test_agent_task(&mut app);
-            // Simulate an in-flight tool call via pending_turn_events.
-            app.session
-                .pending_turn_events
-                .push(crate::session_event::SessionEvent::ToolCall {
-                    id: "call_1".to_string(),
-                    name: "powershell".to_string(),
-                    args: serde_json::json!({"command": "git diff"}),
-                    include_in_llm: true,
-                    timestamp: 1,
-                });
-            app.session
-                .live_turn
-                .tool_entries
-                .push(crate::live_turn::LiveToolEntry {
-                    id: "call_1".to_string(),
-                    name: "powershell".to_string(),
-                    args: serde_json::json!({"command": "git diff"}),
-                    partial_args: String::new(),
-                    partial_snapshot: None,
-                    streaming_field: None,
-                    running_output: String::new(),
-                    last_output_line_count: 0,
-                    result: None,
-                });
-
-            app.abort_agent_loop();
-
-            let tool_result = app
-                .session
-                .session_state
-                .as_ref()
-                .expect("session state")
-                .display_messages()
-                .iter()
-                .find(|m| m.role == Role::ToolResult && m.tool_call_id.as_deref() == Some("call_1"))
-                .expect("expected abort tool result");
-            assert!(tool_result.is_error, "abort tool result should be an error");
-            assert_eq!(tool_result.content, "Interrupted by user");
-        });
-    }
-
-    #[test]
-    fn abort_agent_loop_flushes_error_result_for_pending_tool_call_to_event_log() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("session.jsonl");
-
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let mut app = make_app();
-            app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-                crate::event_log::EventLog::load(&path).expect("load event log"),
-            ));
-            app.agent_turn.start();
-            install_test_agent_task(&mut app);
-            app.session
-                .pending_turn_events
-                .push(crate::session_event::SessionEvent::ToolCall {
-                    id: "call_1".to_string(),
-                    name: "ask_user".to_string(),
-                    args: serde_json::json!({"question": "Continue?"}),
-                    include_in_llm: true,
-                    timestamp: 1,
-                });
-            app.session
-                .live_turn
-                .tool_entries
-                .push(crate::live_turn::LiveToolEntry {
-                    id: "call_1".to_string(),
-                    name: "ask_user".to_string(),
-                    args: serde_json::json!({"question": "Continue?"}),
-                    partial_args: String::new(),
-                    partial_snapshot: None,
-                    streaming_field: None,
-                    running_output: String::new(),
-                    last_output_line_count: 0,
-                    result: None,
-                });
-
-            app.abort_agent_loop();
-
-            let events = app
-                .session
-                .session_state
-                .as_ref()
-                .expect("session state")
-                .events();
-            let tool_results: Vec<_> = events
-                .iter()
-                .filter_map(|event| match event {
-                    crate::session_event::SessionEvent::ToolResult {
-                        id,
-                        name,
-                        content,
-                        is_error,
-                        ..
-                    } if id == "call_1" => Some((name.clone(), content.clone(), *is_error)),
-                    _ => None,
-                })
-                .collect();
-
-            assert_eq!(tool_results.len(), 1, "expected exactly one tool result");
-            assert_eq!(
-                tool_results[0],
-                (
-                    "ask_user".to_string(),
-                    "Interrupted by user".to_string(),
-                    true
-                )
-            );
-        });
-    }
-
-    #[test]
-    fn abort_agent_loop_does_not_duplicate_existing_tool_result() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let path = tmp.path().join("session.jsonl");
-
-            let mut app = make_app();
-            app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-                crate::event_log::EventLog::load(&path).expect("load event log"),
-            ));
-            app.agent_turn.start();
-            install_test_agent_task(&mut app);
-            // Simulate a ToolCall with its result already in pending_turn_events.
-            app.session
-                .pending_turn_events
-                .push(crate::session_event::SessionEvent::ToolCall {
-                    id: "call_1".to_string(),
-                    name: "powershell".to_string(),
-                    args: serde_json::json!({"command": "git diff"}),
-                    include_in_llm: true,
-                    timestamp: 1,
-                });
-            app.session
-                .pending_turn_events
-                .push(crate::session_event::SessionEvent::ToolResult {
-                    id: "call_1".to_string(),
-                    name: "powershell".to_string(),
-                    content: "done".to_string(),
-                    is_error: false,
-                    display_range: None,
-                    include_in_llm: true,
-                    timestamp: 1,
-                });
-
-            app.abort_agent_loop();
-
-            let matching_results = app
-                .session
-                .session_state
-                .as_ref()
-                .expect("session state")
-                .display_messages()
-                .iter()
-                .filter(|m| {
-                    m.role == Role::ToolResult && m.tool_call_id.as_deref() == Some("call_1")
-                })
-                .count();
-            assert_eq!(
-                matching_results, 1,
-                "should not append abort result for already-completed tool call"
-            );
-        });
-    }
-
-    #[test]
-    fn abort_agent_loop_commits_partial_turn_and_next_turn_clears_abort_status() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let path = tmp.path().join("session.jsonl");
-
-            let mut app = make_app();
-            app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-                crate::event_log::EventLog::load(&path).expect("load event log"),
-            ));
-            app.session.live_turn.assistant_content = "partial".to_string();
-            app.agent_turn.start();
-            install_test_agent_task(&mut app);
-
-            app.abort_agent_loop();
-
-            let display = app
-                .session
-                .session_state
-                .as_ref()
-                .expect("session state")
-                .display_messages();
-            assert!(
-                display
-                    .iter()
-                    .any(|m| m.role == Role::Assistant && m.content == "partial")
-            );
-            assert!(matches!(
-                app.agent_turn.status,
-                Some(StreamingStatus::CompletedMessage(ref s)) if s == "[agent loop aborted]"
-            ));
-
-            let provider: std::sync::Arc<dyn crate::llm::LlmProvider + Send + Sync> =
-                std::sync::Arc::new(crate::llm::test_provider::TestProvider::new());
-            app.launch_turn(&provider);
-
-            assert!(matches!(
-                app.agent_turn.status,
-                Some(StreamingStatus::Waiting)
-            ));
-        });
-    }
-
-    #[test]
-    fn request_hard_abort_keeps_running_tool_alive_for_cooperative_cancel() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let mut app = make_app();
-            app.agent_turn.start();
-            install_test_agent_task(&mut app);
-            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(crate::agent::CancelLevel::None);
-            app.runtime.cancel_tx = Some(cancel_tx);
-            app.session.live_turn.tool_entries.push(crate::live_turn::LiveToolEntry {
-                id: "call_1".to_string(),
-                name: "bash".to_string(),
-                args: serde_json::json!({"command": "sleep 10"}),
-                partial_args: String::new(),
-                partial_snapshot: None,
-                streaming_field: None,
-                running_output: String::new(),
-                last_output_line_count: 0,
-                result: None,
-            });
-
-            app.request_hard_abort();
-
-            assert!(app.runtime.agent_task.is_some(), "tool-phase hard abort should keep agent task alive");
-            assert_eq!(app.runtime.abort_stage, crate::agent::CancelLevel::HardAbort);
-            assert_eq!(*cancel_rx.borrow(), crate::agent::CancelLevel::HardAbort);
-            assert!(matches!(
-                app.agent_turn.status,
-                Some(StreamingStatus::Message(ref s)) if s == "[Aborting… Press Ctrl-C again to force kill]"
-            ));
-
-            if let Some(handle) = app.runtime.agent_task.take() {
-                handle.abort();
-            }
-        });
-    }
-
-    #[test]
-    fn request_hard_abort_without_running_tool_aborts_immediately() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let path = tmp.path().join("session.jsonl");
-
-            let mut app = make_app();
-            app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-                crate::event_log::EventLog::load(&path).expect("load event log"),
-            ));
-            app.session.live_turn.assistant_content = "partial".to_string();
-            app.agent_turn.start();
-            install_test_agent_task(&mut app);
-            let (cancel_tx, _cancel_rx) =
-                tokio::sync::watch::channel(crate::agent::CancelLevel::None);
-            app.runtime.cancel_tx = Some(cancel_tx);
-
-            app.request_hard_abort();
-
-            assert!(
-                app.runtime.agent_task.is_none(),
-                "model-phase hard abort should stop the task immediately"
-            );
-            assert!(matches!(
-                app.agent_turn.status,
-                Some(StreamingStatus::CompletedMessage(ref s)) if s == "[agent loop aborted]"
-            ));
-        });
-    }
-
-    #[test]
-    fn submit_does_not_duplicate_user_message_in_display_projection() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let path = tmp.path().join("session.jsonl");
-
-            let mut app = make_app();
-            app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-                crate::event_log::EventLog::load(&path).expect("load event log"),
-            ));
-            app.textarea.insert_str("hello");
-
-            let provider: std::sync::Arc<dyn crate::llm::LlmProvider + Send + Sync> =
-                std::sync::Arc::new(crate::llm::test_provider::TestProvider::new());
-
-            app.submit(&provider);
-
-            let combined = app.display_messages_combined();
-            let matching = combined
-                .iter()
-                .filter(|m| m.role == Role::User && m.content == "hello")
-                .count();
-            assert_eq!(matching, 1, "user message should appear once in display");
-
-            if let Some(handle) = app.runtime.agent_task.take() {
-                handle.abort();
-            }
-        });
-    }
-
-    #[test]
-    fn turn_end_rebuild_replaces_transient_output_without_duplication() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("session.jsonl");
-
-        let mut app = make_app();
-        app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-            crate::event_log::EventLog::load(&path).expect("load event log"),
-        ));
-
-        app.append_event_immediate(crate::session_event::SessionEvent::UserMessage {
-            content: "hello".to_string(),
-            timestamp: 1,
-        });
-
-        app.apply_agent_event(crate::agent::types::AgentEvent::TextToken {
-            text: "hi".to_string(),
-            phase: crate::llm::AssistantPhase::Final,
-        });
-        app.apply_agent_event(crate::agent::types::AgentEvent::ToolCallStart {
-            id: "call_1".to_string(),
-            name: "read_file".to_string(),
-            args: serde_json::json!({"path": "src/main.rs"}),
-        });
-        app.apply_agent_event(crate::agent::types::AgentEvent::ToolCallEnd {
-            id: "call_1".to_string(),
-            result: crate::agent::types::ToolResult::ok_str("ok"),
-        });
-        app.apply_agent_event(crate::agent::types::AgentEvent::TurnEnd);
-
-        let combined = app.display_messages_combined();
-        let assistant_matching = combined
-            .iter()
-            .filter(|m| m.role == Role::Assistant && m.content == "hi")
-            .count();
-        assert_eq!(assistant_matching, 1, "assistant output should appear once");
-
-        let tool_call_matching = combined
-            .iter()
-            .filter(|m| m.role == Role::ToolCall && m.tool_call_id.as_deref() == Some("call_1"))
-            .count();
-        assert_eq!(tool_call_matching, 1, "tool call should appear once");
-
-        let tool_result_matching = combined
-            .iter()
-            .filter(|m| m.role == Role::ToolResult && m.tool_call_id.as_deref() == Some("call_1"))
-            .count();
-        assert_eq!(tool_result_matching, 1, "tool result should appear once");
-    }
-
-    #[test]
-    fn done_does_not_duplicate_assistant_turn_after_turn_end() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("session.jsonl");
-
-        let mut app = make_app();
-        app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-            crate::event_log::EventLog::load(&path).expect("load event log"),
-        ));
-
-        // Seed a user message (normally appended on submit).
-        app.append_event_immediate(crate::session_event::SessionEvent::UserMessage {
-            content: "hello".to_string(),
-            timestamp: 1,
-        });
-
-        // Simulate a simple assistant turn with no tools.
-        app.apply_agent_event(crate::agent::types::AgentEvent::TextToken {
-            text: "hi".to_string(),
-            phase: crate::llm::AssistantPhase::Final,
-        });
-        app.apply_agent_event(crate::agent::types::AgentEvent::TurnEnd);
-        app.apply_agent_event(crate::agent::types::AgentEvent::Done);
-
-        let log_events = app
-            .session
-            .session_state
-            .as_ref()
-            .expect("session state")
-            .events()
-            .to_vec();
-        let assistant_count = log_events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    crate::session_event::SessionEvent::AssistantMessage { .. }
-                )
-            })
-            .count();
-        assert_eq!(assistant_count, 1, "assistant turn should be written once");
-    }
-
-    // ── Step 6: resume/export/integration paths ─────────────────────────────
-
-    #[test]
-    fn submit_initialises_session_state_even_without_session_store() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let mut app = make_app();
-            app.session.session_store = None; // persistence unavailable
-            app.textarea.insert_str("hello");
-
-            let provider: std::sync::Arc<dyn crate::llm::LlmProvider + Send + Sync> =
-                std::sync::Arc::new(crate::llm::test_provider::TestProvider::new());
-
-            app.submit(&provider);
-
-            assert!(
-                app.session.session_state.is_some(),
-                "submit should always initialise session_state before launching a turn"
-            );
-
-            if let Some(handle) = app.runtime.agent_task.take() {
-                handle.abort();
-            }
-        });
-    }
-
-    #[test]
-    fn resume_clears_live_turn_overlay_and_notices() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cwd = tmp.path().to_string_lossy().to_string();
-        let mut store = crate::session::SessionStore::open_at(tmp.path().join("sessions"))
-            .expect("open session store");
-        let session_id = store.create_session(&cwd).expect("create session");
-        let mut log = store.load_events(&session_id).expect("load events");
-        log.append_batch(&[crate::session_event::SessionEvent::UserMessage {
-            content: "hello".to_string(),
-            timestamp: 1,
-        }])
-        .expect("append event");
-
-        let mut app = make_app();
-        app.session.session_store = Some(store);
-        app.session.live_turn.assistant_content = "streaming".to_string();
-        app.session
-            .live_turn
-            .notices
-            .push(Message::assistant("[notice]"));
-
-        app.resume_session_by_id(&session_id);
-
-        assert!(app.session.live_turn.assistant_content.is_empty());
-        assert!(app.session.live_turn.tool_entries.is_empty());
-        assert!(app.session.live_turn.notices.is_empty());
-        let combined = app.display_messages_combined();
-        assert_eq!(combined.len(), 1);
-        assert_eq!(combined[0].content, "hello");
-    }
-
-    #[test]
-    fn export_uses_committed_state_not_live_overlay() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("session.jsonl");
-        let export_path = tmp.path().join("export.html");
-
-        let mut app = make_app();
-        app.session.current_cwd = tmp.path().to_string_lossy().to_string();
-        app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-            crate::event_log::EventLog::load(&path).expect("load event log"),
-        ));
-        app.append_event_immediate(crate::session_event::SessionEvent::UserMessage {
-            content: "committed".to_string(),
-            timestamp: 1,
-        });
-        app.session.live_turn.assistant_content = "live assistant".to_string();
-        app.session
-            .live_turn
-            .notices
-            .push(Message::assistant("[notice]"));
-
-        app.export_session_html(Some(export_path.to_str().expect("utf8 path")));
-
-        let html = std::fs::read_to_string(&export_path).expect("read export html");
-        assert!(html.contains("committed"));
-        assert!(!html.contains("live assistant"));
-        assert!(!html.contains("[notice]"));
-    }
-
-    #[test]
-    fn submit_injects_attachment_events_after_user_message() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        rt.block_on(async {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let path = tmp.path().join("note.txt");
-            std::fs::write(&path, "attached contents\n").expect("write attachment");
-
-            let mut app = make_app();
-            app.session.current_cwd = tmp.path().to_string_lossy().to_string();
-            app.textarea.insert_str("please inspect @note.txt");
-
-            let provider: std::sync::Arc<dyn crate::llm::LlmProvider + Send + Sync> =
-                std::sync::Arc::new(crate::llm::test_provider::TestProvider::new());
-
-            app.submit(&provider);
-
-            let events = app
-                .session
-                .session_state
-                .as_ref()
-                .expect("session state")
-                .events();
-            let user_idx = events
-                .iter()
-                .position(|event| {
-                    matches!(
-                        event,
-                        crate::session_event::SessionEvent::UserMessage { content, .. }
-                            if content == "please inspect `note.txt`"
-                    )
-                })
-                .expect("submitted user message present");
-            assert!(matches!(
-                events.get(user_idx + 1),
-                Some(crate::session_event::SessionEvent::ToolCall { id, name, .. })
-                    if id == "attach_0" && name == "read_file"
-            ));
-            assert!(matches!(
-                events.get(user_idx + 2),
-                Some(crate::session_event::SessionEvent::ToolResult { id, content, is_error, .. })
-                    if id == "attach_0" && content == "attached contents\n" && !is_error
-            ));
-
-            if let Some(handle) = app.runtime.agent_task.take() {
-                handle.abort();
-            }
-        });
-    }
-
-    #[test]
-    fn provider_error_clears_live_turn_and_commits_turn_error_event() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("session.jsonl");
-        let mut app = make_app();
-        app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-            crate::event_log::EventLog::load(&path).expect("load event log"),
-        ));
-        app.agent_turn.start();
-        app.session.live_turn.assistant_content = "partial".to_string();
-        app.session
-            .pending_turn_events
-            .push(crate::session_event::SessionEvent::ToolCall {
-                id: "c1".to_string(),
-                name: "read_file".to_string(),
-                args: serde_json::json!({"path": "src/main.rs"}),
-                include_in_llm: true,
-                timestamp: 1,
-            });
-
-        app.apply_agent_event(crate::agent::types::AgentEvent::Error(ProviderError {
-            message: "boom".to_string(),
-            kind: crate::llm::ProviderErrorKind::Other,
-            status_code: None,
-            source: "test".to_string(),
-        }));
-
-        assert!(app.session.live_turn.assistant_content.is_empty());
-        assert!(app.session.pending_turn_events.is_empty());
-        assert!(
-            app.session.live_turn.notices.is_empty(),
-            "provider errors should not accumulate as persistent live notices"
-        );
-
-        let events = app
-            .session
-            .session_state
-            .as_ref()
-            .expect("session state")
-            .events();
-        let turn_errors: Vec<_> = events
-            .iter()
-            .filter(|e| matches!(e, crate::session_event::SessionEvent::TurnError { .. }))
-            .collect();
-        assert_eq!(
-            turn_errors.len(),
-            1,
-            "TurnError should be committed exactly once"
-        );
-    }
-
-    #[test]
-    fn empty_status_update_keeps_throbber_visible_while_waiting() {
-        let mut app = make_app();
-        app.agent_turn.start();
-
-        assert!(app.throbber_visible());
-
-        app.apply_agent_event(crate::agent::types::AgentEvent::StatusUpdate(String::new()));
-
-        assert!(app.throbber_visible());
-    }
-
-    #[test]
-    fn non_empty_status_update_temporarily_hides_throbber() {
-        let mut app = make_app();
-        app.agent_turn.start();
-
-        assert!(app.throbber_visible());
-
-        app.apply_agent_event(crate::agent::types::AgentEvent::StatusUpdate(
-            "retrying in 1s…".to_string(),
-        ));
-
-        assert!(!app.throbber_visible());
-    }
-
-    #[test]
-    fn whitespace_text_token_keeps_throbber_visible_while_waiting() {
-        let mut app = make_app();
-        app.agent_turn.start();
-
-        app.apply_agent_event(crate::agent::types::AgentEvent::TextToken {
-            text: "   \n".to_string(),
-            phase: crate::llm::AssistantPhase::Unknown,
-        });
-
-        assert!(app.throbber_visible());
-    }
-
-    #[test]
-    fn whitespace_thinking_token_keeps_throbber_visible_while_waiting() {
-        let mut app = make_app();
-        app.agent_turn.start();
-
-        app.apply_agent_event(crate::agent::types::AgentEvent::ThinkingToken(
-            "\n\n".to_string(),
-        ));
-
-        assert!(app.throbber_visible());
-    }
-
-    #[test]
-    fn provider_status_visibility_follows_status_messages() {
-        let mut app = make_app();
-        assert!(!app.provider_status_visible());
-
-        app.agent_turn
-            .set_status(Some(StreamingStatus::Message("compacting…".to_string())));
-        assert!(app.provider_status_visible());
-
-        app.agent_turn.set_status(None);
-        assert!(!app.provider_status_visible());
-    }
-
-    #[test]
-    fn notices_survive_turn_boundary_but_are_not_committed_or_sent_to_llm() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("session.jsonl");
-        let mut app = make_app();
-        app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-            crate::event_log::EventLog::load(&path).expect("load event log"),
-        ));
-
-        app.session
-            .live_turn
-            .notices
-            .push(Message::assistant("[notice]"));
-        app.session.live_turn.assistant_content = "hi".to_string();
-        app.apply_agent_event(crate::agent::types::AgentEvent::TurnEnd);
-
-        assert_eq!(
-            app.session.live_turn.notices.len(),
-            1,
-            "notice should survive turn boundary"
-        );
-        assert_eq!(app.session.live_turn.notices[0].content, "[notice]");
-        assert!(
-            app.session.live_turn.assistant_content.is_empty(),
-            "turn content should clear"
-        );
-
-        let events = app
-            .session
-            .session_state
-            .as_ref()
-            .expect("session state")
-            .events();
-        assert!(
-            !events.iter().any(|e| matches!(
-                e,
-                crate::session_event::SessionEvent::AssistantMessage { content, .. } if content == "[notice]"
-            )),
-            "notice must not be committed as a session event"
-        );
-
-        let llm = app
-            .session
-            .session_state
-            .as_mut()
-            .expect("session state")
-            .llm_messages()
-            .to_vec();
-        assert!(
-            !llm.iter().any(|m| m.content == "[notice]"),
-            "notice must not appear in LLM input"
-        );
-    }
-
-    #[tokio::test]
-    async fn shell_output_is_ui_only_and_excluded_from_event_log_and_llm() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("session.jsonl");
-        let mut app = make_app();
-        app.session.current_cwd = tmp.path().to_string_lossy().to_string();
-        app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-            crate::event_log::EventLog::load(&path).expect("load event log"),
-        ));
-        app.shell.textarea.insert_str("printf 'hello'");
-
-        app.submit_shell_command();
-
-        // Async: wait for the ShellComplete event from the spawned task.
-        // Don't dispatch through apply_app_event in the loop because
-        // drain_app_events (called by Agent handling) would greedily
-        // consume ShellComplete before this loop can observe it.
-        let complete_ev = loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                app.runtime.recv_app_event(),
-            )
-            .await
-            {
-                Ok(Some(ev @ AppEvent::ShellComplete { .. })) => break ev,
-                Ok(Some(_)) => continue,
-                Ok(None) => panic!("shell channel closed unexpectedly"),
-                Err(_) => panic!("shell command timed out after 5s"),
-            }
-        };
-
-        // Dispatch the ShellComplete and any remaining buffered events.
-        app.apply_app_event(complete_ev);
-
-        // After completion, the live entry should be removed and events
-        // persisted in the session state.
-        assert!(
-            app.session.live_turn.tool_entries.is_empty(),
-            "shell live entry should be removed after completion"
-        );
-
-        // Shell events should be persisted in the event log with include_in_llm=false.
-        let events = app
-            .session
-            .session_state
-            .as_ref()
-            .expect("session state")
-            .events();
-        let has_tool_call = events.iter().any(|e| {
-            matches!(e, SessionEvent::ToolCall { name, include_in_llm, .. }
-                if name == "local_shell" && !include_in_llm)
-        });
-        let has_tool_result = events.iter().any(|e| {
-            matches!(e, SessionEvent::ToolResult { name, include_in_llm, .. }
-                if name == "local_shell" && !include_in_llm)
-        });
-        assert!(has_tool_call, "shell tool call must be persisted");
-        assert!(has_tool_result, "shell tool result must be persisted");
-
-        // Shell events must NOT appear in the LLM projection.
-        let llm = app
-            .session
-            .session_state
-            .as_mut()
-            .expect("session state")
-            .llm_messages()
-            .to_vec();
-        assert!(llm.is_empty(), "shell output must not enter LLM history");
-    }
-
-    #[tokio::test]
-    async fn shell_command_persists_in_fresh_session_without_prior_chat() {
-        // In a fresh session with no session_state yet, shell commands should
-        // still persist via ensure_event_log_for_submit.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let mut app = make_app();
-        app.session.current_cwd = tmp.path().to_string_lossy().to_string();
-        // Don't set session_state — simulate fresh session.
-        assert!(
-            app.session.session_state.is_none(),
-            "fresh session should have no session_state"
-        );
-
-        app.shell.textarea.insert_str("printf 'fresh'");
-
-        app.submit_shell_command();
-
-        // Wait for completion.
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                app.runtime.recv_app_event(),
-            )
-            .await
-            {
-                Ok(Some(ev @ AppEvent::ShellComplete { .. })) => {
-                    app.apply_app_event(ev);
-                    break;
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) => panic!("channel closed"),
-                Err(_) => panic!("timed out"),
-            }
-        }
-
-        // Session state should now exist and contain the shell events.
-        let ss = app
-            .session
-            .session_state
-            .as_ref()
-            .expect("session state should exist after shell command");
-        let events = ss.events();
-        assert!(
-            events.iter().any(|e| matches!(e, SessionEvent::ToolCall {
-                name, ..
-            } if name == "local_shell")),
-            "shell tool call must be persisted in fresh session"
-        );
-        assert!(
-            events.iter().any(|e| matches!(e, SessionEvent::ToolResult {
-                name, ..
-            } if name == "local_shell")),
-            "shell tool result must be persisted in fresh session"
-        );
-    }
-
-    #[test]
-    fn finalise_assistant_turn_event_uses_live_turn_state_fields() {
-        let mut app = make_app();
-        app.session.live_turn.assistant_content = "answer".to_string();
-        app.session.live_turn.assistant_thinking = Some("thinking".to_string());
-        app.session.live_turn.assistant_phase = crate::llm::AssistantPhase::Provisional;
-        app.latest_usage = Some(crate::llm::UsageStats {
-            input_tokens: Some(1),
-            output_tokens: Some(2),
-            total_tokens: Some(3),
-            cached_tokens: None,
-        });
-
-        app.finalise_assistant_turn_event();
-
-        let ev = app
-            .session
-            .pending_turn_events
-            .iter()
-            .find_map(|e| match e {
-                crate::session_event::SessionEvent::AssistantMessage {
-                    content,
-                    thinking,
-                    phase,
-                    usage,
-                    ..
-                } => Some((content, thinking, phase, usage)),
-                _ => None,
-            })
-            .expect("assistant event should be present");
-
-        assert_eq!(ev.0, "answer");
-        assert_eq!(ev.1.as_deref(), Some("thinking"));
-        assert_eq!(*ev.2, crate::llm::AssistantPhase::Provisional);
-        assert_eq!(
-            *ev.3,
-            Some(crate::llm::UsageStats {
-                input_tokens: Some(1),
-                output_tokens: Some(2),
-                total_tokens: Some(3),
-                cached_tokens: None,
-            })
-        );
-    }
-
-    #[test]
-    fn live_overlay_does_not_mutate_committed_history() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("session.jsonl");
-        let mut app = make_app();
-        app.session.session_state = Some(crate::session_state::SessionState::from_event_log(
-            crate::event_log::EventLog::load(&path).expect("load event log"),
-        ));
-        app.append_event_immediate(crate::session_event::SessionEvent::UserMessage {
-            content: "committed".to_string(),
-            timestamp: 1,
-        });
-
-        let committed_before = app
-            .session
-            .session_state
-            .as_ref()
-            .expect("session state")
-            .display_messages()
-            .to_vec();
-
-        app.session.live_turn.assistant_content = "live".to_string();
-        app.session
-            .live_turn
-            .notices
-            .push(Message::assistant("[notice]"));
-
-        let committed_after = app
-            .session
-            .session_state
-            .as_ref()
-            .expect("session state")
-            .display_messages()
-            .to_vec();
-        let before_contents: Vec<_> = committed_before.iter().map(|m| m.content.clone()).collect();
-        let after_contents: Vec<_> = committed_after.iter().map(|m| m.content.clone()).collect();
-        assert_eq!(
-            before_contents, after_contents,
-            "live overlay must not mutate committed history"
-        );
-
-        let combined = app.display_messages_combined();
-        assert!(
-            combined.len() > committed_after.len(),
-            "combined view should include live overlay"
-        );
-    }
-
-    // ── Step-back navigation ──────────────────────────────────────────────────
-
-    fn make_app_with_events(events: Vec<crate::session_event::SessionEvent>) -> App {
-        let mut app = make_app();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("session.jsonl");
-        let mut log = crate::event_log::EventLog::load(&path).expect("load");
-        log.append_batch(&events).expect("append");
-        app.session.session_state = Some(crate::session_state::SessionState::from_event_log(log));
-        // Keep tempdir alive inside app so the path is valid for the test duration.
-        // We don't need the store for these unit tests.
-        app
-    }
-
-    fn ts() -> u64 {
-        1_713_000_000
-    }
-
-    fn user_ev(content: &str) -> crate::session_event::SessionEvent {
-        crate::session_event::SessionEvent::UserMessage {
-            content: content.to_string(),
-            timestamp: ts(),
-        }
-    }
-
-    fn assistant_ev(content: &str) -> crate::session_event::SessionEvent {
-        crate::session_event::SessionEvent::AssistantMessage {
-            content: content.to_string(),
-            thinking: None,
-            phase: crate::llm::AssistantPhase::Final,
-            usage: None,
-            timestamp: ts(),
-        }
-    }
-
-    fn ask_user_result_ev(id: &str, answer: &str) -> crate::session_event::SessionEvent {
-        crate::session_event::SessionEvent::ToolResult {
-            id: id.to_string(),
-            name: "ask_user".to_string(),
-            content: answer.to_string(),
-            is_error: false,
-            display_range: None,
-            include_in_llm: true,
-            timestamp: ts(),
-        }
-    }
-
-    fn ask_user_call_ev(question: &str) -> crate::session_event::SessionEvent {
-        crate::session_event::SessionEvent::ToolCall {
-            id: "ask_1".to_string(),
-            name: "ask_user".to_string(),
-            args: serde_json::json!({"question": question}),
-            include_in_llm: true,
-            timestamp: ts(),
-        }
-    }
-
-    fn ask_user_call_with_options_ev(
-        question: &str,
-        options: &[&str],
-    ) -> crate::session_event::SessionEvent {
-        let opts: Vec<serde_json::Value> = options
-            .iter()
-            .map(|o| serde_json::Value::String(o.to_string()))
-            .collect();
-        crate::session_event::SessionEvent::ToolCall {
-            id: "ask_2".to_string(),
-            name: "ask_user".to_string(),
-            args: serde_json::json!({
-                "question": question,
-                "options": opts,
-                "allowFreeform": true,
-            }),
-            include_in_llm: true,
-            timestamp: ts(),
-        }
-    }
-
-    fn other_tool_result_ev() -> crate::session_event::SessionEvent {
-        crate::session_event::SessionEvent::ToolResult {
-            id: "t1".to_string(),
-            name: "bash".to_string(),
-            content: "output".to_string(),
-            is_error: false,
-            display_range: None,
-            include_in_llm: true,
-            timestamp: ts(),
-        }
-    }
-
-    #[test]
-    fn step_boundaries_empty() {
-        let app = make_app();
-        assert!(app.step_boundaries().is_empty());
-    }
-
-    #[test]
-    fn step_boundaries_user_messages() {
-        let app = make_app_with_events(vec![
-            user_ev("first"),
-            assistant_ev("reply1"),
-            user_ev("second"),
-            assistant_ev("reply2"),
-        ]);
-        assert_eq!(app.step_boundaries(), vec![0, 2]);
-    }
-
-    #[test]
-    fn step_boundaries_includes_ask_user_results() {
-        let app = make_app_with_events(vec![
-            user_ev("do it"),
-            assistant_ev(""),
-            other_tool_result_ev(), // non-ask_user tool result should be ignored
-            ask_user_call_ev("which?"),
-            ask_user_result_ev("ask_1", "my answer"),
-            assistant_ev("done"),
-            user_ev("next"),
-        ]);
-        // Boundaries: UserMessage at 0, ask_user ToolResult at 4, UserMessage at 6
-        // The other_tool_result at 2 should NOT be a boundary.
-        assert_eq!(app.step_boundaries(), vec![0, 4, 6]);
-    }
-
-    #[test]
-    fn step_back_restores_ask_user_ui_with_options() {
-        let mut app = make_app_with_events(vec![
-            user_ev("do it"),
-            assistant_ev(""),
-            ask_user_call_with_options_ev("which?", &["Option A", "Option B"]),
-            ask_user_result_ev("ask_2", "my answer"),
-            assistant_ev("done"),
-            user_ev("next"),
-        ]);
-        app.textarea = ratatui_textarea::TextArea::new(vec!["current input".to_string()]);
-
-        // Step back to the last boundary (last UserMessage at index 5), then
-        // again to the ask_user ToolResult at index 3.
-        app.step_back();
-        assert_eq!(app.step_back.cursor, Some(5));
-        app.step_back();
-        assert_eq!(app.step_back.cursor, Some(3));
-        assert!(app.selection.active);
-        assert!(app.has_pending_ask());
-        assert!(
-            app.ask_user.reply.is_none(),
-            "no reply channel in step mode"
-        );
-    }
-
-    #[test]
-    fn step_back_restores_ask_user_freeform_when_no_options() {
-        let mut app = make_app_with_events(vec![
-            user_ev("do it"),
-            assistant_ev(""),
-            ask_user_call_ev("what do you think?"),
-            ask_user_result_ev("ask_1", "my answer"),
-            assistant_ev("done"),
-            user_ev("next"),
-        ]);
-        app.textarea = ratatui_textarea::TextArea::new(vec!["current input".to_string()]);
-
-        // Step back past the last UserMessage to the ask_user ToolResult.
-        app.step_back();
-        assert_eq!(app.step_back.cursor, Some(5));
-        app.step_back();
-        assert_eq!(app.step_back.cursor, Some(3));
-        // No options → freeform-only mode; selection is inactive.
-        assert!(!app.selection.active);
-        assert!(app.has_pending_ask());
-        assert!(app.ask_user_freeform_mode());
-        assert!(
-            app.ask_user.reply.is_none(),
-            "no reply channel in step mode"
-        );
-    }
-
-    #[test]
-    fn step_back_saves_input_and_repopulates() {
-        let mut app = make_app_with_events(vec![
-            user_ev("first"),
-            assistant_ev("reply1"),
-            user_ev("second"),
-            assistant_ev("reply2"),
-        ]);
-        app.textarea = ratatui_textarea::TextArea::new(vec!["current input".to_string()]);
-
-        app.step_back();
-
-        assert_eq!(app.step_back.saved_input.as_deref(), Some("current input"));
-        assert_eq!(app.step_back.cursor, Some(2));
-        assert_eq!(app.textarea.lines().join(""), "second");
-    }
-
-    #[test]
-    fn step_back_twice_reaches_first_boundary() {
-        let mut app = make_app_with_events(vec![
-            user_ev("first"),
-            assistant_ev("reply1"),
-            user_ev("second"),
-            assistant_ev("reply2"),
-        ]);
-        app.step_back();
-        app.step_back();
-
-        assert_eq!(app.step_back.cursor, Some(0));
-        assert_eq!(app.textarea.lines().join(""), "first");
-    }
-
-    #[test]
-    fn step_back_noop_at_earliest_boundary() {
-        let mut app = make_app_with_events(vec![user_ev("first"), assistant_ev("reply1")]);
-        app.step_back();
-        app.step_back(); // Should not go further
-
-        assert_eq!(app.step_back.cursor, Some(0));
-    }
-
-    #[test]
-    fn step_forward_restores_and_clears_at_end() {
-        let mut app = make_app_with_events(vec![
-            user_ev("first"),
-            assistant_ev("reply1"),
-            user_ev("second"),
-            assistant_ev("reply2"),
-        ]);
-        app.textarea = ratatui_textarea::TextArea::new(vec!["current input".to_string()]);
-
-        app.step_back(); // cursor -> 2
-        app.step_back(); // cursor -> 0
-        app.step_forward(); // cursor -> 2
-        assert_eq!(app.step_back.cursor, Some(2));
-        assert_eq!(app.textarea.lines().join(""), "second");
-
-        app.step_forward(); // past end -> clear
-        assert!(app.step_back.cursor.is_none());
-        assert!(app.step_back.saved_input.is_none());
-        assert_eq!(app.textarea.lines().join(""), "current input");
-    }
-
-    #[test]
-    fn cancel_stepping_restores_input() {
-        let mut app = make_app_with_events(vec![user_ev("first"), assistant_ev("reply1")]);
-        app.textarea = ratatui_textarea::TextArea::new(vec!["my draft".to_string()]);
-
-        app.step_back();
-        assert_eq!(app.step_back.cursor, Some(0));
-
-        app.cancel_stepping();
-        assert!(app.step_back.cursor.is_none());
-        assert_eq!(app.textarea.lines().join(""), "my draft");
-    }
-
-    #[tokio::test]
-    async fn step_back_noop_when_runtime_running() {
-        let mut app = make_app_with_events(vec![user_ev("first")]);
-        install_test_agent_task(&mut app);
-
-        app.step_back();
-        assert!(app.step_back.cursor.is_none());
-    }
-
-    // ── commit_step_branch ask_user preservation ───────────────────────────
-
-    #[test]
-    fn commit_step_branch_preserves_ask_user_turn() {
-        // When stepping back to an ask_user ToolResult and committing a
-        // branch, the ask_user ToolCall (the question) must be preserved.
-        // The old ToolResult is excluded; the caller (finish_pending_ask)
-        // appends the replacement ToolResult.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let sessions_dir = tmp.path().join("sessions");
-        let store = crate::session::SessionStore::open_at(sessions_dir).expect("open store");
-
-        let mut app = make_app_with_events(vec![
-            user_ev("start"),
-            assistant_ev("thinking…"),
-            // Completed tool call from the same turn (not ask_user).
-            crate::session_event::SessionEvent::ToolCall {
-                id: "bash1".to_string(),
-                name: "bash".to_string(),
-                args: serde_json::json!({"command": "ls"}),
-                include_in_llm: true,
-                timestamp: ts(),
-            },
-            crate::session_event::SessionEvent::ToolResult {
-                id: "bash1".to_string(),
-                name: "bash".to_string(),
-                content: "output".to_string(),
-                is_error: false,
-                display_range: None,
-                include_in_llm: true,
-                timestamp: ts(),
-            },
-            // The ask_user turn:
-            assistant_ev("which option?"),
-            ask_user_call_ev("pick one"),
-            ask_user_result_ev("ask_1", "old answer"),
-            // More events after (should not be in branch):
-            assistant_ev("thanks"),
-            user_ev("next"),
-        ]);
-        app.session.session_store = Some(store);
-        app.session.current_cwd = tmp.path().to_string_lossy().to_string();
-
-        // Step back to the ask_user ToolResult boundary (index 6).
-        // Boundaries: UserMsg(0), ask_user ToolResult(6), UserMsg(8)
-        app.step_back(); // -> last UserMessage (8)
-        app.step_back(); // -> ask_user ToolResult (6)
-        assert_eq!(app.step_back.cursor, Some(6));
-
-        // Set a new answer and commit the branch.
-        app.textarea = ratatui_textarea::TextArea::new(vec!["new answer".to_string()]);
-        let committed = app.commit_step_branch();
-        assert!(committed.is_some());
-
-        let ss = app.session.session_state.as_ref().unwrap();
-        // Events: user(0), asst(1), bash_call(2), bash_result(3),
-        //         asst("which option?")(4), ask_user_call(5) = 6 events.
-        // The ask_user turn is preserved; old ToolResult and everything after excluded.
-        assert_eq!(ss.events().len(), 6);
-
-        // Verify the ask_user ToolCall is present (unpaired — waiting for caller
-        // to append the replacement ToolResult).
-        let has_ask_call = ss.events().iter().any(|e| {
-            matches!(e, crate::session_event::SessionEvent::ToolCall { id, name, .. }
-                if id == "ask_1" && name == "ask_user")
-        });
-        assert!(has_ask_call, "ask_user ToolCall must be preserved");
-
-        // The old ask_user ToolResult must not be present.
-        let has_old_result = ss.events().iter().any(|e| {
-            matches!(e, crate::session_event::SessionEvent::ToolResult { id, name, content, .. }
-                if id == "ask_1" && name == "ask_user" && content == "old answer")
-        });
-        assert!(!has_old_result, "old ask_user ToolResult must be excluded");
-
-        // The paired bash ToolCall still has its result.
-        let has_bash_result = ss.events().iter().any(|e| {
-            matches!(e, crate::session_event::SessionEvent::ToolResult { id, name, .. }
-                if id == "bash1" && name == "bash")
-        });
-        assert!(has_bash_result, "bash ToolResult must be preserved");
     }
 }

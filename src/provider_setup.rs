@@ -57,10 +57,9 @@ pub(crate) fn resolve_default_provider_instance(config: &XiConfig) -> ProviderIn
         return inst.clone();
     }
 
-    effective
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| ProviderInstance::new("openai", BackendPreset::OpenAi))
+    effective.into_iter().next().unwrap_or_else(|| {
+        ProviderInstance::new("openai-compatible", BackendPreset::OpenAiCompatible)
+    })
 }
 
 pub(crate) fn resolve_provider_instance(

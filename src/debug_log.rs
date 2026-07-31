@@ -59,31 +59,6 @@ fn write_entry(value: &serde_json::Value) {
     }
 }
 
-/// Write a fully structured JSONL record directly to the debug log,
-/// bypassing the `log` crate's string-message path.
-///
-/// `fields` should be a JSON object.  `timestamp`, `level`, and `target`
-/// are injected automatically when not already present.  This is used
-/// for LLM request/response payloads so they appear as native JSON
-/// rather than as strings embedded inside a `"message"` field.
-pub fn log_structured(level: log::Level, target: &str, mut fields: serde_json::Value) {
-    if !is_enabled() {
-        return;
-    }
-    if let Some(obj) = fields.as_object_mut() {
-        obj.entry("timestamp").or_insert_with(|| {
-            serde_json::Value::String(
-                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            )
-        });
-        obj.entry("level")
-            .or_insert_with(|| serde_json::Value::String(level.as_str().to_owned()));
-        obj.entry("target")
-            .or_insert_with(|| serde_json::Value::String(target.to_owned()));
-    }
-    write_entry(&fields);
-}
-
 pub fn init_logging() {
     if !is_enabled() {
         return;
