@@ -74,6 +74,7 @@ pub(crate) enum SelectionKind {
     Model,
     Thinking,
     Provider,
+    ProviderApiType,
     ResumeSession,
     AskUser,
     ConfirmProviderRemoval,

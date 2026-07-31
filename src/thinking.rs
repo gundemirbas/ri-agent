@@ -43,11 +43,38 @@ impl ThinkingLevel {
             Self::XHigh,
         ]
     }
+
+    /// Map onto the OpenAI `reasoning_effort` vocabulary.  `Off` omits the
+    /// parameter entirely so the model's autonomous reasoning (and its live
+    /// reasoning deltas) still stream.
+    pub fn to_reasoning_effort(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ThinkingLevel;
+
+    #[test]
+    fn to_reasoning_effort_matches_openai_vocabulary() {
+        assert_eq!(ThinkingLevel::Off.to_reasoning_effort(), None);
+        assert_eq!(
+            ThinkingLevel::Minimal.to_reasoning_effort(),
+            Some("minimal")
+        );
+        assert_eq!(ThinkingLevel::Low.to_reasoning_effort(), Some("low"));
+        assert_eq!(ThinkingLevel::Medium.to_reasoning_effort(), Some("medium"));
+        assert_eq!(ThinkingLevel::High.to_reasoning_effort(), Some("high"));
+        assert_eq!(ThinkingLevel::XHigh.to_reasoning_effort(), Some("xhigh"));
+    }
 
     #[test]
     fn parse_round_trip_known_levels() {

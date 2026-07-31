@@ -2,7 +2,11 @@ use std::sync::Arc;
 
 use crate::{
     config::XiConfig,
-    llm::{LlmProvider, rig_provider::RigOpenAiProvider, test_provider::TestProvider},
+    llm::{
+        LlmProvider,
+        rig_provider::{RigOpenAiApi, RigOpenAiProvider},
+        test_provider::TestProvider,
+    },
     provider_instance::{ApiType, BackendPreset, ProviderInstance},
     thinking::ThinkingLevel,
 };
@@ -17,16 +21,9 @@ pub enum ThinkingSupport {
 /// Return the thinking support level for a named provider instance.
 pub fn thinking_support_for_instance(instance: &ProviderInstance, _model: &str) -> ThinkingSupport {
     match instance.api_type {
-        ApiType::OpenAiCompatible => {
-            // Generic OpenAI-compatible endpoints (e.g. DeepSeek) may or may not
-            // support `reasoning_effort`.  Many don't — they still produce
-            // `reasoning_content` in responses autonomously, but sending the
-            // parameter triggers a 400 error.  Mark thinking as unsupported so
-            // the parameter is not sent; the model's autonomous reasoning
-            // tokens are still streamed live via rig's reasoning deltas.
-            ThinkingSupport::Ignored(
-                "generic openai-compatible: reasoning_effort not reliably supported",
-            )
+        ApiType::OpenAiResponses | ApiType::OpenAiCompatible => {
+            // Both OpenAI wire protocols accept a reasoning-effort control.
+            ThinkingSupport::Applied
         }
         ApiType::Test => ThinkingSupport::Ignored("test provider does not support thinking"),
     }
@@ -35,7 +32,7 @@ pub fn thinking_support_for_instance(instance: &ProviderInstance, _model: &str) 
 /// Build a provider for a named [`ProviderInstance`].
 pub fn build_provider_for_instance(
     instance: &ProviderInstance,
-    _thinking: ThinkingLevel,
+    thinking: ThinkingLevel,
     _config: &XiConfig,
 ) -> anyhow::Result<Arc<dyn LlmProvider + Send + Sync>> {
     let model = instance.effective_model();
@@ -44,7 +41,7 @@ pub fn build_provider_for_instance(
         BackendPreset::OpenAiCompatible => {
             let base_url = instance.base_url.clone().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "No base URL for OpenAI-compatible provider '{}'. Configure it first.",
+                    "No base URL for OpenAI provider '{}'. Configure it first.",
                     instance.id
                 )
             })?;
@@ -54,12 +51,15 @@ pub fn build_provider_for_instance(
                     instance.id
                 )
             })?;
-            let p = RigOpenAiProvider::new(base_url, model, api_key).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to build OpenAI-compatible provider '{}': {e}",
-                    instance.id
-                )
-            })?;
+            let api_type = match instance.api_type {
+                ApiType::OpenAiResponses => RigOpenAiApi::Responses,
+                ApiType::OpenAiCompatible | ApiType::Test => RigOpenAiApi::Completions,
+            };
+            let p = RigOpenAiProvider::new(api_type, base_url, model, api_key)
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to build OpenAI provider '{}': {e}", instance.id)
+                })?
+                .with_reasoning_effort(thinking.to_reasoning_effort());
             Ok(Arc::new(p))
         }
         BackendPreset::Test => Ok(Arc::new(TestProvider::new())),
@@ -67,4 +67,24 @@ pub fn build_provider_for_instance(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    fn compat(api_type: ApiType) -> ProviderInstance {
+        let mut i = ProviderInstance::new("test", BackendPreset::OpenAiCompatible);
+        i.api_type = api_type;
+        i
+    }
+
+    #[test]
+    fn openai_protocols_support_thinking() {
+        assert_eq!(
+            thinking_support_for_instance(&compat(ApiType::OpenAiResponses), "gpt-5"),
+            ThinkingSupport::Applied
+        );
+        assert_eq!(
+            thinking_support_for_instance(&compat(ApiType::OpenAiCompatible), "gpt-4o"),
+            ThinkingSupport::Applied
+        );
+    }
+}

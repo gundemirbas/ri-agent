@@ -449,6 +449,14 @@ fn handle_selection_enter(app: &mut App) -> KeyDispatch {
             KeyDispatch::Continue
         }
         Some(SelectionResult::Provider(p)) => KeyDispatch::Return(RunResult::ChangeProvider(p)),
+        Some(SelectionResult::ProviderAdd) => {
+            app.start_provider_add_flow();
+            KeyDispatch::Continue
+        }
+        Some(SelectionResult::ProviderApiType(api_type)) => {
+            app.apply_pending_provider_api_type(api_type);
+            KeyDispatch::Continue
+        }
         Some(SelectionResult::CancelProviderRemoval) => {
             app.clear_pending_provider_removal();
             KeyDispatch::Continue

@@ -2,15 +2,31 @@
 
 /// API protocol/transport types that ri-agent knows how to speak.
 ///
-/// After the migration to `rig` only the OpenAI-compatible protocol remains
-/// (plus the internal, never-shown test provider).
+/// OpenAI's two wire protocols are supported via `rig`: the newer **Responses**
+/// API (`/v1/responses`) and the older Chat Completions / "OpenAI-compatible"
+/// protocol (`/v1/chat/completions`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApiType {
+    /// OpenAI Responses API (`/v1/responses`).
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
+    /// Chat Completions protocol (`/v1/chat/completions`) — works with any
+    /// OpenAI-compatible endpoint (DeepSeek, vLLM, local inference servers, …).
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
     /// Internal only — used by the test provider. Never shown to users.
     Test,
+}
+
+impl ApiType {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OpenAiResponses => "OpenAI Responses",
+            Self::OpenAiCompatible => "OpenAI-compatible",
+            Self::Test => "Test",
+        }
+    }
 }
 
 /// Recognisable software / cloud services ri-agent supports.
@@ -86,6 +102,11 @@ pub struct BackendPresetDef {
     pub label: &'static str,
     /// Which class of backend this preset belongs to.
     pub backend_class: BackendClass,
+    /// Whether the user is asked to choose an API type when adding this preset
+    /// (i.e. the preset supports more than one selectable protocol).
+    pub user_selects_api: bool,
+    /// API types the user may pick from for this preset, in picker order.
+    pub allowed_apis: &'static [ApiType],
     /// The recommended / default API type.
     pub default_api: ApiType,
     /// Whether the endpoint is predetermined or user-supplied.
@@ -103,6 +124,8 @@ pub const BACKEND_PRESET_CATALOG: &[BackendPresetDef] = &[
         id: "openai-compatible",
         label: "OpenAI-compatible endpoint",
         backend_class: BackendClass::UserSuppliedService,
+        user_selects_api: true,
+        allowed_apis: &[ApiType::OpenAiResponses, ApiType::OpenAiCompatible],
         default_api: ApiType::OpenAiCompatible,
         endpoint_behavior: EndpointBehavior::UserSupplied,
         auth_mode: AuthMode::ApiKey,
@@ -115,6 +138,8 @@ pub const BACKEND_PRESET_CATALOG: &[BackendPresetDef] = &[
         id: "test",
         label: "Test (UI exercise)",
         backend_class: BackendClass::Internal,
+        user_selects_api: false,
+        allowed_apis: &[ApiType::Test],
         default_api: ApiType::Test,
         endpoint_behavior: EndpointBehavior::Internal,
         auth_mode: AuthMode::None,
@@ -227,6 +252,23 @@ mod tests {
         for st in &types {
             // Each preset has exactly one usable API type (its default).
             let _ = st.def().default_api;
+        }
+    }
+
+    #[test]
+    fn api_type_round_trips_through_serde() {
+        for (serialized, api) in [
+            ("openai-responses", ApiType::OpenAiResponses),
+            ("openai-compatible", ApiType::OpenAiCompatible),
+            ("test", ApiType::Test),
+        ] {
+            let roundtripped: ApiType = serde_json::from_str(&format!("\"{serialized}\"")).unwrap();
+            assert_eq!(roundtripped, api, "parse {serialized}");
+            assert_eq!(
+                serde_json::to_string(&api).unwrap(),
+                format!("\"{serialized}\""),
+                "serialize {api:?}"
+            );
         }
     }
 

@@ -16,9 +16,10 @@ use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
     ToolDefinition as RigToolDefinition,
 };
+use rig_core::http_client::HeaderMap;
 use rig_core::message as rig_message;
 use rig_core::message::Message as RigMessage;
-use rig_core::providers::openai::CompletionsClient;
+use rig_core::providers::openai::{Client as ResponsesClient, CompletionsClient};
 use rig_core::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 
 use super::{
@@ -27,57 +28,123 @@ use super::{
 };
 use crate::llm::{ProviderError, ProviderErrorKind};
 
-/// OpenAI-compatible provider built on rig.
+/// Which OpenAI wire protocol this provider uses.
+pub enum RigOpenAiApi {
+    /// OpenAI Responses API (`/v1/responses`).
+    Responses,
+    /// Chat Completions / OpenAI-compatible (`/v1/chat/completions`).
+    Completions,
+}
+
+/// The underlying rig OpenAI transport (Responses or Chat Completions).
+#[derive(Clone)]
+enum RigClient {
+    Responses(ResponsesClient),
+    Completions(CompletionsClient),
+}
+
+/// OpenAI provider built on rig, supporting both the Responses API and the
+/// Chat Completions ("OpenAI-compatible") protocol.
 pub struct RigOpenAiProvider {
-    client: CompletionsClient,
+    client: RigClient,
     model: String,
+    reasoning_effort: Option<&'static str>,
 }
 
 impl RigOpenAiProvider {
-    /// Create a provider for an OpenAI-compatible endpoint.
+    /// Create a provider for an OpenAI endpoint using `api_type`.
     ///
     /// `base_url` should include the API version prefix, e.g.
-    /// `http://localhost:8000/v1` (rig appends `/chat/completions`).
+    /// `http://localhost:8000/v1` (rig appends `/chat/completions` or
+    /// `/responses`).
     pub fn new(
+        api_type: RigOpenAiApi,
         base_url: impl Into<String>,
         model: impl Into<String>,
         api_key: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_headers(base_url, model, api_key, vec![])
+        Self::new_with_headers(api_type, base_url, model, api_key, vec![])
     }
 
-    /// Create a provider with extra per-request HTTP headers (e.g. OpenRouter's
-    /// `HTTP-Referer` / `X-Title`).
+    /// Create a provider with extra per-request HTTP headers.
     pub fn new_with_headers(
+        api_type: RigOpenAiApi,
         base_url: impl Into<String>,
         model: impl Into<String>,
         api_key: impl Into<String>,
         headers: Vec<(String, String)>,
     ) -> anyhow::Result<Self> {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        let mut builder = CompletionsClient::builder().api_key(api_key.into());
-        builder = builder.base_url(&base_url);
-        if !headers.is_empty() {
-            let mut map = rig_core::http_client::HeaderMap::new();
-            for (k, v) in headers {
-                let (Ok(k), Ok(v)) = (
-                    http::HeaderName::from_bytes(k.as_bytes()),
-                    http::HeaderValue::from_str(&v),
-                ) else {
-                    continue;
-                };
-                map.insert(k, v);
+        let api_key: String = api_key.into();
+        let header_map = header_map_from_pairs(headers);
+        let client = match api_type {
+            RigOpenAiApi::Responses => {
+                RigClient::Responses(build_responses_client(&base_url, &api_key, header_map)?)
             }
-            builder = builder.http_headers(map);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build OpenAI-compatible client: {e}"))?;
+            RigOpenAiApi::Completions => {
+                RigClient::Completions(build_completions_client(&base_url, &api_key, header_map)?)
+            }
+        };
         Ok(Self {
             client,
             model: model.into(),
+            reasoning_effort: None,
         })
     }
+
+    /// Set the `reasoning_effort` request parameter.  `None` omits it.
+    ///
+    /// For the Responses API this is translated to the `reasoning.effort`
+    /// field; for Chat Completions it is sent as the top-level
+    /// `reasoning_effort` parameter.
+    pub fn with_reasoning_effort(mut self, effort: Option<&'static str>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+}
+
+fn header_map_from_pairs(headers: Vec<(String, String)>) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (k, v) in headers {
+        let (Ok(k), Ok(v)) = (
+            http::HeaderName::from_bytes(k.as_bytes()),
+            http::HeaderValue::from_str(&v),
+        ) else {
+            continue;
+        };
+        map.insert(k, v);
+    }
+    map
+}
+
+fn build_responses_client(
+    base_url: &str,
+    api_key: &str,
+    headers: HeaderMap,
+) -> anyhow::Result<ResponsesClient> {
+    let mut builder = ResponsesClient::builder().api_key(api_key);
+    builder = builder.base_url(base_url);
+    if !headers.is_empty() {
+        builder = builder.http_headers(headers);
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build OpenAI Responses client: {e}"))
+}
+
+fn build_completions_client(
+    base_url: &str,
+    api_key: &str,
+    headers: HeaderMap,
+) -> anyhow::Result<CompletionsClient> {
+    let mut builder = CompletionsClient::builder().api_key(api_key);
+    builder = builder.base_url(base_url);
+    if !headers.is_empty() {
+        builder = builder.http_headers(headers);
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build OpenAI-compatible client: {e}"))
 }
 
 // ── Message conversion ────────────────────────────────────────────────────────
@@ -238,6 +305,60 @@ fn yield_tool_call_delta(
     }
 }
 
+/// Map a single rig stream item onto ri-agent [`LlmEvent`]s, preserving live
+/// text, reasoning, and tool-call argument deltas.
+///
+/// `R` is the provider raw-response type; the only provider-specific part is
+/// its usage, extracted via [`GetTokenUsage`].
+fn map_stream_item<R: GetTokenUsage>(
+    item: StreamedAssistantContent<R>,
+    phase: &mut StreamPhase,
+) -> (Vec<LlmEvent>, Option<UsageStats>) {
+    let mut events = Vec::new();
+    let mut usage = None;
+    match item {
+        StreamedAssistantContent::Text(text) => {
+            let content = text.text;
+            if !content.is_empty() {
+                *phase = StreamPhase::Idle;
+                events.push(LlmEvent::Token {
+                    text: content,
+                    phase: AssistantPhase::Unknown,
+                });
+            }
+        }
+        StreamedAssistantContent::Reasoning(r) => {
+            let text = r.display_text();
+            if !text.is_empty() {
+                events.push(LlmEvent::ThinkingToken(text));
+            }
+        }
+        StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+            if !reasoning.is_empty() {
+                events.push(LlmEvent::ThinkingToken(reasoning));
+            }
+        }
+        StreamedAssistantContent::ToolCallDelta { id, content, .. } => {
+            yield_tool_call_delta(&mut events, id, content, phase);
+        }
+        StreamedAssistantContent::ToolCall { tool_call, .. } => {
+            events.push(LlmEvent::ToolCall {
+                id: tool_call.id.clone(),
+                name: tool_call.function.name.clone(),
+                args: tool_call.function.arguments.clone(),
+            });
+        }
+        StreamedAssistantContent::Final(final_resp) => {
+            let u = final_resp.token_usage();
+            usage = Some(to_usage_stats(&u));
+        }
+        StreamedAssistantContent::Unknown(_) => {
+            // Unmodeled provider output — ignore for now.
+        }
+    }
+    (events, usage)
+}
+
 impl super::LlmProvider for RigOpenAiProvider {
     fn stream_chat(&self, messages: Vec<Message>, context: LlmRequestContext) -> LlmStream {
         self.stream_chat_with_tools(messages, vec![], context)
@@ -251,94 +372,97 @@ impl super::LlmProvider for RigOpenAiProvider {
     ) -> LlmStream {
         let client = self.client.clone();
         let model_name = self.model.clone();
+        let reasoning_effort = self.reasoning_effort;
         let rig_messages = to_rig_messages(&messages);
         let rig_tools = to_rig_tools(&tools);
 
-        Box::pin(stream! {
-            let model = client.completion_model(model_name.clone());
-            let request = CompletionRequest {
-                model: None,
-                preamble: None,
-                chat_history: OneOrMany::from_iter_optional(rig_messages)
-                    .unwrap_or_else(|| OneOrMany::one(RigMessage::user(""))),
-                documents: vec![],
-                tools: rig_tools,
-                temperature: None,
-                max_tokens: None,
-                tool_choice: None,
-                additional_params: None,
-                output_schema: None,
-                record_telemetry_content: false,
-            };
+        let openai_completion_request = || CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::from_iter_optional(rig_messages)
+                .unwrap_or_else(|| OneOrMany::one(RigMessage::user(""))),
+            documents: vec![],
+            tools: rig_tools,
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+            record_telemetry_content: false,
+        };
 
-            let mut stream = match model.stream(request).await {
-                Ok(s) => s,
-                Err(e) => {
-                    yield LlmEvent::Error(to_provider_error(e));
-                    return;
-                }
-            };
-
-            let mut phase = StreamPhase::Idle;
-            let mut latest_usage: Option<UsageStats> = None;
-
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(StreamedAssistantContent::Text(text)) => {
-                        let content = text.text;
-                        if content.is_empty() {
-                            continue;
-                        }
-                        phase = StreamPhase::Idle;
-                        yield LlmEvent::Token {
-                            text: content,
-                            phase: AssistantPhase::Unknown,
-                        };
-                    }
-                    Ok(StreamedAssistantContent::Reasoning(r)) => {
-                        let text = r.display_text();
-                        if !text.is_empty() {
-                            yield LlmEvent::ThinkingToken(text);
-                        }
-                    }
-                    Ok(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
-                        if !reasoning.is_empty() {
-                            yield LlmEvent::ThinkingToken(reasoning);
-                        }
-                    }
-                    Ok(StreamedAssistantContent::ToolCallDelta { id, content, .. }) => {
-                        let mut buf = Vec::new();
-                        yield_tool_call_delta(&mut buf, id, content, &mut phase);
-                        for ev in buf {
-                            yield ev;
-                        }
-                    }
-                    Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
-                        yield LlmEvent::ToolCall {
-                            id: tool_call.id.clone(),
-                            name: tool_call.function.name.clone(),
-                            args: tool_call.function.arguments.clone(),
-                        };
-                    }
-                    Ok(StreamedAssistantContent::Final(final_resp)) => {
-                        let usage = final_resp.token_usage();
-                        latest_usage = Some(to_usage_stats(&usage));
-                    }
-                    Ok(StreamedAssistantContent::Unknown(_)) => {
-                        // Unmodeled provider output — ignore for now.
-                    }
+        match client {
+            RigClient::Responses(client) => Box::pin(stream! {
+                let model = client.completion_model(model_name.clone());
+                let mut request = openai_completion_request();
+                // Responses API carries reasoning effort as `reasoning.effort`.
+                request.additional_params = reasoning_effort
+                    .map(|e| serde_json::json!({ "reasoning": { "effort": e } }));
+                let mut stream = match model.stream(request).await {
+                    Ok(s) => s,
                     Err(e) => {
                         yield LlmEvent::Error(to_provider_error(e));
                         return;
                     }
+                };
+                let mut phase = StreamPhase::Idle;
+                let mut latest_usage: Option<UsageStats> = None;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(item) => {
+                            let (events, usage) = map_stream_item(item, &mut phase);
+                            latest_usage = usage.or(latest_usage);
+                            for ev in events {
+                                yield ev;
+                            }
+                        }
+                        Err(e) => {
+                            yield LlmEvent::Error(to_provider_error(e));
+                            return;
+                        }
+                    }
                 }
-            }
-
-            if let Some(usage) = latest_usage {
-                yield LlmEvent::Usage(usage);
-            }
-            yield LlmEvent::Done;
-        })
+                if let Some(usage) = latest_usage {
+                    yield LlmEvent::Usage(usage);
+                }
+                yield LlmEvent::Done;
+            }),
+            RigClient::Completions(client) => Box::pin(stream! {
+                let model = client.completion_model(model_name.clone());
+                let mut request = openai_completion_request();
+                // Chat Completions sends reasoning effort as a top-level param.
+                request.additional_params = reasoning_effort
+                    .map(|e| serde_json::json!({ "reasoning_effort": e }));
+                let mut stream = match model.stream(request).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        yield LlmEvent::Error(to_provider_error(e));
+                        return;
+                    }
+                };
+                let mut phase = StreamPhase::Idle;
+                let mut latest_usage: Option<UsageStats> = None;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(item) => {
+                            let (events, usage) = map_stream_item(item, &mut phase);
+                            latest_usage = usage.or(latest_usage);
+                            for ev in events {
+                                yield ev;
+                            }
+                        }
+                        Err(e) => {
+                            yield LlmEvent::Error(to_provider_error(e));
+                            return;
+                        }
+                    }
+                }
+                if let Some(usage) = latest_usage {
+                    yield LlmEvent::Usage(usage);
+                }
+                yield LlmEvent::Done;
+            }),
+        }
     }
 
     fn list_models(&self) -> ModelListFuture {

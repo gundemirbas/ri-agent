@@ -9,7 +9,7 @@ use crate::{
     keybindings::{BindingContext, KEYBINDINGS},
     live_turn::compose_display,
     llm::{LlmProvider, Message, UsageStats},
-    provider_instance::ProviderInstance,
+    provider_instance::{ApiType, ProviderInstance},
     session::SessionStore,
     session_state::SessionState,
     skills::SkillMeta,
@@ -64,6 +64,10 @@ pub enum SelectionResult {
     RemoveProvider(String),
     /// The user selected an agent name from the picker.
     Agent(String),
+    /// The user chose to add a new OpenAI-compatible provider instance.
+    ProviderAdd,
+    /// An API type was chosen during add-provider setup.
+    ProviderApiType(ApiType),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

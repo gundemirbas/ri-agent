@@ -7,7 +7,9 @@ use crate::ask_user_state::PendingAsk;
 use crate::completion::CompletionItem;
 use crate::export;
 use crate::llm::Message;
-use crate::provider_instance::{BackendPreset, ProviderInstance};
+use crate::provider_instance::{
+    ApiType, AuthMode, BackendPreset, EndpointBehavior, ProviderInstance,
+};
 use crate::provider_manager::{PendingProviderRemoval, PendingProviderSetup, ProviderSetupStep};
 use crate::selection_state::{MAX_SELECTION_VISIBLE, SelectionKind};
 use crate::thinking::ThinkingLevel;
@@ -33,6 +35,7 @@ impl App {
             Some(SelectionKind::ResumeSession)
             | Some(SelectionKind::AskUser)
             | Some(SelectionKind::ConfirmProviderRemoval)
+            | Some(SelectionKind::ProviderApiType)
             | Some(SelectionKind::Agent)
             | Some(SelectionKind::KeybindingHelp)
             | None => None,
@@ -153,21 +156,18 @@ impl App {
     pub fn enter_provider_selection_mode(&mut self, instances: &[ProviderInstance]) {
         self.reset_textarea();
         self.session.live_turn.notices.clear();
-        let items: Vec<CompletionItem> = if instances.is_empty() {
-            vec![CompletionItem {
-                label: "No providers configured".to_string(),
-                detail: "Configure one with /provider".to_string(),
-                complete_to: String::new(),
-                loading: false,
-                error: false,
-                match_range: None,
-            }]
-        } else {
-            instances
-                .iter()
-                .map(|p| CompletionItem::from_provider(&p.id, &p.label()))
-                .collect()
-        };
+        let mut items: Vec<CompletionItem> = instances
+            .iter()
+            .map(|p| CompletionItem::from_provider(&p.id, &p.label()))
+            .collect();
+        items.push(CompletionItem {
+            label: "+ Add OpenAI-compatible provider…".to_string(),
+            detail: "Endpoint URL, API key, API type".to_string(),
+            complete_to: "/provider_add".to_string(),
+            loading: false,
+            error: false,
+            match_range: None,
+        });
         self.selection
             .activate(SelectionKind::Provider, "  Select provider  ", items);
         self.select_current_default();
@@ -191,6 +191,70 @@ impl App {
 
     pub fn pending_provider_original_id(&self) -> Option<&str> {
         self.provider.pending_original_id()
+    }
+
+    /// Start the interactive add-provider flow for a new OpenAI-compatible
+    /// instance.  Creates the pending setup and advances into the first input
+    /// step (API-type picker for this preset, then endpoint, API key, name).
+    pub fn start_provider_add_flow(&mut self) {
+        let Some(preset) = BackendPreset::from_id("openai-compatible") else {
+            return;
+        };
+        let instance = ProviderInstance::new(String::new(), preset.clone());
+        self.provider.pending_setup =
+            Some(crate::provider_manager::PendingProviderSetup::from_instance(&instance));
+        if preset.def().user_selects_api {
+            self.enter_provider_api_type_selection_mode(&preset);
+        } else {
+            self.advance_provider_setup_after_api_type();
+        }
+    }
+
+    /// Apply a chosen API type to the pending provider setup and continue the
+    /// add flow with the remaining input steps.
+    pub fn apply_pending_provider_api_type(&mut self, api_type: ApiType) {
+        if let Some(setup) = self.provider.pending_setup.as_mut() {
+            setup.api_type = Some(api_type);
+        }
+        self.advance_provider_setup_after_api_type();
+    }
+
+    /// Advance the pending provider-setup flow to the next input step after the
+    /// API type has been decided.  For `OpenAiCompatible` this is the endpoint
+    /// URL, then the API key, then the instance name.
+    fn advance_provider_setup_after_api_type(&mut self) {
+        let Some(instance) = self.pending_provider_instance() else {
+            return;
+        };
+        let def = instance.backend_preset.def();
+        if matches!(def.endpoint_behavior, EndpointBehavior::UserSupplied) {
+            self.enter_provider_endpoint_input_mode();
+        } else if matches!(def.auth_mode, AuthMode::ApiKey) {
+            self.enter_provider_api_key_input_mode();
+        } else {
+            self.enter_provider_name_input_mode();
+        }
+    }
+
+    /// Show the API-type menu for the pending provider instance.
+    pub fn enter_provider_api_type_selection_mode(&mut self, backend_preset: &BackendPreset) {
+        self.reset_textarea();
+        self.session.live_turn.notices.clear();
+        let items = backend_preset
+            .def()
+            .allowed_apis
+            .iter()
+            .map(|api| CompletionItem {
+                label: api.label().to_string(),
+                detail: String::new(),
+                complete_to: format!("/provider_api {}", api.label()),
+                loading: false,
+                error: false,
+                match_range: None,
+            })
+            .collect();
+        self.selection
+            .activate(SelectionKind::ProviderApiType, "  Select API type  ", items);
     }
 
     /// Begin setup for a new custom provider instance.
@@ -498,7 +562,10 @@ impl App {
             Some(SelectionKind::Provider) => item
                 .complete_to
                 .strip_prefix("/provider ")
-                .map(|name| SelectionResult::Provider(name.to_string())),
+                .map(|name| SelectionResult::Provider(name.to_string()))
+                .or_else(|| {
+                    (item.complete_to == "/provider_add").then_some(SelectionResult::ProviderAdd)
+                }),
             Some(SelectionKind::ConfirmProviderRemoval) => match item.complete_to.as_str() {
                 "/provider_remove_confirm" => self
                     .provider
@@ -508,6 +575,22 @@ impl App {
                 "/provider_remove_cancel" => Some(SelectionResult::CancelProviderRemoval),
                 _ => None,
             },
+            Some(SelectionKind::ProviderApiType) => item
+                .complete_to
+                .strip_prefix("/provider_api ")
+                .and_then(|label| {
+                    self.provider
+                        .pending_setup
+                        .as_ref()?
+                        .backend_preset
+                        .as_ref()?
+                        .def()
+                        .allowed_apis
+                        .iter()
+                        .find(|api| api.label() == label)
+                        .cloned()
+                })
+                .map(SelectionResult::ProviderApiType),
             Some(SelectionKind::ResumeSession) => item
                 .complete_to
                 .strip_prefix("/resume_session ")
