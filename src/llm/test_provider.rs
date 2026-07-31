@@ -1,9 +1,11 @@
-//! A hidden test provider for exercising the xi-agent UI without a real API
+//! A hidden test provider for exercising the ri-agent UI without a real API
 //! connection.  Activated via `--provider=test` or `/provider test`.
 //! Never appears in the provider selection menu.  Never persists to config.
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+//!
+//! Kept intentionally minimal: it exists to smoke-test the agent loop and,
+//! crucially, to let you inspect the exact system prompt being sent to the
+//! model via the `system` command.  The heavier scripted demo sequences were
+//! trimmed.
 
 use async_stream::stream;
 use tokio::time::{Duration, sleep};
@@ -14,253 +16,32 @@ use super::{
 };
 use crate::llm::ProviderError;
 
-pub struct TestProvider {
-    /// Tracks the current step for scripted multi-turn sequences.
-    /// 0 = idle (no sequence in progress).
-    sequence_step: Arc<AtomicU8>,
-    /// PID captured from step 1 of bash-background-job, used in steps 2–4.
-    sequence_pid: Arc<std::sync::atomic::AtomicU32>,
-    /// Tracks the current step for the write-edit sequence.
-    /// 0 = idle, 1 = waiting for write result, 2 = done.
-    write_edit_step: Arc<AtomicU8>,
-    /// Temp file path used by the write-edit sequence.
-    write_edit_path: Arc<std::sync::Mutex<String>>,
-    /// Tracks the current step for the long-lines sequence.
-    /// 0 = idle, 1 = waiting for write result, 2 = waiting for grep result, 3 = done.
-    long_lines_step: Arc<AtomicU8>,
-    /// Temp file path used by the long-lines sequence.
-    long_lines_path: Arc<std::sync::Mutex<String>>,
-    /// When true, the write-edit sequence will delay 4s after the edit
-    /// result before emitting the summary — enough to trigger the throbber.
-    write_edit_throbber: Arc<std::sync::atomic::AtomicBool>,
-}
+/// A hidden test provider with no persistent state.
+pub struct TestProvider;
 
 impl TestProvider {
     pub fn new() -> Self {
-        Self {
-            sequence_step: Arc::new(AtomicU8::new(0)),
-            sequence_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            write_edit_step: Arc::new(AtomicU8::new(0)),
-            write_edit_path: Arc::new(std::sync::Mutex::new(String::new())),
-            long_lines_step: Arc::new(AtomicU8::new(0)),
-            long_lines_path: Arc::new(std::sync::Mutex::new(String::new())),
-            write_edit_throbber: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
+        Self
     }
 }
 
-// ── Pre-defined questions ─────────────────────────────────────────────────────
-
-const ASK_QUESTION: &str = "Which option do you prefer?";
-const ASK_CONTEXT_QUESTION: &str = "How should I proceed after reviewing the gathered evidence?";
-const ASK_CONTEXT: &str = "Summary: reproduced the issue locally, narrowed it to the ask_user display path, and verified no unrelated warnings are present.";
-const ASK_TYPE_QUESTION: &str = "Please type your answer:";
-const ASK_NOTYPE_QUESTION: &str = "Select one of the following:";
-
-// ── Markdown fixture ──────────────────────────────────────────────────────────
-
-const MARKDOWN_FIXTURE: &str = r#"# Markdown Showcase
-
-This document exercises **every** major markdown feature rendered by xi-agent. It is intentionally long and verbose so that scrolling, wrapping, and layout can all be verified in a single pass.
-
-## Text styles
-
-Normal text, **bold text**, *italic text*, ***bold and italic***, and `inline code`. You can also combine styles: **bold with `inline code` inside** or *italic with **nested bold** inside*.
-
-Here is a second paragraph in the same section. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
-
-## Headings
-
-### Level 3 heading
-
-Some text under a level-3 heading. This paragraph is here to verify that the heading renders at the correct weight and that subsequent body text is clearly distinguished from it.
-
-#### Level 4 heading
-
-Some text under a level-4 heading. Headings at this depth are less common but should still render distinctly from body text.
-
-## Lists
-
-Unordered:
-
-- Alpha — the first item, with a moderately long description to check line wrapping inside a list bullet
-- Beta — the second item
-  - Nested item one
-  - Nested item two, also with a longer description to ensure indented wrapping works correctly
-  - Nested item three
-- Gamma — the third item
-- Delta — the fourth item, added to give the list more visual weight
-
-Ordered:
-
-1. First step — initialize the project and install dependencies
-2. Second step — configure the environment and set the required variables
-3. Third step — run the test suite and verify all assertions pass
-4. Fourth step — build the release artifact and publish
-
-## Code block
-
-```rust
-fn main() {
-    // This is a moderately long code block to verify that horizontal
-    // scrolling or wrapping behaves correctly inside a fenced block.
-    let message = "Hello from the test provider!";
-    let repeated: String = std::iter::repeat(message).take(3).collect::<Vec<_>>().join(", ");
-    println!("{repeated}");
+impl Default for TestProvider {
+    fn default() -> Self {
+        Self::new()
+    }
 }
-```
-
-```json
-{
-  "provider": "test",
-  "model": "test",
-  "commands": ["help", "markdown", "echo", "slow", "thinking", "status", "error", "system", "ask", "bash", "exec"],
-  "persistent": false
-}
-```
-
-## Blockquote
-
-> The test provider exists so you can exercise the xi-agent UI without burning real tokens or requiring authentication. It simulates every kind of LLM event — text tokens, thinking tokens, tool calls, status updates, and errors — through a simple command interface.
->
-> Nested quote:
->
-> > This is a nested blockquote. It should be indented further than the outer quote and still wrap correctly at the terminal width.
-
-## Commands table
-
-| Command                 | Arguments       | Description                                                                 |
-|-------------------------|-----------------|-----------------------------------------------------------------------------|
-| `help`                  | —               | Show a list of all available test provider commands                         |
-| `markdown`              | —               | Stream this rich markdown document in full                                  |
-| `echo <text>`           | text            | Stream the provided text back to the UI token by token without any delay    |
-| `slow <text>`           | text            | Stream the provided text word by word with a 150 ms artificial delay        |
-| `thinking <text>`       | text            | Emit a simulated chain-of-thought block followed by the provided answer     |
-| `status <msg>`          | message         | Emit a transient StatusUpdate event and then confirm with a short response  |
-| `error`                 | —               | Emit a provider error to test the error-display path in the UI              |
-| `system`                | —               | Retrieve and display the full system prompt inside a fenced code block      |
-| `ask [question]`        | question        | Invoke ask_user with three named options and freeform input enabled         |
-| `ask-context [q]`       | question        | Invoke ask_user with context text, options, and freeform input enabled      |
-| `ask-type [q]`          | question        | Invoke ask_user with freeform input only and no predefined option list      |
-| `ask-notype [q]`        | question        | Invoke ask_user with three options and freeform input disabled              |
-| `bash <cmd>`            | shell command   | Execute a real bash command and echo the result as a fenced code block      |
-| `powershell <cmd>`      | shell command   | Execute a real powershell command and echo the result as a fenced code block |
-| `cmd <cmd>`             | shell command   | Execute a real cmd command and echo the result as a fenced code block       |
-| `exec <prog> [args…]`   | prog + args     | Execute a program via argv (shellword-split); no shell interpretation        |
-| `bash-background-job`   | —               | 4-step scripted loop: start sleep 60, check running, kill, confirm gone     |
-| `read-skill [name]`     | name            | Issue a read_skill tool call (defaults to edit_skill if no name given)      |
-| `write`                 | —               | Issue a write_file tool call that writes a file to the system temp directory |
-| `write-edit`            | —               | Stream write_file then edit_file in streaming mode (~4-8 chars/chunk, 20 chunks/sec); uses 6 lines of context |
-
-## Wide data table
-
-This table has many columns and long cell values to stress-test column sizing and text wrapping behaviour.
-
-| ID  | Component         | Status      | Owner              | Last Updated | Notes                                                                 |
-|-----|-------------------|-------------|--------------------|--------------|-----------------------------------------------------------------------|
-| 001 | LLM provider      | ✅ Complete  | @larsch            | 2026-04-06   | Supports streaming, tool calls, thinking tokens, and status updates   |
-| 002 | Test provider     | ✅ Complete  | @larsch            | 2026-04-06   | Hidden from menu; never persists; activated via --provider=test       |
-| 003 | Markdown renderer | 🔄 Ongoing  | @larsch            | 2026-04-05   | Tables, blockquotes, and nested lists under active refinement         |
-| 004 | ask_user tool     | ✅ Complete  | @larsch            | 2026-03-20   | Supports options, freeform, and cancellation via Escape               |
-| 005 | Session export    | ✅ Complete  | @larsch            | 2026-03-15   | Exports full conversation history to an HTML file with syntax highlighting |
-| 006 | Thinking tokens   | ✅ Complete  | @larsch            | 2026-04-01   | Gemini, Codex, and Copilot Responses route all supported              |
-| 007 | Token compaction  | 🔄 Ongoing  | @larsch            | 2026-04-04   | Reserve-based strategy; square-root budget curve                      |
-| 008 | Windows support   | ⚠️ Partial  | @larsch            | 2026-03-28   | Bracketed paste heuristic in place; some edge cases remain on conhost |
-
-## Done
-
-End of markdown fixture. Scroll back up to verify that all sections rendered correctly.
-"#;
-
-// ── Emoji fixture ─────────────────────────────────────────────────────────────
-
-/// A fixture that lists every emoji used in xi-agent's tool labels so that
-/// rendering alignment can be verified visually in the terminal.
-///
-/// Each line shows: the emoji (as xi-agent would render it in a tool label),
-/// a pipe, then a descriptive name.  The pipe should be vertically aligned
-/// if all emojis advance the cursor by exactly 2 columns.
-const EMOJI_FIXTURE: &str = "\
-Emoji alignment test — the `|` column shows actual terminal cursor advance.\n\
-Alignment may vary by terminal, font, and render state.\n\
-\n\
-```\n\
-👀 | read_file  (U+1F440, wide)\n\
-✏️ | write_file (U+270F+VS16)\n\
-📝 | edit_file  (U+1F4DD, wide)\n\
-💻 | bash       (U+1F4BB, wide)\n\
-🔍 | find_files (U+1F50D, wide)\n\
-❓ | ask_user   (U+2753, wide)\n\
-⚙️ | exec/other (U+2699+VS16)\n\
-🕹️ | steering   (U+1F579+VS16)\n\
-⚠️ | warning    (U+26A0+VS16)\n\
-✅ | checkmark  (U+2705, wide)\n\
-❌ | red cross  (U+274C, wide)\n\
-```\n\
-";
 
 // ── Help text ─────────────────────────────────────────────────────────────────
 
 const HELP_TEXT: &str = r#"# Test Provider Commands
 
-## General
-
-| Command | Description |
-|---------|-------------|
-| `help` | Show this help |
-| `markdown` | Stream a rich markdown document |
-| `emoji` | Show emoji alignment test for all tool label glyphs |
-| `echo <text>` | Stream text back token by token |
-| `slow <text>` | Stream text with artificial delays |
-| `thinking <text>` | Emit thinking tokens then a text answer |
-| `status <msg>` | Emit a `StatusUpdate` event then confirm |
-| `error` | Emit a provider error |
-| `system` | Show the full system prompt |
-
-## User interaction
-
-| Command | Description |
-|---------|-------------|
-| `ask [question]` | `ask_user` with options + freeform |
-| `ask-context [question]` | `ask_user` with context + options + freeform |
-| `ask-type [question]` | `ask_user` freeform only (no options) |
-| `ask-notype [question]` | `ask_user` options only (no freeform) |
-| `stream-ask [question]` | Streaming `ask_user` with options + freeform |
-| `stream-ask-context [question]` | Streaming `ask_user` with context + options + freeform |
-| `stream-ask-type [question]` | Streaming `ask_user` freeform only (no options) |
-| `stream-ask-notype [question]` | Streaming `ask_user` options only (no freeform) |
-
-## Shell commands
-
-| Command | Description |
-|---------|-------------|
-| `bash <command>` | Execute a real bash command |
-| `powershell <command>` | Execute a real PowerShell command |
-| `cmd <command>` | Execute a real cmd command |
-| `exec <prog> [args…]` | Execute a program via argv (shellword-split, no shell) |
-| `bash-background-job` | 4-step scripted loop: start `sleep 60` in background, check it is running, kill it, confirm it is gone |
-| `stream-bash` | Streaming `bash` tool call (~4–8 chars/chunk at 20/sec); runs a 10 s script with live output |
-| `stream-python` | Streaming `python` tool call (~4–8 chars/chunk at 20/sec); runs a 10 s script with live output |
-| `python-program` | Streaming `python` tool call with a ~21-line stats program (streamed in chunks at 20/sec) |
-
-## File tool calls
-
-| Command | Description |
-|---------|-------------|
-| `python` | Issue a `python` tool call (quick single-output script) |
-
-| Command | Description |
-|---------|-------------|
-| `write` | Issue a `write_file` tool call to the system temp directory |
-| `write-edit` | Stream `write_file` then `edit_file` (~4–8 chars/chunk at 20 chunks/sec); edit uses 6 lines of context each side |
-| `write-edit-throbber` | Same as `write-edit` but waits 4 s after edit result before summary — exercises throbber-after-shrink rendering |
-| `long-lines` | 3-step sequence: write 10 very long lines (~200 chars each), grep all, read back (exercises wrapped-line limit in shell and read_file output) |
-| `read` | Issue a `read_file` tool call on a short fixture (≤8 lines) |
-| `read-long` | Issue a `read_file` tool call on a 20-line fixture (exercises head-truncation and range suffix) |
-| `read-skill [name]` | Issue a `read_skill` tool call (defaults to `edit_skill` if no name given) |
-| `find` | Issue a `find_files` tool call on the temp directory |
-| `edit` | Issue an `edit_file` tool call with short old/new text (use after `write`; exercises compact diff body) |
-| `edit-long` | Issue an `edit_file` tool call with 6 lines per side (exercises per-side truncation markers) |
+| Command         | Description                                                     |
+|-----------------|-----------------------------------------------------------------|
+| `help`          | Show this help                                                  |
+| `echo <text>`   | Stream text back to the UI                                      |
+| `slow <text>`   | Stream text with artificial per-word delays                     |
+| `system`        | Show the exact system prompt that is being sent to the model    |
+| `error`         | Emit a provider error to exercise the error-display path        |
 "#;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -294,582 +75,7 @@ fn stream_owned(text: String) -> LlmStream {
     })
 }
 
-/// Build a tool call stream for `ask_user`.
-fn ask_user_stream(
-    question: String,
-    context: Option<&'static str>,
-    options: &'static [&'static str],
-    allow_freeform: bool,
-) -> LlmStream {
-    let options_json: serde_json::Value = options
-        .iter()
-        .map(|s| serde_json::Value::String(s.to_string()))
-        .collect::<Vec<_>>()
-        .into();
-
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "ask_user".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "ask_user".to_string(),
-            args: serde_json::json!({
-                "question": question,
-                "context": context,
-                "options": options_json,
-                "allowFreeform": allow_freeform,
-            }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// Build a tool call stream for `write_file` targeting the system temp directory.
-fn write_file_stream() -> LlmStream {
-    let path = std::env::temp_dir()
-        .join("xi-test-write.txt")
-        .to_string_lossy()
-        .into_owned();
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "write_file".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "write_file".to_string(),
-            args: serde_json::json!({
-                "path": path,
-                "content": "Hello from the xi-agent test provider!\n",
-            }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// Temp file path used by write/read/edit test commands.
-fn test_temp_path() -> String {
-    std::env::temp_dir()
-        .join("xi-test-write.txt")
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Fixture with 10 very long lines for the `long-lines` command.
-/// Each line is ~400+ characters (wraps to 6+ visual lines at 80 cols).
-const LONG_LINES_FIXTURE: &str = "\
-line 01: The quick brown fox jumps over the lazy dog repeatedly without stopping for a break while the sun sets slowly over the horizon and the birds return to their nests for the evening chorus while the crickets begin their nightly symphony beneath the ancient oak tree that has stood watch over the meadow for more than three hundred years\n\
-line 02: Pack my box with five dozen liquor jugs and then carefully arrange them in alphabetical order by brand name while simultaneously balancing a tray of champagne flutes on my head and reciting the complete works of Shakespeare from memory without missing a single syllable or forgetting where I left my car keys in the parking lot behind the theatre\n\
-line 03: How vexingly quick daft zebras jump over fences made of bamboo and discarded typewriters that were once used by famous authors who wrote about the human condition in novels so long and complex that scholars still debate their true meaning decades after publication\n\
-line 04: The five boxing wizards jump quickly through hoops of fire while reciting Shakespearean sonnets backwards in a language that has not been spoken for centuries except by the ancient order of librarians who guard the secrets of the universe in an underground archive protected by puzzles and riddles\n\
-line 05: Sphinx of black quartz judge my vow and render a verdict based on the ancient laws of the desert kingdom where camels roam freely among the pyramids and oases while merchants trade spices and silk under the watchful eye of the pharaoh who demands tribute from every traveler\n\
-line 06: Waltz nymph for quick jigs vex bud and then tango with the penguins who have been training for this dance competition since the last ice age ended and the glaciers retreated to reveal the hidden ballroom carved from crystal deep within the frozen mountains\n\
-line 07: Blowzy red-haired vixens blow kisses to the crowd while juggling chainsaws and reciting the digits of pi to a thousand decimal places without error even as the marching band parades through the center ring playing a medley of sea shanties arranged for brass instruments\n\
-line 08: Jumpy halfback vows to fix the broken scoreboard using only a roll of duct tape and a paperclip while the stadium erupts in chaos around the final play of the championship game with millions watching from home and the commentators losing their minds\n\
-line 09: Plucky quarterback who zaps defenders with lightning bolts conjured from ancient runes found in a cave beneath the fifty-yard line during halftime when the marching band was performing and nobody noticed the strange glowing symbols on the turf\n\
-line 10: quickly foxing the dizzy dog around the mulberry bush while the monkey chases the weasel through a labyrinth of mirrors and existential questions that would make even the most confident philosopher stop and reconsider everything they thought they knew about reality\n\
-";
-
-/// Short fixture content (≤8 lines) for `read` command.
-const READ_SHORT_FIXTURE: &str = "\
-line 1: Hello from the xi-agent test provider\n\
-line 2: This file exercises read_file rendering\n\
-line 3: It is short enough to display without truncation\n\
-line 4: End of short fixture\n\
-";
-
-/// Long fixture content (>8 lines) for `read-long` command.
-const READ_LONG_FIXTURE: &str = "\
-line 01: The quick brown fox\n\
-line 02: jumps over the lazy dog\n\
-line 03: Pack my box with five\n\
-line 04: dozen liquor jugs\n\
-line 05: How vexingly quick\n\
-line 06: daft zebras jump\n\
-line 07: The five boxing wizards\n\
-line 08: jump quickly\n\
-line 09: Sphinx of black quartz\n\
-line 10: judge my vow\n\
-line 11: Waltz nymph for quick\n\
-line 12: jigs vex bud\n\
-line 13: Blowzy red-haired\n\
-line 14: vixens blow\n\
-line 15: Jumpy halfback\n\
-line 16: vows to fix\n\
-line 17: plucky quarterback\n\
-line 18: who zaps\n\
-line 19: quickly foxing\n\
-line 20: the dizzy dog\n\
-";
-
-/// Write content to the test temp file and return a read_file tool call stream.
-fn read_file_stream(content: &'static str) -> LlmStream {
-    let path = test_temp_path();
-    Box::pin(stream! {
-        // Write the fixture to the temp file first.
-        if let Err(e) = std::fs::write(&path, content) {
-            yield LlmEvent::Token {
-                text: format!("Failed to write fixture: {e}\n"),
-                phase: AssistantPhase::Final,
-            };
-            yield LlmEvent::Done;
-            return;
-        }
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "read_file".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "read_file".to_string(),
-            args: serde_json::json!({ "path": path }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// Build a tool call stream for `read_skill`.
-fn read_skill_stream(name: String) -> LlmStream {
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "read_skill".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "read_skill".to_string(),
-            args: serde_json::json!({ "name": name }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// find_files tool call stream targeting the system temp directory.
-fn find_files_stream() -> LlmStream {
-    let path = std::env::temp_dir().to_string_lossy().into_owned();
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "find_files".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "find_files".to_string(),
-            args: serde_json::json!({ "pattern": "*", "path": path }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// edit_file tool call stream — both sides within 4 lines.
-fn edit_file_stream(old_text: String, new_text: String) -> LlmStream {
-    let path = test_temp_path();
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "edit_file".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "edit_file".to_string(),
-            args: serde_json::json!({ "path": path, "old_text": old_text, "new_text": new_text }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// Stream the JSON args of a tool call in small chunks (~4-8 chars each) at
-/// Stream tool call args in small chunks (~4-8 chars each).
-///
-/// Yields: `ToolCallStart`, N×`ToolCallArgsDelta`, then `ToolCall`, then `Done`.
-fn streaming_tool_call(tool_name: String, args: serde_json::Value, delay_ms: u64) -> LlmStream {
-    let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
-    Box::pin(stream! {
-        let id = "test-1".to_string();
-        yield LlmEvent::ToolCallStart {
-            id: id.clone(),
-            name: tool_name.clone(),
-        };
-        // Chunk the JSON string into pieces of 4-8 chars, alternating.
-        let bytes = args_str.as_bytes();
-        let mut pos = 0;
-        let mut chunk_size = 4usize;
-        while pos < bytes.len() {
-            let end = (pos + chunk_size).min(bytes.len());
-            // Find a valid UTF-8 boundary at or before `end`.
-            let end = (pos..=end).rev().find(|&i| args_str.is_char_boundary(i)).unwrap_or(end);
-            let partial_json = args_str[pos..end].to_string();
-            pos = end;
-            chunk_size = if chunk_size == 4 { 8 } else { 4 };
-            sleep(Duration::from_millis(delay_ms)).await;
-            yield LlmEvent::ToolCallArgsDelta {
-                id: id.clone(),
-                partial_json,
-            };
-        }
-        yield LlmEvent::ToolCall {
-            id: id.clone(),
-            name: tool_name,
-            args,
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// The multi-line content written by the `write-edit` command.
-const WRITE_EDIT_CONTENT: &str = "\
-context line 1: The quick brown fox\n\
-context line 2: jumps over the lazy dog\n\
-context line 3: Pack my box with five\n\
-context line 4: dozen liquor jugs\n\
-context line 5: How vexingly quick\n\
-context line 6: daft zebras jump\n\
-TARGET LINE: original content to be replaced\n\
-context line 7: The five boxing wizards\n\
-context line 8: jump quickly\n\
-context line 9: Sphinx of black quartz\n\
-context line 10: judge my vow\n\
-context line 11: Waltz nymph for quick\n\
-context line 12: jigs vex bud\n\
-";
-
-/// Build a write_file streaming tool call for the write-edit command.
-fn write_edit_write_stream(path: String) -> LlmStream {
-    streaming_tool_call(
-        "write_file".to_string(),
-        serde_json::json!({
-            "path": path,
-            "content": WRITE_EDIT_CONTENT,
-        }),
-        50,
-    )
-}
-
-/// Build an edit_file streaming tool call for the write-edit command.
-/// Uses 6 lines of context on each side of the change.
-fn write_edit_edit_stream(path: String) -> LlmStream {
-    let old_text = "\
-context line 1: The quick brown fox\n\
-context line 2: jumps over the lazy dog\n\
-context line 3: Pack my box with five\n\
-context line 4: dozen liquor jugs\n\
-context line 5: How vexingly quick\n\
-context line 6: daft zebras jump\n\
-TARGET LINE: original content to be replaced\n\
-context line 7: The five boxing wizards\n\
-context line 8: jump quickly\n\
-context line 9: Sphinx of black quartz\n\
-context line 10: judge my vow\n\
-context line 11: Waltz nymph for quick\n\
-context line 12: jigs vex bud\n\
-";
-    let new_text = "\
-context line 1: The quick brown fox\n\
-context line 2: jumps over the lazy dog\n\
-context line 3: Pack my box with five\n\
-context line 4: dozen liquor jugs\n\
-context line 5: How vexingly quick\n\
-context line 6: daft zebras jump\n\
-TARGET LINE: replaced content — edit succeeded!\n\
-context line 7: The five boxing wizards\n\
-context line 8: jump quickly\n\
-context line 9: Sphinx of black quartz\n\
-context line 10: judge my vow\n\
-context line 11: Waltz nymph for quick\n\
-context line 12: jigs vex bud\n\
-";
-    streaming_tool_call(
-        "edit_file".to_string(),
-        serde_json::json!({
-            "path": path,
-            "old_text": old_text,
-            "new_text": new_text,
-        }),
-        50,
-    )
-}
-
-/// Build a write_file tool call for the long-lines sequence's write step.
-fn long_lines_write_stream(path: String) -> LlmStream {
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "write_file".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "write_file".to_string(),
-            args: serde_json::json!({
-                "path": path,
-                "content": LONG_LINES_FIXTURE,
-            }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// Build a read_file tool call for the long-lines sequence's read step.
-fn long_lines_read_stream(path: String) -> LlmStream {
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "read_file".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "read_file".to_string(),
-            args: serde_json::json!({ "path": path }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// Build a tool call stream for a shell tool (bash / powershell / cmd).
-fn shell_tool_stream(tool_name: String, command: String) -> LlmStream {
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: tool_name.clone(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: tool_name,
-            args: serde_json::json!({ "command": command }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// Build a tool call stream for the `exec` tool using an argv parsed from
-/// `invocation` via simple shellword (shlex) splitting.
-///
-/// The first token is `program`; the remainder become `args`.
-/// Returns an error stream if `invocation` is empty or unparseable.
-fn exec_tool_stream(invocation: String) -> LlmStream {
-    let tokens = match shlex::split(&invocation) {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            let msg = if invocation.trim().is_empty() {
-                "exec: no program specified\n".to_string()
-            } else {
-                format!("exec: failed to parse shellwords from: {invocation}\n")
-            };
-            return stream_owned(msg);
-        }
-    };
-    let program = tokens[0].clone();
-    let args: Vec<String> = tokens[1..].to_vec();
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "exec".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "exec".to_string(),
-            args: serde_json::json!({ "program": program, "args": args }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
-/// Build a streaming python tool call — a 10-second script that produces
-/// output over time to exercise both the streaming headline and live output body.
-fn streaming_python_stream() -> LlmStream {
-    streaming_tool_call(
-        "run_python".to_string(),
-        serde_json::json!({
-            "script": "import time\nfor i in range(1, 11):\n    print(f'line {i}: processing chunk {i}...')\n    time.sleep(1)\n"
-        }),
-        50,
-    )
-}
-
-/// Build a streaming python tool call with a medium-length (~21 line) program
-/// that computes descriptive statistics on a sample dataset.
-fn streaming_python_program_stream() -> LlmStream {
-    streaming_tool_call(
-        "run_python".to_string(),
-        serde_json::json!({
-            "script": "import json, math, time\n\ndef stats(values):\n    n = len(values)\n    mean = sum(values) / n\n    sv = sorted(values)\n    var = sum((x - mean) ** 2 for x in values) / n\n    return {\n        \"n\": n,\n        \"mean\": round(mean, 2),\n        \"std\": round(math.sqrt(var), 2),\n        \"median\": sv[n // 2],\n        \"min\": sv[0],\n        \"max\": sv[-1],\n    }\n\nprint(\"Running stats demo...\", flush=True)\ntime.sleep(0.3)\ndata = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]\nprint(f\"Data ({len(data)} values): {data}\", flush=True)\ntime.sleep(0.3)\nresult = stats(data)\nprint(json.dumps(result, indent=2))\nprint(\"Done.\", flush=True)"
-        }),
-        50,
-    )
-}
-
-/// Build a streaming bash tool call — a 10-second script that produces
-/// output over time to exercise both the streaming headline and live output body.
-fn streaming_bash_stream() -> LlmStream {
-    streaming_tool_call(
-        "bash".to_string(),
-        serde_json::json!({
-            "command": "for i in $(seq 1 10); do echo \"line $i: $(date +%H:%M:%S)\"; sleep 1; done"
-        }),
-        50,
-    )
-}
-
-/// Build a streaming ask_user tool call with options and freeform.
-fn streaming_ask_stream(question: String, context: Option<&'static str>) -> LlmStream {
-    let options: serde_json::Value = vec!["Option A", "Option B", "Option C"]
-        .into_iter()
-        .map(|s| serde_json::Value::String(s.to_string()))
-        .collect::<Vec<_>>()
-        .into();
-    let mut args = serde_json::json!({
-        "question": question,
-        "options": options,
-        "allowFreeform": true,
-    });
-    if let Some(ctx) = context {
-        args["context"] = serde_json::Value::String(ctx.to_string());
-    }
-    streaming_tool_call("ask_user".to_string(), args, 50)
-}
-
-/// Build a streaming ask_user tool call with context, options, and freeform.
-fn streaming_ask_context_stream(question: String) -> LlmStream {
-    streaming_ask_stream(question, Some(ASK_CONTEXT))
-}
-
-/// Build a streaming ask_user tool call with freeform only (no options).
-fn streaming_ask_type_stream(question: String) -> LlmStream {
-    streaming_tool_call(
-        "ask_user".to_string(),
-        serde_json::json!({
-            "question": question,
-            "options": [],
-            "allowFreeform": true,
-        }),
-        50,
-    )
-}
-
-/// Build a streaming ask_user tool call with options only (no freeform).
-fn streaming_ask_notype_stream(question: String) -> LlmStream {
-    let options: serde_json::Value = vec!["Choice 1", "Choice 2", "Choice 3"]
-        .into_iter()
-        .map(|s| serde_json::Value::String(s.to_string()))
-        .collect::<Vec<_>>()
-        .into();
-    streaming_tool_call(
-        "ask_user".to_string(),
-        serde_json::json!({
-            "question": question,
-            "options": options,
-            "allowFreeform": false,
-        }),
-        50,
-    )
-}
-
-/// Build a non-streaming python tool call (quick, single output).
-fn python_stream() -> LlmStream {
-    Box::pin(stream! {
-        yield LlmEvent::ToolCallStart {
-            id: "test-1".to_string(),
-            name: "run_python".to_string(),
-        };
-        yield LlmEvent::ToolCall {
-            id: "test-1".to_string(),
-            name: "run_python".to_string(),
-            args: serde_json::json!({ "script": "print('hello from test provider')" }),
-        };
-        yield LlmEvent::Done;
-    })
-}
-
 // ── LlmProvider impl ──────────────────────────────────────────────────────────
-
-impl TestProvider {
-    /// Drive the bash-background-job scripted sequence.
-    ///
-    /// Steps (called with the tool result from the *previous* step):
-    ///   1 → start `sleep 60` in the background and print its PID
-    ///   2 → parse PID from result; check process is running with `ps -p <pid>`
-    ///   3 → kill it with `kill <pid>`
-    ///   4 → verify it is gone with `ps -p <pid>`
-    ///   5 → emit final summary text, reset to idle
-    fn advance_sequence(&self, step: u8, tool_result: &str) -> LlmStream {
-        let seq = Arc::clone(&self.sequence_step);
-        let pid_store = Arc::clone(&self.sequence_pid);
-        match step {
-            1 => {
-                seq.store(2, Ordering::SeqCst);
-                shell_tool_stream("bash".to_string(), "sleep 60 & echo $!".to_string())
-            }
-            2 => {
-                // Parse PID from the tool result (first token on first non-empty line).
-                let pid: u32 = tool_result
-                    .lines()
-                    .find_map(|l| l.split_whitespace().next()?.parse().ok())
-                    .unwrap_or(0);
-                pid_store.store(pid, Ordering::SeqCst);
-                seq.store(3, Ordering::SeqCst);
-                shell_tool_stream("bash".to_string(), format!("ps -p {pid}"))
-            }
-            3 => {
-                let pid = pid_store.load(Ordering::SeqCst);
-                seq.store(4, Ordering::SeqCst);
-                shell_tool_stream("bash".to_string(), format!("kill {pid}"))
-            }
-            4 => {
-                let pid = pid_store.load(Ordering::SeqCst);
-                seq.store(5, Ordering::SeqCst);
-                shell_tool_stream("bash".to_string(), format!("ps -p {pid}"))
-            }
-            _ => {
-                // Sequence finished — emit a summary.
-                seq.store(0, Ordering::SeqCst);
-                pid_store.store(0, Ordering::SeqCst);
-                stream_owned(
-                    "Background-job sequence complete: started sleep 60, confirmed it was running, killed it, and confirmed it was gone.\n"
-                        .to_string(),
-                )
-            }
-        }
-    }
-
-    /// Drive the long-lines scripted sequence.
-    ///
-    /// Steps:
-    ///   1 → write_file with 10 very long lines (~200 chars each)
-    ///   2 → bash: grep for a pattern matching all lines
-    ///   3 → read_file the temp file
-    ///   4 → emit summary, reset to idle
-    fn advance_long_lines(&self, step: u8, _tool_result: &str) -> LlmStream {
-        let seq = Arc::clone(&self.long_lines_step);
-        let path_guard = Arc::clone(&self.long_lines_path);
-        match step {
-            1 => {
-                seq.store(2, Ordering::SeqCst);
-                let path = path_guard.lock().unwrap().clone();
-                long_lines_write_stream(path)
-            }
-            2 => {
-                seq.store(3, Ordering::SeqCst);
-                let path = path_guard.lock().unwrap().clone();
-                // grep for a pattern that matches every line (they all contain "the").
-                shell_tool_stream("bash".to_string(), format!("grep -n 'the' '{path}'"))
-            }
-            3 => {
-                seq.store(4, Ordering::SeqCst);
-                let path = path_guard.lock().unwrap().clone();
-                long_lines_read_stream(path)
-            }
-            _ => {
-                seq.store(0, Ordering::SeqCst);
-                stream_owned(
-                    "Long-lines sequence complete: wrote 10 very long lines, grepped them all, and read the file back.\n\
-                     Scroll up to verify the wrapped-line limit is enforced in both shell output (grep) and read_file output.\n"
-                        .to_string(),
-                )
-            }
-        }
-    }
-}
 
 impl super::LlmProvider for TestProvider {
     fn stream_chat(&self, messages: Vec<Message>, context: LlmRequestContext) -> LlmStream {
@@ -882,50 +88,11 @@ impl super::LlmProvider for TestProvider {
         _tools: Vec<ToolDefinition>,
         _context: LlmRequestContext,
     ) -> LlmStream {
-        // If a scripted sequence is in progress, advance it on every ToolResult.
+        // If the last message is a tool result, echo it back so the provider
+        // keeps working in a multi-turn agent loop.
         if let Some(last) = messages.last()
             && last.role == Role::ToolResult
         {
-            // Check write-edit sequence first.
-            let we_step = self.write_edit_step.load(Ordering::SeqCst);
-            if we_step == 1 {
-                self.write_edit_step.store(2, Ordering::SeqCst);
-                let path = self.write_edit_path.lock().unwrap().clone();
-                return write_edit_edit_stream(path);
-            }
-            if we_step == 2 {
-                // Edit result received — emit summary (after optional throbber delay).
-                self.write_edit_step.store(0, Ordering::SeqCst);
-                if self.write_edit_throbber.swap(false, Ordering::SeqCst) {
-                    return Box::pin(stream! {
-                        // Delay long enough for the edit_file result block to finish
-                        // rendering and the throbber to appear (240 ms idle threshold).
-                        sleep(Duration::from_secs(4)).await;
-                        let summary = "write-edit sequence complete: wrote the file and edited it with 6 lines of context on each side.\n\
-                                      (4 s delay inserted after edit to exercise throbber-after-shrink rendering.)\n";
-                        for word in summary.split_inclusive(' ').map(ToOwned::to_owned).collect::<Vec<_>>() {
-                            yield LlmEvent::Token { text: word, phase: AssistantPhase::Final };
-                        }
-                        yield LlmEvent::Done;
-                    });
-                }
-                return stream_owned(
-                    "write-edit sequence complete: wrote the file and edited it with 6 lines of context on each side.\n"
-                        .to_string(),
-                );
-            }
-
-            // Check long-lines sequence.
-            let ll_step = self.long_lines_step.load(Ordering::SeqCst);
-            if ll_step > 0 {
-                return self.advance_long_lines(ll_step, &last.content.clone());
-            }
-
-            let step = self.sequence_step.load(Ordering::SeqCst);
-            if step > 0 {
-                return self.advance_sequence(step, &last.content.clone());
-            }
-            // Not in a sequence — echo the result as before.
             let content = last.content.clone();
             let response = format!("Tool result:\n\n```\n{content}\n```\n");
             return stream_owned(response);
@@ -947,8 +114,6 @@ impl super::LlmProvider for TestProvider {
         match cmd.as_str() {
             "help" => stream_text(HELP_TEXT, None),
 
-            "markdown" => stream_text(MARKDOWN_FIXTURE, None),
-
             "echo" => {
                 let text = if rest.is_empty() {
                     "(nothing to echo)".to_string()
@@ -964,7 +129,6 @@ impl super::LlmProvider for TestProvider {
                 } else {
                     rest
                 };
-                // stream_owned with a per-word delay
                 Box::pin(stream! {
                     for word in text.split_inclusive(' ').map(ToOwned::to_owned).collect::<Vec<_>>() {
                         sleep(Duration::from_millis(150)).await;
@@ -977,51 +141,9 @@ impl super::LlmProvider for TestProvider {
                 })
             }
 
-            "thinking" => {
-                let answer = if rest.is_empty() {
-                    "Thinking complete.".to_string()
-                } else {
-                    rest
-                };
-                Box::pin(stream! {
-                    let thought = "Let me consider this carefully... The test provider is exercising the thinking UI path. This simulated chain-of-thought is intentionally verbose to give the UI something to render.";
-                    for chunk in thought.split_inclusive(' ') {
-                        yield LlmEvent::ThinkingToken(chunk.to_string());
-                    }
-                    for word in answer.split_inclusive(' ').map(ToOwned::to_owned).collect::<Vec<_>>() {
-                        yield LlmEvent::Token {
-                            text: word,
-                            phase: AssistantPhase::Final,
-                        };
-                    }
-                    yield LlmEvent::Done;
-                })
-            }
-
-            "status" => {
-                let msg = if rest.is_empty() {
-                    "Test status message".to_string()
-                } else {
-                    rest
-                };
-                Box::pin(stream! {
-                    yield LlmEvent::StatusUpdate(msg);
-                    let confirmation = "Status sent.\n";
-                    for word in confirmation.split_inclusive(' ') {
-                        yield LlmEvent::Token {
-                            text: word.to_string(),
-                            phase: AssistantPhase::Final,
-                        };
-                    }
-                    yield LlmEvent::Done;
-                })
-            }
-
-            "error" => Box::pin(stream! {
-                yield LlmEvent::Error(ProviderError::other("test", "test error triggered by 'error' command"));
-            }),
-
             "system" => {
+                // The key capability: surface the exact system prompt that is
+                // being sent to the model, verbatim, in a fenced code block.
                 let system_content = messages
                     .iter()
                     .find(|m| m.role == Role::System)
@@ -1031,217 +153,9 @@ impl super::LlmProvider for TestProvider {
                 stream_owned(response)
             }
 
-            "ask" => {
-                let question = if rest.is_empty() {
-                    ASK_QUESTION.to_string()
-                } else {
-                    rest
-                };
-                ask_user_stream(question, None, &["Option A", "Option B", "Option C"], true)
-            }
-
-            "ask-context" => {
-                let question = if rest.is_empty() {
-                    ASK_CONTEXT_QUESTION.to_string()
-                } else {
-                    rest
-                };
-                ask_user_stream(
-                    question,
-                    Some(ASK_CONTEXT),
-                    &["Quick pass", "Full pass", "Investigate further"],
-                    true,
-                )
-            }
-
-            "ask-type" => {
-                let question = if rest.is_empty() {
-                    ASK_TYPE_QUESTION.to_string()
-                } else {
-                    rest
-                };
-                ask_user_stream(question, None, &[], true)
-            }
-
-            "ask-notype" => {
-                let question = if rest.is_empty() {
-                    ASK_NOTYPE_QUESTION.to_string()
-                } else {
-                    rest
-                };
-                ask_user_stream(question, None, &["Choice 1", "Choice 2", "Choice 3"], false)
-            }
-
-            "stream-ask" => {
-                let question = if rest.is_empty() {
-                    ASK_QUESTION.to_string()
-                } else {
-                    rest
-                };
-                streaming_ask_stream(question, None)
-            }
-
-            "stream-ask-context" => {
-                let question = if rest.is_empty() {
-                    ASK_CONTEXT_QUESTION.to_string()
-                } else {
-                    rest
-                };
-                streaming_ask_context_stream(question)
-            }
-
-            "stream-ask-type" => {
-                let question = if rest.is_empty() {
-                    ASK_TYPE_QUESTION.to_string()
-                } else {
-                    rest
-                };
-                streaming_ask_type_stream(question)
-            }
-
-            "stream-ask-notype" => {
-                let question = if rest.is_empty() {
-                    ASK_NOTYPE_QUESTION.to_string()
-                } else {
-                    rest
-                };
-                streaming_ask_notype_stream(question)
-            }
-
-            "bash" => {
-                let command = if rest.is_empty() {
-                    "echo 'hello from test provider'".to_string()
-                } else {
-                    rest
-                };
-                shell_tool_stream("bash".to_string(), command)
-            }
-
-            "powershell" => {
-                let command = if rest.is_empty() {
-                    "Write-Host 'hello from test provider'".to_string()
-                } else {
-                    rest
-                };
-                shell_tool_stream("powershell".to_string(), command)
-            }
-
-            "cmd" => {
-                let command = if rest.is_empty() {
-                    "echo hello from test provider".to_string()
-                } else {
-                    rest
-                };
-                shell_tool_stream("cmd".to_string(), command)
-            }
-
-            "exec" => exec_tool_stream(rest),
-
-            "emoji" => stream_text(EMOJI_FIXTURE, None),
-
-            "bash-background-job" => {
-                self.sequence_step.store(1, Ordering::SeqCst);
-                self.advance_sequence(1, "")
-            }
-
-            "stream-bash" => streaming_bash_stream(),
-
-            "stream-python" => streaming_python_stream(),
-
-            "python-program" => streaming_python_program_stream(),
-
-            "run_python" => python_stream(),
-
-            "write" => write_file_stream(),
-
-            "write-edit" => {
-                // Generate a random temp file path, store it, then stream write_file.
-                let fname = format!(
-                    "xi-test-write-edit-{}.txt",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.subsec_nanos())
-                        .unwrap_or(0)
-                );
-                let path = std::env::temp_dir()
-                    .join(fname)
-                    .to_string_lossy()
-                    .into_owned();
-                *self.write_edit_path.lock().unwrap() = path.clone();
-                self.write_edit_step.store(1, Ordering::SeqCst);
-                write_edit_write_stream(path)
-            }
-
-            "write-edit-throbber" => {
-                // Same as write-edit but inserts a 4 s delay after the edit
-                // result so the throbber appears while the bottom gap is visible.
-                self.write_edit_throbber.store(true, Ordering::SeqCst);
-                let fname = format!(
-                    "xi-test-write-edit-throbber-{}.txt",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.subsec_nanos())
-                        .unwrap_or(0)
-                );
-                let path = std::env::temp_dir()
-                    .join(fname)
-                    .to_string_lossy()
-                    .into_owned();
-                *self.write_edit_path.lock().unwrap() = path.clone();
-                self.write_edit_step.store(1, Ordering::SeqCst);
-                write_edit_write_stream(path)
-            }
-
-            "long-lines" => {
-                // 3-step sequence: write 10 very long lines, grep all, read back.
-                let fname = format!(
-                    "xi-test-long-lines-{}.txt",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.subsec_nanos())
-                        .unwrap_or(0)
-                );
-                let path = std::env::temp_dir()
-                    .join(fname)
-                    .to_string_lossy()
-                    .into_owned();
-                *self.long_lines_path.lock().unwrap() = path.clone();
-                self.long_lines_step.store(1, Ordering::SeqCst);
-                self.advance_long_lines(1, "")
-            }
-
-            "read" => read_file_stream(READ_SHORT_FIXTURE),
-
-            "read-long" => read_file_stream(READ_LONG_FIXTURE),
-
-            "find" => find_files_stream(),
-
-            "read-skill" => {
-                let name = if rest.is_empty() {
-                    "edit_skill".to_string()
-                } else {
-                    rest
-                };
-                read_skill_stream(name)
-            }
-
-            "edit" => {
-                // Short edit: both sides within the 4-line diff limit.
-                let old = "Hello from the xi-agent test provider\n".to_string();
-                let new = "Hello from the xi-agent test provider — edited!\n".to_string();
-                edit_file_stream(old, new)
-            }
-
-            "edit-long" => {
-                // Long edit: 6 lines per side to exercise per-side truncation.
-                let old =
-                    "old line 1\nold line 2\nold line 3\nold line 4\nold line 5\nold line 6\n"
-                        .to_string();
-                let new =
-                    "new line 1\nnew line 2\nnew line 3\nnew line 4\nnew line 5\nnew line 6\n"
-                        .to_string();
-                edit_file_stream(old, new)
-            }
+            "error" => Box::pin(stream! {
+                yield LlmEvent::Error(ProviderError::other("test", "test error triggered by 'error' command"));
+            }),
 
             "" => stream_text("Type 'help' for a list of test provider commands.\n", None),
 
@@ -1264,33 +178,50 @@ mod tests {
     use futures_util::StreamExt;
 
     #[tokio::test]
-    async fn ask_context_command_emits_context_argument() {
+    async fn system_command_returns_exact_system_prompt() {
         let provider = TestProvider::new();
         let events: Vec<LlmEvent> = provider
             .stream_chat(
-                vec![Message::user("ask-context")],
+                vec![Message::system("YOU ARE RI."), Message::user("system")],
                 LlmRequestContext::default(),
             )
             .collect()
             .await;
 
-        let tool_call = events
+        let text: String = events
             .iter()
-            .find_map(|event| match event {
-                LlmEvent::ToolCall { name, args, .. } if name == "ask_user" => Some(args),
+            .filter_map(|e| match e {
+                LlmEvent::Token { text, .. } => Some(text.as_str()),
                 _ => None,
             })
-            .expect("expected ask_user tool call");
+            .collect();
 
-        assert_eq!(
-            tool_call.get("context").and_then(serde_json::Value::as_str),
-            Some(ASK_CONTEXT)
+        assert!(text.contains("System prompt:"), "{text}");
+        assert!(
+            text.contains("YOU ARE RI."),
+            "system prompt not echoed: {text}"
         );
-        assert_eq!(
-            tool_call
-                .get("question")
-                .and_then(serde_json::Value::as_str),
-            Some(ASK_CONTEXT_QUESTION)
-        );
+    }
+
+    #[tokio::test]
+    async fn unknown_command_returns_hint() {
+        let provider = TestProvider::new();
+        let events: Vec<LlmEvent> = provider
+            .stream_chat(
+                vec![Message::user("does-not-exist")],
+                LlmRequestContext::default(),
+            )
+            .collect()
+            .await;
+
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                LlmEvent::Token { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(text.contains("Unknown command"), "{text}");
     }
 }
