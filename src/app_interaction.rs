@@ -240,7 +240,7 @@ impl App {
     fn api_type_detail(api: &ApiType) -> &'static str {
         match api {
             ApiType::OpenAiResponses => {
-                "OpenAI's newer protocol (/v1/responses) — only api.openai.com"
+                "OpenAI's newer protocol (/v1/responses) — OpenAI's own API mostly; servers without sequence_number stream nothing (then use OpenAI Completions)"
             }
             ApiType::OpenAiCompatible => {
                 "Chat Completions (/v1/chat/completions) — works on any OpenAI-compatible server"

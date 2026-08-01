@@ -673,4 +673,126 @@ mod tests {
         assert_eq!(err.kind, ProviderErrorKind::Unauthorized);
         assert_eq!(err.status_code, Some(401));
     }
+
+    #[tokio::test]
+    async fn responses_stream_yields_text_tokens_with_sequence_numbers() {
+        use futures_util::StreamExt;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        // OpenAI's real /responses stream includes sequence_number on every
+        // event; rig requires it on each chunk.
+        let sse = r#"data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress"},"sequence_number":0}
+
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"msg_1","role":"assistant","type":"message","status":"in_progress","content":[]}}
+
+data: {"type":"response.content_part.added","sequence_number":2,"output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}
+
+data: {"type":"response.output_text.delta","sequence_number":3,"output_index":0,"content_index":0,"delta":"merha"}
+
+data: {"type":"response.output_text.delta","sequence_number":4,"output_index":0,"content_index":0,"delta":"ba"}
+
+data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_1","object":"response","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6},"output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"merhaba","annotations":[]}]}]}}
+
+data: [DONE]
+
+"#;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = RigOpenAiProvider::new(
+            RigOpenAiApi::Responses,
+            format!("{}/v1", server.uri()),
+            "main",
+            "test",
+        )
+        .unwrap();
+        let mut stream = provider.stream_chat_with_tools(
+            vec![Message::user("naber")],
+            vec![],
+            LlmRequestContext {},
+        );
+        let mut tokens = Vec::new();
+        let mut done = false;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                LlmEvent::Token { text, .. } => tokens.push(text),
+                LlmEvent::Done => {
+                    done = true;
+                    break;
+                }
+                LlmEvent::Error(e) => eprintln!("EVENT ERROR: {:?} | {}", e.kind, e.message),
+                _ => {}
+            }
+        }
+        assert!(done, "expected Done");
+        assert_eq!(tokens.join(""), "merhaba");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_stream_yields_text_tokens() {
+        use futures_util::StreamExt;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        // llama.cpp / OpenAI-compatible chat-completions SSE (the format most
+        // third-party servers speak).
+        let sse = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"main","choices":[{"index":0,"delta":{"content":"merha"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"main","choices":[{"index":0,"delta":{"content":"ba"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"main","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = RigOpenAiProvider::new(
+            RigOpenAiApi::Completions,
+            format!("{}/v1", server.uri()),
+            "main",
+            "test",
+        )
+        .unwrap();
+        let mut stream = provider.stream_chat_with_tools(
+            vec![Message::user("naber")],
+            vec![],
+            LlmRequestContext {},
+        );
+        let mut tokens = Vec::new();
+        let mut done = false;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                LlmEvent::Token { text, .. } => tokens.push(text),
+                LlmEvent::Done => {
+                    done = true;
+                    break;
+                }
+                LlmEvent::Error(e) => eprintln!("EVENT ERROR: {:?} | {}", e.kind, e.message),
+                _ => {}
+            }
+        }
+        assert!(done, "expected Done");
+        assert_eq!(tokens.join(""), "merhaba");
+    }
 }
