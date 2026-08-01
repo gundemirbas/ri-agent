@@ -23,7 +23,7 @@ impl ApiType {
     pub fn label(&self) -> &'static str {
         match self {
             Self::OpenAiResponses => "OpenAI Responses",
-            Self::OpenAiCompatible => "OpenAI-compatible",
+            Self::OpenAiCompatible => "OpenAI Completions",
             Self::Test => "Test",
         }
     }

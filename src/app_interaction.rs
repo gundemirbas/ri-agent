@@ -161,8 +161,8 @@ impl App {
             .map(|p| CompletionItem::from_provider(&p.id, &p.label()))
             .collect();
         items.push(CompletionItem {
-            label: "+ Add OpenAI-compatible provider…".to_string(),
-            detail: "Endpoint URL, API key, API type".to_string(),
+            label: "+ Add OpenAI provider…".to_string(),
+            detail: "Endpoint URL, API key, chat completions or responses".to_string(),
             complete_to: "/provider_add".to_string(),
             loading: false,
             error: false,
@@ -236,6 +236,19 @@ impl App {
         }
     }
 
+    /// One-line explanation for an API-type picker option.
+    fn api_type_detail(api: &ApiType) -> &'static str {
+        match api {
+            ApiType::OpenAiResponses => {
+                "OpenAI's newer protocol (/v1/responses) — only api.openai.com"
+            }
+            ApiType::OpenAiCompatible => {
+                "Chat Completions (/v1/chat/completions) — works on any OpenAI-compatible server"
+            }
+            ApiType::Test => "internal test API",
+        }
+    }
+
     /// Show the API-type menu for the pending provider instance.
     pub fn enter_provider_api_type_selection_mode(&mut self, backend_preset: &BackendPreset) {
         self.reset_textarea();
@@ -246,7 +259,7 @@ impl App {
             .iter()
             .map(|api| CompletionItem {
                 label: api.label().to_string(),
-                detail: String::new(),
+                detail: Self::api_type_detail(api).to_string(),
                 complete_to: format!("/provider_api {}", api.label()),
                 loading: false,
                 error: false,
