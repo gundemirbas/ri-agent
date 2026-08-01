@@ -155,7 +155,6 @@ pub mod custom;
 pub mod edit;
 pub mod exec;
 pub mod find;
-pub mod python;
 pub mod read;
 pub mod read_skill;
 pub mod subprocess;
@@ -169,7 +168,6 @@ use bash::BashTool;
 use edit::EditTool;
 use exec::ExecTool;
 use find::FindTool;
-use python::PythonTool;
 use read::ReadFileTool;
 use read_skill::ReadSkillTool;
 use write::WriteTool;
@@ -202,11 +200,6 @@ pub async fn register_builtin_tools(
 
     tools.push(Arc::new(BashTool));
     tools.push(Arc::new(ExecTool));
-
-    // Detect and register the Python tool if a suitable runtime is available.
-    if let Some(runtime) = python::detect_python().await {
-        tools.push(Arc::new(PythonTool::new(runtime)));
-    }
 
     for tool in tools {
         registry.insert(tool.name().to_string(), tool);

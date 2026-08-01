@@ -1124,16 +1124,6 @@ fn default_tools_map() -> HashMap<String, ToolTheme> {
     // executing group
     map.insert("executing".to_string(), default_tool_executing());
 
-    // python — unique headline color to distinguish source code from shell commands
-    let mut python = default_tool_executing();
-    python.headline = StyleSpec {
-        fg: Some(Color::Rgb(130, 150, 210)),
-        bold: Some(true),
-        ..Default::default()
-    };
-    // body inherits from executing group (same as bash/exec program output)
-    map.insert("run_python".to_string(), python);
-
     // individual file tools
     let mut read = default_tool_file();
     read.prefix = PrefixStyle {
@@ -1201,9 +1191,9 @@ fn default_tools_map() -> HashMap<String, ToolTheme> {
 
 /// Resolution order for tool theme lookup:
 /// 1. Named tool entry (e.g. `tools["bash"]`)
-/// 2. `tools["executing"]` — for bash, exec, cmd, powershell
+/// 2. `tools["executing"]` — for bash, exec
 /// 3. `tools["default"]`
-const EXECUTING_TOOLS: &[&str] = &["bash", "exec", "cmd", "powershell", "run_python"];
+const EXECUTING_TOOLS: &[&str] = &["bash", "exec"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolsTheme(#[serde(default = "default_tools_map")] pub HashMap<String, ToolTheme>);

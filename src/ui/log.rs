@@ -699,11 +699,8 @@ fn render_tool_result(
         return;
     }
 
-    // bash / cmd / powershell / exec / python: tail-truncated.
-    if matches!(
-        prev_name,
-        "bash" | "cmd" | "powershell" | "exec" | "run_python"
-    ) {
+    // bash / exec: tail-truncated.
+    if matches!(prev_name, "bash" | "exec") {
         let color = if msg.is_error {
             theme.log.diff.removed.fg.unwrap_or(Color::LightRed)
         } else {
@@ -1927,51 +1924,6 @@ mod tests {
         assert!(
             body.last().unwrap().contains("20"),
             "expected last line to be 20"
-        );
-    }
-
-    // ── python result tail truncation ──────────────────────────────────────────
-
-    #[test]
-    fn python_result_tail_truncated() {
-        let call = Message::tool_call(
-            "c1",
-            "run_python",
-            serde_json::json!({"script": "for i in range(1, 21): print(i)"}),
-        );
-        let content = (1..=20)
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let result = Message::tool_result("c1", &content, false);
-        let (lines, _sources) = build_log_lines(
-            &[call, result],
-            false,
-            120,
-            &cfg(),
-            &crate::theme::Theme::default(),
-            &crate::config::DisplayConfig::default(),
-        );
-        let text: Vec<String> = lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect();
-        // Body starts after the headline line.
-        let body: Vec<&String> = text.iter().skip(1).collect();
-        assert!(
-            body[0].contains("20 total lines"),
-            "expected tail-truncated marker first, got: {}",
-            body[0]
-        );
-        assert!(
-            body.last().unwrap().contains("20"),
-            "expected last visible line to be 20, got: {}",
-            body.last().unwrap()
         );
     }
 
