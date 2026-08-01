@@ -10,7 +10,7 @@
 use async_stream::stream;
 use futures_util::StreamExt;
 use rig_core::OneOrMany;
-use rig_core::client::CompletionClient;
+use rig_core::client::{CompletionClient, ModelListingClient};
 use rig_core::completion::request::Usage as RigUsage;
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
@@ -19,6 +19,7 @@ use rig_core::completion::{
 use rig_core::http_client::HeaderMap;
 use rig_core::message as rig_message;
 use rig_core::message::Message as RigMessage;
+use rig_core::model::ModelListingError;
 use rig_core::providers::openai::{Client as ResponsesClient, CompletionsClient};
 use rig_core::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 
@@ -29,6 +30,7 @@ use crate::llm::{ProviderError, ProviderErrorKind};
 use crate::provider_instance::ensure_v1_prefix;
 
 /// Which OpenAI wire protocol this provider uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RigOpenAiApi {
     /// OpenAI Responses API (`/v1/responses`).
     Responses,
@@ -256,7 +258,32 @@ pub(crate) fn to_rig_messages(messages: &[Message]) -> Vec<RigMessage> {
                     .tool_call_id
                     .clone()
                     .unwrap_or_else(|| format!("call_{}", out.len()));
-                out.push(RigMessage::tool_result(id, msg.content.clone()));
+                let mut tr_content = Vec::new();
+                let mut pushed_image = false;
+                if let Some(img) = &msg.image_data
+                    && let Some(media_type) = to_image_media_type(&img.mime_type)
+                {
+                    tr_content.push(rig_message::ToolResultContent::image_base64(
+                        img.base64.clone(),
+                        Some(media_type),
+                        None,
+                    ));
+                    pushed_image = true;
+                }
+                // When a binary image was attached and encoded, send it instead
+                // of the `[image]` text placeholder so vision-capable models get
+                // the real pixels via rig's `ToolResultContent::Image`.
+                if !pushed_image && !msg.content.is_empty() {
+                    tr_content.push(rig_message::ToolResultContent::text(msg.content.clone()));
+                }
+                out.push(RigMessage::User {
+                    content: OneOrMany::one(rig_message::UserContent::tool_result(
+                        id,
+                        OneOrMany::from_iter_optional(tr_content).unwrap_or_else(|| {
+                            OneOrMany::one(rig_message::ToolResultContent::text(""))
+                        }),
+                    )),
+                });
                 i += 1;
             }
         }
@@ -274,6 +301,21 @@ pub(crate) fn to_rig_tools(tools: &[ToolDefinition]) -> Vec<RigToolDefinition> {
             parameters: t.parameters.clone(),
         })
         .collect()
+}
+
+/// Map a ri-agent image MIME type onto rig's [`ImageMediaType`]
+/// (`rig_message::ImageMediaType`), returning `None` for unsupported types.
+fn to_image_media_type(mime: &str) -> Option<rig_message::ImageMediaType> {
+    match mime {
+        "image/jpeg" => Some(rig_message::ImageMediaType::JPEG),
+        "image/png" => Some(rig_message::ImageMediaType::PNG),
+        "image/gif" => Some(rig_message::ImageMediaType::GIF),
+        "image/webp" => Some(rig_message::ImageMediaType::WEBP),
+        "image/heic" => Some(rig_message::ImageMediaType::HEIC),
+        "image/heif" => Some(rig_message::ImageMediaType::HEIF),
+        "image/svg+xml" => Some(rig_message::ImageMediaType::SVG),
+        _ => None,
+    }
 }
 
 /// Map rig token usage onto ri-agent [`UsageStats`].
@@ -323,6 +365,46 @@ fn provider_error_for_status(status: u16, message: String) -> ProviderError {
         500..=599 => ProviderError::server_error("openai", status, message),
         other => ProviderError::new(ProviderErrorKind::Other, Some(other), "openai", message),
     }
+}
+
+/// Map a rig [`ModelListingError`] onto a ri-agent [`ProviderError`].
+fn listing_to_provider_error(e: ModelListingError) -> ProviderError {
+    match e {
+        ModelListingError::ApiError {
+            status_code,
+            message,
+        } => provider_error_for_status(status_code, message),
+        ModelListingError::AuthError { message } => ProviderError::unauthorized("openai", message),
+        ModelListingError::RateLimitError { message } => {
+            ProviderError::rate_limited("openai", message)
+        }
+        ModelListingError::ServiceUnavailable { message } => {
+            ProviderError::server_error("openai", 503, message)
+        }
+        // rig's http layer short-circuits non-2xx responses into a transport
+        // error that lands here as `RequestError`; the status code is still
+        // embedded in the message, so recover it to keep auth/rate-limit/serve
+        // failures typed. Status-less entries are genuinely transport errors.
+        ModelListingError::RequestError { message } => match listing_message_status(&message) {
+            Some(status) => provider_error_for_status(status, message),
+            None => ProviderError::network("openai", message),
+        },
+        ModelListingError::ParseError { message } | ModelListingError::UnknownError { message } => {
+            ProviderError::other("openai", message)
+        }
+    }
+}
+
+/// Extract an HTTP status code from rig's `InvalidStatusCode*` transport
+/// message format — the only typed signal rig preserves for non-2xx responses.
+fn listing_message_status(message: &str) -> Option<u16> {
+    let rest = message.strip_prefix("Invalid status code")?;
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 // ── LlmProvider impl ──────────────────────────────────────────────────────────
@@ -409,6 +491,159 @@ fn map_stream_item<R: GetTokenUsage>(
     (events, usage)
 }
 
+// ── Streaming driver (shared by both wire protocols) ─────────────────────────
+
+/// Build a `CompletionRequest` from the prepared rig messages/tools plus the
+/// protocol-specific `additional_params` (e.g. the reasoning-effort encoding).
+fn full_completion_request(
+    messages: &[RigMessage],
+    tools: &[RigToolDefinition],
+    additional_params: Option<serde_json::Value>,
+) -> CompletionRequest {
+    CompletionRequest {
+        model: None,
+        preamble: None,
+        chat_history: OneOrMany::from_iter_optional(messages.to_vec())
+            .unwrap_or_else(|| OneOrMany::one(RigMessage::user(""))),
+        documents: vec![],
+        tools: tools.to_vec(),
+        temperature: None,
+        max_tokens: None,
+        tool_choice: None,
+        additional_params,
+        output_schema: None,
+        record_telemetry_content: false,
+    }
+}
+
+/// Single shared streaming driver used by both the Responses and Chat
+/// Completions backends.
+///
+/// `C` is the concrete rig client (`ResponsesClient` or `CompletionsClient`).
+/// `make_request` builds the protocol-specific [`CompletionRequest`] (including
+/// its reasoning-effort `additional_params` shape) and `rebuild` recreates a
+/// fully configured client of the same type against the alternate base URL, so
+/// a pre-content 404 transparently falls back to a pathless (`/v1`-less)
+/// endpoint without tearing the stream down.
+fn stream_with_retry<C, MakeReq, Rebuild>(
+    mut client: C,
+    model_name: String,
+    make_request: MakeReq,
+    rebuild: Rebuild,
+) -> LlmStream
+where
+    C: CompletionClient + Clone + Send + 'static,
+    C::CompletionModel: CompletionModel<Client = C> + Send,
+    <<C as CompletionClient>::CompletionModel as CompletionModel>::StreamingResponse:
+        Clone + Send + Unpin + GetTokenUsage + 'static,
+    MakeReq: Fn() -> CompletionRequest + Send + 'static,
+    Rebuild: Fn() -> anyhow::Result<C> + Send + 'static,
+{
+    Box::pin(stream! {
+        let mut retried = false;
+        let mut emitted = false;
+        let mut latest_usage: Option<UsageStats> = None;
+
+        'stream: loop {
+            let model = client.completion_model(model_name.clone());
+            let mut stream = match model.stream(make_request()).await {
+                Ok(s) => s,
+                Err(e) if !retried && is_not_found(&e) => {
+                    if let Ok(c) = rebuild() {
+                        client = c;
+                        retried = true;
+                        continue 'stream;
+                    }
+                    yield LlmEvent::Error(to_provider_error(e));
+                    return;
+                }
+                Err(e) => {
+                    yield LlmEvent::Error(to_provider_error(e));
+                    return;
+                }
+            };
+
+            let mut phase = StreamPhase::Idle;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(item) => {
+                        emitted = true;
+                        let (events, usage) = map_stream_item(item, &mut phase);
+                        latest_usage = usage.or(latest_usage);
+                        for ev in events {
+                            yield ev;
+                        }
+                    }
+                    Err(e) if !retried && !emitted && is_not_found(&e) => {
+                        if let Ok(c) = rebuild() {
+                            client = c;
+                            retried = true;
+                            continue 'stream;
+                        }
+                        yield LlmEvent::Error(to_provider_error(e));
+                        return;
+                    }
+                    Err(e) => {
+                        yield LlmEvent::Error(to_provider_error(e));
+                        return;
+                    }
+                }
+            }
+            break 'stream;
+        }
+
+        if let Some(usage) = latest_usage {
+            yield LlmEvent::Usage(usage);
+        }
+        yield LlmEvent::Done;
+    })
+}
+
+// ── Model listing via rig ─────────────────────────────────────────────────────
+
+/// Which OpenAI wire protocol a rig client speaks.
+fn client_protocol(client: &RigClient) -> RigOpenAiApi {
+    match client {
+        RigClient::Responses(_) => RigOpenAiApi::Responses,
+        RigClient::Completions(_) => RigOpenAiApi::Completions,
+    }
+}
+
+/// Rebuild a rig client of the same protocol against a different base URL
+/// (used to retry the alternate `/v1`/pathless endpoint).
+fn rebuild_client(
+    api_type: RigOpenAiApi,
+    base_url: &str,
+    api_key: &str,
+    headers: &[(String, String)],
+) -> anyhow::Result<RigClient> {
+    let map = header_map_from_pairs(headers.to_vec());
+    match api_type {
+        RigOpenAiApi::Responses => Ok(RigClient::Responses(build_responses_client(
+            base_url, api_key, map,
+        )?)),
+        RigOpenAiApi::Completions => Ok(RigClient::Completions(build_completions_client(
+            base_url, api_key, map,
+        )?)),
+    }
+}
+
+/// Fetch the model list through rig's `ModelListingClient` (`GET /models`),
+/// reduced to the model ids.
+///
+/// rig wires `ModelListingClient` only to the Responses client type; the
+/// Completions client converts to it via [`CompletionsClient::responses_api`]
+/// (same base URL and auth) because `/models` is protocol-independent.
+async fn list_models_once(client: &RigClient) -> Result<Vec<String>, ProviderError> {
+    let result = match client {
+        RigClient::Responses(c) => c.list_models().await,
+        RigClient::Completions(c) => c.clone().responses_api().list_models().await,
+    };
+    result
+        .map(|list| list.into_iter().map(|m| m.id).collect())
+        .map_err(listing_to_provider_error)
+}
+
 impl super::LlmProvider for RigOpenAiProvider {
     fn stream(&self, messages: Vec<Message>, tools: Vec<ToolDefinition>) -> LlmStream {
         let client = self.client.clone();
@@ -420,202 +655,87 @@ impl super::LlmProvider for RigOpenAiProvider {
         let rig_messages = to_rig_messages(&messages);
         let rig_tools = to_rig_tools(&tools);
 
-        let openai_completion_request = move || CompletionRequest {
-            model: None,
-            preamble: None,
-            chat_history: OneOrMany::from_iter_optional(rig_messages.clone())
-                .unwrap_or_else(|| OneOrMany::one(RigMessage::user(""))),
-            documents: vec![],
-            tools: rig_tools.clone(),
-            temperature: None,
-            max_tokens: None,
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-            record_telemetry_content: false,
-        };
-
         match client {
-            RigClient::Responses(client) => Box::pin(stream! {
-                let mut client = client;
-                let mut retried = false;
-                let mut emitted = false;
-                let mut latest_usage: Option<UsageStats> = None;
-
-                'stream: loop {
-                    let model = client.completion_model(model_name.clone());
-                    // Responses API carries reasoning effort as `reasoning.effort`.
-                    let mut request = openai_completion_request();
-                    request.additional_params = reasoning_effort
-                        .map(|e| serde_json::json!({ "reasoning": { "effort": e } }));
-                    let mut stream = match model.stream(request).await {
-                        Ok(s) => s,
-                        Err(e) if !retried && is_not_found(&e) => {
-                            if let Some(alt) = alternate_base_url.clone()
-                                && let Ok(c) = build_responses_client(&alt, &api_key, header_map_from_pairs(headers.clone()))
-                            {
-                                client = c;
-                                retried = true;
-                                continue 'stream;
-                            }
-                            yield LlmEvent::Error(to_provider_error(e));
-                            return;
-                        }
-                        Err(e) => {
-                            yield LlmEvent::Error(to_provider_error(e));
-                            return;
-                        }
-                    };
-
-                    let mut phase = StreamPhase::Idle;
-                    while let Some(item) = stream.next().await {
-                        match item {
-                            Ok(item) => {
-                                emitted = true;
-                                let (events, usage) = map_stream_item(item, &mut phase);
-                                latest_usage = usage.or(latest_usage);
-                                for ev in events {
-                                    yield ev;
-                                }
-                            }
-                            Err(e) if !retried && !emitted && is_not_found(&e) => {
-                                if let Some(alt) = alternate_base_url.clone()
-                                    && let Ok(c) = build_responses_client(&alt, &api_key, header_map_from_pairs(headers.clone()))
-                                {
-                                    client = c;
-                                    retried = true;
-                                    continue 'stream;
-                                }
-                                yield LlmEvent::Error(to_provider_error(e));
-                                return;
-                            }
-                            Err(e) => {
-                                yield LlmEvent::Error(to_provider_error(e));
-                                return;
-                            }
-                        }
+            RigClient::Responses(rc) => {
+                // Responses API carries reasoning effort as `reasoning.effort`.
+                let make_request = {
+                    let messages = rig_messages.clone();
+                    let tools = rig_tools.clone();
+                    move || {
+                        let additional = reasoning_effort
+                            .map(|e| serde_json::json!({ "reasoning": { "effort": e } }));
+                        full_completion_request(&messages, &tools, additional)
                     }
-                    break 'stream;
-                }
-
-                if let Some(usage) = latest_usage {
-                    yield LlmEvent::Usage(usage);
-                }
-                yield LlmEvent::Done;
-            }),
-            RigClient::Completions(client) => Box::pin(stream! {
-                let mut client = client;
-                let mut retried = false;
-                let mut emitted = false;
-                let mut latest_usage: Option<UsageStats> = None;
-
-                'stream: loop {
-                    let model = client.completion_model(model_name.clone());
-                    // Chat Completions sends reasoning effort as a top-level param.
-                    let mut request = openai_completion_request();
-                    request.additional_params = reasoning_effort
-                        .map(|e| serde_json::json!({ "reasoning_effort": e }));
-                    let mut stream = match model.stream(request).await {
-                        Ok(s) => s,
-                        Err(e) if !retried && is_not_found(&e) => {
-                            if let Some(alt) = alternate_base_url.clone()
-                                && let Ok(c) = build_completions_client(&alt, &api_key, header_map_from_pairs(headers.clone()))
-                            {
-                                client = c;
-                                retried = true;
-                                continue 'stream;
-                            }
-                            yield LlmEvent::Error(to_provider_error(e));
-                            return;
-                        }
-                        Err(e) => {
-                            yield LlmEvent::Error(to_provider_error(e));
-                            return;
-                        }
-                    };
-
-                    let mut phase = StreamPhase::Idle;
-                    while let Some(item) = stream.next().await {
-                        match item {
-                            Ok(item) => {
-                                emitted = true;
-                                let (events, usage) = map_stream_item(item, &mut phase);
-                                latest_usage = usage.or(latest_usage);
-                                for ev in events {
-                                    yield ev;
-                                }
-                            }
-                            Err(e) if !retried && !emitted && is_not_found(&e) => {
-                                if let Some(alt) = alternate_base_url.clone()
-                                    && let Ok(c) = build_completions_client(&alt, &api_key, header_map_from_pairs(headers.clone()))
-                                {
-                                    client = c;
-                                    retried = true;
-                                    continue 'stream;
-                                }
-                                yield LlmEvent::Error(to_provider_error(e));
-                                return;
-                            }
-                            Err(e) => {
-                                yield LlmEvent::Error(to_provider_error(e));
-                                return;
-                            }
-                        }
+                };
+                let rebuild = {
+                    let alt = alternate_base_url.clone();
+                    let key = api_key.clone();
+                    let headers = headers.clone();
+                    move || {
+                        build_responses_client(
+                            alt.as_deref()
+                                .ok_or_else(|| anyhow::anyhow!("no alternate base URL"))?,
+                            &key,
+                            header_map_from_pairs(headers.clone()),
+                        )
                     }
-                    break 'stream;
-                }
-
-                if let Some(usage) = latest_usage {
-                    yield LlmEvent::Usage(usage);
-                }
-                yield LlmEvent::Done;
-            }),
+                };
+                stream_with_retry(rc, model_name.clone(), make_request, rebuild)
+            }
+            RigClient::Completions(cc) => {
+                // Chat Completions sends reasoning effort as a top-level param.
+                let make_request = {
+                    let messages = rig_messages.clone();
+                    let tools = rig_tools.clone();
+                    move || {
+                        let additional =
+                            reasoning_effort.map(|e| serde_json::json!({ "reasoning_effort": e }));
+                        full_completion_request(&messages, &tools, additional)
+                    }
+                };
+                let rebuild = {
+                    let alt = alternate_base_url.clone();
+                    let key = api_key.clone();
+                    let headers = headers.clone();
+                    move || {
+                        build_completions_client(
+                            alt.as_deref()
+                                .ok_or_else(|| anyhow::anyhow!("no alternate base URL"))?,
+                            &key,
+                            header_map_from_pairs(headers.clone()),
+                        )
+                    }
+                };
+                stream_with_retry(cc, model_name, make_request, rebuild)
+            }
         }
     }
 
     fn list_models(&self) -> ModelListFuture {
-        let mut endpoints = vec![format!("{}/models", self.base_url)];
-        if let Some(alt) = &self.alternate_base_url {
-            let alt = format!("{alt}/models");
-            if !endpoints.contains(&alt) {
-                endpoints.push(alt);
-            }
-        }
+        let api_type = client_protocol(&self.client);
+        let base_url = self.base_url.clone();
+        let alternate_base_url = self.alternate_base_url.clone();
         let api_key = self.api_key.clone();
+        let headers = self.headers.clone();
         Box::pin(async move {
-            let client = reqwest::Client::new();
-            let mut last_error: Option<ProviderError> = None;
-            for url in endpoints {
-                let response = match client.get(&url).bearer_auth(&api_key).send().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        last_error = Some(ProviderError::network("openai", e.to_string()));
-                        continue;
-                    }
-                };
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                if !(200..300).contains(&status) {
-                    last_error = Some(provider_error_for_status(status, body));
-                    // On 404 the `/v1` variant may be the wrong one — try the
-                    // alternate endpoint before giving up.
-                    continue;
-                }
-                let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-                    ProviderError::other("openai", format!("failed to parse /models: {e}"))
-                })?;
-                let ids = value["data"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| m["id"].as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                return Ok(ids);
+            // Primary (normalized `/v1`) base URL first.
+            let primary = match rebuild_client(api_type, &base_url, &api_key, &headers) {
+                Ok(c) => list_models_once(&c).await,
+                Err(e) => Err(ProviderError::other("openai", e.to_string())),
+            };
+            if let Ok(models) = primary {
+                return Ok(models);
             }
-            Err(last_error
-                .unwrap_or_else(|| ProviderError::other("openai", "no model endpoint responded")))
+
+            // On a provider error the `/v1` variant may be the wrong one — try
+            // the alternate endpoint before giving up.
+            if let Some(alt) = &alternate_base_url
+                && let Ok(alt_client) = rebuild_client(api_type, alt, &api_key, &headers)
+            {
+                return list_models_once(&alt_client).await;
+            }
+
+            Err(primary.expect_err("primary succeeded above"))
         })
     }
 }
@@ -709,6 +829,65 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_with_image_maps_to_image_content() {
+        let msg = Message::tool_result("call_1", "[image]", false).with_image_data(
+            crate::llm::ImageData {
+                base64: "aW1n".to_string(),
+                mime_type: "image/png".to_string(),
+            },
+        );
+        let rig = to_rig_messages(&[msg]);
+        assert_eq!(rig.len(), 1);
+        match &rig[0] {
+            RigMessage::User { content } => {
+                let parts: Vec<_> = content.clone().into_iter().collect();
+                assert_eq!(parts.len(), 1, "image replaces the [image] placeholder");
+                match &parts[0] {
+                    rig_message::UserContent::ToolResult(tr) => {
+                        let tr_parts: Vec<_> = tr.content.clone().into_iter().collect();
+                        assert_eq!(tr_parts.len(), 1);
+                        assert!(matches!(
+                            tr_parts[0],
+                            rig_message::ToolResultContent::Image(_)
+                        ));
+                    }
+                    other => panic!("expected tool result, got {other:?}"),
+                }
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_with_unsupported_image_type_keeps_placeholder_text() {
+        let msg = Message::tool_result("call_1", "[image]", false).with_image_data(
+            crate::llm::ImageData {
+                base64: "AAAA".to_string(),
+                mime_type: "image/tiff".to_string(),
+            },
+        );
+        let rig = to_rig_messages(&[msg]);
+        match &rig[0] {
+            RigMessage::User { content } => {
+                let parts: Vec<_> = content.clone().into_iter().collect();
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    rig_message::UserContent::ToolResult(tr) => {
+                        let tr_parts: Vec<_> = tr.content.clone().into_iter().collect();
+                        assert_eq!(tr_parts.len(), 1);
+                        assert!(matches!(
+                            tr_parts[0],
+                            rig_message::ToolResultContent::Text(_)
+                        ));
+                    }
+                    other => panic!("expected tool result, got {other:?}"),
+                }
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn usage_stats_maps_zeros_to_none() {
         let u = RigUsage::new();
         let s = to_usage_stats(&u);
@@ -769,8 +948,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "object": "list",
                 "data": [
-                    { "id": "gpt-5", "object": "model" },
-                    { "id": "gpt-4o", "object": "model" }
+                    { "id": "gpt-5", "object": "model", "created": 1730000000, "owned_by": "openai" },
+                    { "id": "gpt-4o", "object": "model", "created": 1730000001, "owned_by": "openai" }
                 ]
             })))
             .mount(&server)
