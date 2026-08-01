@@ -366,7 +366,17 @@ fn parse_skill_meta(content: &str, path: PathBuf) -> Option<SkillMeta> {
 /// {optional args}
 /// ```
 pub fn expand_skill(skill: &SkillMeta, args: &str) -> anyhow::Result<String> {
-    let content = fs::read_to_string(&skill.path)?;
+    let content = if let Some(embedded) = skill.embedded_body.as_deref() {
+        embedded.to_string()
+    } else {
+        fs::read_to_string(&skill.path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read skill '{}' from {}: {e}",
+                skill.name,
+                skill.path.display()
+            )
+        })?
+    };
     let body = strip_frontmatter(&content).trim();
 
     let skill_block = format!(
@@ -425,7 +435,9 @@ fn strip_frontmatter(content: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_skill, load_skills_from_dirs, parse_skill_meta, strip_frontmatter};
+    use super::{
+        SkillMeta, expand_skill, load_skills_from_dirs, parse_skill_meta, strip_frontmatter,
+    };
     use std::path::PathBuf;
 
     fn dummy_path() -> PathBuf {
@@ -500,6 +512,24 @@ description: guides most non-trivial coding work.
         assert!(expanded.contains("References are relative to"));
         assert!(expanded.contains("# My skill"));
         assert!(expanded.contains("</skill>"));
+    }
+
+    #[test]
+    fn expand_skill_uses_embedded_body_without_touching_disk() {
+        let meta = SkillMeta {
+            name: "edit_skill".to_string(),
+            description: "embedded".to_string(),
+            // Dummy path that does not exist on disk — expand_skill must use
+            // embedded_body instead of reading it.
+            path: std::path::PathBuf::from("__embedded__/edit_skill/SKILL.md"),
+            base_dir: std::path::PathBuf::from("__embedded__/edit_skill"),
+            embedded_body: Some("---\nname: edit_skill\n---\n\n# Embedded body".to_string()),
+        };
+
+        let expanded = expand_skill(&meta, "").unwrap();
+        assert!(expanded.contains("# Embedded body"));
+        assert!(expanded.contains("</skill>"));
+        assert!(!expanded.contains("No such file"));
     }
 
     #[test]
