@@ -2,18 +2,16 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v6.0.3
     - name: Check
@@ -24,3 +22,19 @@ jobs:
       run: cargo fmt --all -- --check
     - name: Run clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Release build of the static musl binary, uploaded as a build artifact so
+  # every push produces a directly runnable single-file executable.
+  release:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6.0.3
+    - name: Install musl target
+      run: rustup target add x86_64-unknown-linux-musl
+    - name: Build release binary
+      run: cargo build --release --target x86_64-unknown-linux-musl
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ri-linux-musl
+        path: target/x86_64-unknown-linux-musl/release/ri

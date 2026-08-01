@@ -24,7 +24,7 @@ impl Default for DisplayConfig {
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
-pub struct XiConfig {
+pub struct RiConfig {
     /// Path to the theme file. Overridden by the `--theme` CLI flag.
     pub theme: Option<PathBuf>,
     /// UI display thresholds.
@@ -45,14 +45,12 @@ pub struct XiConfig {
     pub providers: Vec<ProviderInstance>,
 }
 
-impl XiConfig {
+impl RiConfig {
     /// Return a reference to the provider instance with the given id, if any.
     pub fn find_provider(&self, id: &str) -> Option<&ProviderInstance> {
         self.providers.iter().find(|p| p.id == id)
     }
 
-    /// Return a mutable reference to the provider instance with the given id.
-    ///
     /// Return a mutable reference to the provider instance with the given id.
     pub fn find_provider_mut(&mut self, id: &str) -> Option<&mut ProviderInstance> {
         self.providers.iter_mut().find(|p| p.id == id)
@@ -99,7 +97,7 @@ impl XiConfig {
     }
 }
 
-impl XiConfig {
+impl RiConfig {
     /// Load from $XDG_CONFIG_HOME/ri/config.toml (or ~/.config/ri/config.toml).
     /// Missing file is not an error and returns `Default`.
     pub fn load() -> anyhow::Result<Self> {
@@ -125,7 +123,7 @@ impl XiConfig {
     }
 }
 
-fn save_config(path: &std::path::Path, config: &XiConfig) -> anyhow::Result<()> {
+fn save_config(path: &std::path::Path, config: &RiConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -142,7 +140,7 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{XiConfig, save_config};
+    use super::{RiConfig, save_config};
     use crate::provider_instance::{ApiType, BackendPreset, ProviderInstance};
 
     // ── Instance-format config tests ─────────────────────────────────────────
@@ -151,7 +149,7 @@ mod tests {
     fn save_config_creates_missing_parent_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("config.toml");
-        let cfg = XiConfig::default();
+        let cfg = RiConfig::default();
 
         save_config(&path, &cfg).unwrap();
 
@@ -179,7 +177,7 @@ base_url = "https://my-webui.example.com"
 api_key = "token123"
 model = "llama3.1"
 "#;
-        let cfg = XiConfig::from_toml_str(raw).unwrap();
+        let cfg = RiConfig::from_toml_str(raw).unwrap();
         assert!(cfg.providers.is_empty());
         assert!(cfg.find_provider("gemini").is_none());
         assert!(cfg.find_provider("openai").is_none());
@@ -206,7 +204,7 @@ backend_preset = "openai-compatible"
 api_type = "openai-compatible"
 base_url = "http://gpu-box:11434"
 "#;
-        let cfg = XiConfig::from_toml_str(raw).unwrap();
+        let cfg = RiConfig::from_toml_str(raw).unwrap();
         assert_eq!(cfg.providers.len(), 2);
 
         let webui = cfg.find_provider("work-webui").unwrap();
@@ -224,7 +222,7 @@ base_url = "http://gpu-box:11434"
 
     #[test]
     fn upsert_and_remove_provider() {
-        let mut cfg = XiConfig::default();
+        let mut cfg = RiConfig::default();
         use crate::provider_instance::ProviderInstance;
         let inst = ProviderInstance::new("my-provider", BackendPreset::OpenAiCompatible);
         cfg.upsert_provider(inst);
@@ -247,13 +245,13 @@ base_url = "http://gpu-box:11434"
 
     #[test]
     fn resolve_effective_providers_empty_on_empty_config() {
-        let cfg = XiConfig::default();
+        let cfg = RiConfig::default();
         assert!(cfg.resolve_effective_providers().is_empty());
     }
 
     #[test]
     fn resolve_effective_providers_includes_user_providers() {
-        let mut cfg = XiConfig::default();
+        let mut cfg = RiConfig::default();
         cfg.upsert_provider(ProviderInstance::new(
             "my-provider",
             BackendPreset::OpenAiCompatible,
@@ -266,7 +264,7 @@ base_url = "http://gpu-box:11434"
 
     #[test]
     fn resolve_effective_providers_prefers_config_override_for_builtin() {
-        let mut cfg = XiConfig::default();
+        let mut cfg = RiConfig::default();
         let mut inst = ProviderInstance::new("openai", BackendPreset::OpenAiCompatible);
         inst.model = Some("override-model".to_string());
         cfg.upsert_provider(inst);
@@ -277,7 +275,7 @@ base_url = "http://gpu-box:11434"
 
     #[test]
     fn upsert_provider_replaces_existing_provider_after_rename_when_old_id_removed() {
-        let mut cfg = XiConfig::default();
+        let mut cfg = RiConfig::default();
         let mut original = crate::provider_instance::ProviderInstance::new(
             "gpu-box",
             BackendPreset::OpenAiCompatible,

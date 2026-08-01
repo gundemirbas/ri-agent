@@ -102,12 +102,6 @@ impl App {
             .activate(SelectionKind::Agent, "  Select agent  ", items);
     }
 
-    /// Returns true when the active selection is the agent picker.
-    #[allow(dead_code)] // Convenience method, follows pattern of other selection mode checks
-    pub fn in_agent_selection_mode(&self) -> bool {
-        self.selection.kind == Some(SelectionKind::Agent)
-    }
-
     /// Returns true when the active selection is the provider picker.
     pub fn in_provider_selection_mode(&self) -> bool {
         self.selection.kind == Some(SelectionKind::Provider)
@@ -341,8 +335,8 @@ impl App {
         Some(token)
     }
 
-    // Used by tests in app.rs.
-    #[allow(dead_code)]
+    /// Sets the pending provider's backend preset. Used by tests in app.rs.
+    #[cfg(test)]
     pub fn set_pending_provider_backend_preset(&mut self, backend_preset: BackendPreset) {
         self.provider.set_pending_backend_preset(backend_preset);
     }

@@ -1,11 +1,11 @@
-//! Theme configuration for Xi's terminal UI.
+//! Theme configuration for ri's terminal UI.
 //!
 //! All visual style choices — colors, symbols, padding, margins — are
 //! expressed as a [`Theme`] struct that is loaded from
 //! `~/.config/ri/theme.toml` (or a path supplied via `--theme`).
 //!
 //! Every field is optional in the TOML file; missing values fall back to
-//! [`Theme::default()`], which reproduces Xi's built-in appearance.
+//! [`Theme::default()`], which reproduces ri's built-in appearance.
 
 use std::{collections::HashMap, fs, path::Path};
 
@@ -1467,7 +1467,7 @@ impl<'a> ResolvedToolTheme<'a> {
 // ── Root Theme ────────────────────────────────────────────────────────────────
 
 /// The root theme struct. Loaded from `theme.toml`; all fields are optional
-/// and default to Xi's built-in appearance.
+/// and default to ri's built-in appearance.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Theme {
     #[serde(default)]

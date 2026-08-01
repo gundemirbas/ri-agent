@@ -69,7 +69,9 @@ src/
   print_mode.rs        — non-interactive -p/--print mode
   agent/
     mod.rs             — run_agent_loop: the multi-turn agentic loop
-    types.rs           — Tool/ToolExecutor traits, AgentEvent, AgentLoopConfig
+    subagent.rs        — run_subagent: bounded nested subagent loop for invoke_subagent
+    types.rs           — Tool/ToolExecutor traits, AgentEvent, AgentLoopConfig,
+                         SubagentContext
     system_prompt.rs   — build_system_prompt (dynamic, agent-aware)
     file_tracker.rs    — FileTracker: external-change detection + diff
     compaction.rs      — context compaction (summary generation, triggers)
@@ -82,6 +84,7 @@ src/
       find.rs          — FindTool  (🔍 search by name glob or content pattern)
       ask_user.rs      — AskUserTool (❓ interactive question to the user)
       read_skill.rs    — ReadSkillTool (load a SKILL.md body)
+      invoke_subagent.rs — InvokeSubagentTool (run a named subagent)
       exec.rs          — exec-path resolution helpers
       subprocess.rs    — SubprocessCommand (shared run/stream/cancel logic)
       truncate.rs      — output truncation (TruncationResult)
@@ -289,6 +292,17 @@ and an optional `AGENTS.md` that replaces the global instructions. Tool/skill
 filtering is applied at prompt-build time via `agents::filter_tools` /
 `filter_skills`. `ask_user` and `read_skill` are always present.
 `/agent <name>` switches agents; `/agent` shows a picker.
+
+**Subagents** — agents with `mode: subagent` in `SYSTEM.md` frontmatter are
+subagents: never shown in the picker, but invokable by the orchestrator through
+the `invoke_subagent` tool. `run_subagent` (`agent/subagent.rs`) resolves the
+agent, applies its tool/skill filters (always stripping `invoke_subagent` to
+prevent recursion), builds its own system prompt, and runs a bounded nested
+loop (≤ 20 turns) whose live output streams under the outer tool call. The
+subagent's transcript is ephemeral — only its final answer is persisted as the
+outer `ToolCall`/`ToolResult` event pair. Subagent launching is wired via
+`DefaultToolExecutor.subagent` in both the TUI (`app_submission.rs`) and
+`--print` mode.
 
 **Outer provider loop in `main.rs`** — `run()` returns a `RunResult` enum
 (`Quit | ChangeModel | ChangeProvider`) rather than mutating global state. The

@@ -113,10 +113,9 @@ impl SessionStore {
     }
 
     pub fn latest_for_cwd(&self, cwd: &str) -> Option<SessionMeta> {
-        let needle = normalize_cwd_for_match(cwd);
         self.list_sessions()
             .into_iter()
-            .filter(|s| normalize_cwd_for_match(&s.cwd) == needle && s.message_count > 0)
+            .filter(|s| s.cwd == cwd && s.message_count > 0)
             .max_by_key(|s| (s.updated_at_ms, s.created_at_ms, s.id.clone()))
     }
 
@@ -234,9 +233,17 @@ impl SessionStore {
 
 fn new_session_id() -> String {
     let ts = Utc::now().format("%Y%m%dT%H%M%S").to_string();
-    let mut bytes = [0u8; 4];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        return format!("{ts}-00000000");
+    // 8 random bytes (64 bits of entropy) keep same-second collision
+    // probability negligible even when several sessions are created at once.
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Entropy source unavailable — fall back to wall-clock nanos so the
+        // suffix is still (practically) unique instead of a constant.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        return format!("{ts}-{nanos:016x}");
     }
     let suffix = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     format!("{ts}-{suffix}")
@@ -244,10 +251,6 @@ fn new_session_id() -> String {
 
 fn cwd_key(cwd: &str) -> String {
     urlencoding::encode(cwd).into_owned()
-}
-
-fn normalize_cwd_for_match(cwd: &str) -> String {
-    cwd.to_string()
 }
 
 fn decode_cwd_key(key: &str) -> Option<String> {

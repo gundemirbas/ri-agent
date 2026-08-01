@@ -151,24 +151,12 @@ pub enum AtFileResult {
     },
     /// The file could not be read.
     Error {
-        #[allow(dead_code)]
+        /// Path that could not be read (for diagnostics).
         path: String,
-        #[allow(dead_code)]
         /// Human-readable error description (used in Debug output and by
-        /// external consumers; the built-in submission path silently skips
-        /// these).
+        /// external consumers; the built-in submission path logs it at debug).
         message: String,
     },
-}
-
-impl AtFileResult {
-    /// The path this result corresponds to.
-    #[allow(dead_code)]
-    pub fn path(&self) -> &str {
-        match self {
-            Self::Text { path, .. } | Self::Image { path, .. } | Self::Error { path, .. } => path,
-        }
-    }
 }
 
 /// Image MIME type detected from file extension.

@@ -36,7 +36,7 @@ pub(crate) async fn run_print_mode(
     prompt: String,
     provider_override: &str,
     model_override: Option<&str>,
-    config: &crate::config::XiConfig,
+    config: &crate::config::RiConfig,
 ) -> io::Result<()> {
     let resolved_instance = with_resolved_model(
         model_override,
@@ -71,14 +71,26 @@ pub(crate) async fn run_print_mode(
     }];
 
     let loop_config = AgentLoopConfig {
-        tools,
+        tools: tools.clone(),
         file_tracker: headless_tracker,
         tool_output_log: headless_log,
         session_events,
         current_model: resolved_instance.effective_model().to_string(),
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
-        executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
+        executor: std::sync::Arc::new({
+            let mut ex = crate::agent::DefaultToolExecutor::new();
+            // Wire subagent launching in headless mode too: subagents can
+            // delegate against the same provider/tool universe.
+            ex.subagent = Some(crate::agent::types::SubagentContext {
+                provider: Arc::clone(&provider),
+                agents: std::sync::Arc::new(crate::agents::load_agents()),
+                skills: std::sync::Arc::new((*loaded_skills).clone()),
+                cwd: cwd.clone(),
+                tools: tools.clone(),
+            });
+            ex
+        }),
         system_prompt: Some(system_prompt),
     };
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    config::XiConfig,
+    config::RiConfig,
     llm::{
         LlmProvider,
         rig_provider::{RigOpenAiApi, RigOpenAiProvider},
@@ -50,7 +50,7 @@ pub fn thinking_support_for_instance(instance: &ProviderInstance, _model: &str) 
 pub fn build_provider_for_instance(
     instance: &ProviderInstance,
     thinking: ThinkingLevel,
-    _config: &XiConfig,
+    _config: &RiConfig,
 ) -> anyhow::Result<Arc<dyn LlmProvider + Send + Sync>> {
     let model = instance.effective_model();
 
@@ -140,7 +140,7 @@ mod tests {
         let p = build_provider_for_instance(
             &instance,
             ThinkingLevel::Off,
-            &crate::config::XiConfig::default(),
+            &crate::config::RiConfig::default(),
         );
         assert!(
             p.is_ok(),
@@ -160,7 +160,7 @@ mod tests {
         let err = match build_provider_for_instance(
             &instance,
             ThinkingLevel::Off,
-            &crate::config::XiConfig::default(),
+            &crate::config::RiConfig::default(),
         ) {
             Ok(_) => panic!("expected build to fail on invalid schema"),
             Err(e) => e,

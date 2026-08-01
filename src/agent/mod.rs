@@ -11,6 +11,7 @@ use file_tracker::build_notification;
 
 pub mod compaction;
 pub mod file_tracker;
+pub mod subagent;
 pub mod system_prompt;
 pub mod tool_output_log;
 pub mod tools;

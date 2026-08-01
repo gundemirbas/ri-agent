@@ -474,6 +474,7 @@ mod tests {
             id: "call_1".to_string(),
             tx,
             cancel_rx: Some(cancel_rx),
+            subagent: None,
         }
     }
 

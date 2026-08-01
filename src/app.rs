@@ -83,7 +83,6 @@ pub enum InputMode {
 pub struct App {
     pub(crate) textarea: TextArea<'static>,
     /// Shell mode state (textarea, selected shell, available shells).
-    /// Shell mode state (textarea, selected shell, available shells).
     pub(crate) shell: ShellState,
     pub(crate) input_mode: InputMode,
     /// Vertical scroll offset for the input panel (in wrapped lines).
@@ -268,7 +267,7 @@ impl App {
         self.rebuild_agent_system_prompt(cwd);
 
         // Persist to config
-        if let Ok(mut config) = crate::config::XiConfig::load() {
+        if let Ok(mut config) = crate::config::RiConfig::load() {
             config.agent = self.active_agent.clone();
             let _ = config.save();
         }
@@ -666,6 +665,7 @@ impl App {
             id: call_id.clone(),
             tx: Some(tx.clone()),
             cancel_rx: None,
+            subagent: None,
         };
 
         self.runtime.pending_shell_handle = Some(tokio::spawn(async move {

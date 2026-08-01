@@ -13,7 +13,9 @@ use crate::session_event::SessionEvent;
 impl App {
     // ── LLM submission ────────────────────────────────────────────────────────
 
-    fn start_agent_task(&mut self, provider: &DynProvider) {
+    /// Returns `false` when the loop could not be started (no session state).
+    /// Callers must stop the turn / surface a notice in that case.
+    fn start_agent_task(&mut self, provider: &DynProvider) -> bool {
         // Ensure the session ID is assigned before creating the log so the
         // output directory uses the real session key, not the "init" placeholder.
         let session_id = self.ensure_session_id();
@@ -22,13 +24,11 @@ impl App {
         // remain accessible after the agent loop completes.
         self.agent_config.tool_output_log =
             Arc::new(std::sync::Mutex::new(ToolOutputLog::new(&session_id)));
-        let session_events = self
-            .session
-            .session_state
-            .as_ref()
-            .expect("start_agent_task called before session_state was initialised")
-            .events()
-            .to_vec();
+        let Some(session_state) = self.session.session_state.as_ref() else {
+            log::debug!("start_agent_task: no session_state; refusing to launch");
+            return false;
+        };
+        let session_events = session_state.events().to_vec();
 
         // Create cancel channel before the config so the executor can receive
         // a clone for passing into ToolCallContext.
@@ -50,6 +50,10 @@ impl App {
             )
         };
 
+        // Snapshot the tool universe for subagent launching before `tools` is
+        // moved into AgentLoopConfig below.
+        let subagent_tools = tools.clone();
+
         let config = AgentLoopConfig {
             tools,
             file_tracker: Arc::clone(&self.agent_config.file_tracker),
@@ -64,6 +68,15 @@ impl App {
             executor: std::sync::Arc::new({
                 let mut ex = crate::agent::DefaultToolExecutor::new();
                 ex.cancel_rx = Some(cancel_rx.clone());
+                // Wire subagent launching: the `invoke_subagent` tool can then
+                // run named subagents against this provider and tool universe.
+                ex.subagent = Some(crate::agent::types::SubagentContext {
+                    provider: Arc::clone(provider),
+                    agents: std::sync::Arc::new(self.agents.clone()),
+                    skills: std::sync::Arc::new(self.loaded_skills.clone()),
+                    cwd: self.session.current_cwd.clone(),
+                    tools: subagent_tools,
+                });
                 ex
             }),
             system_prompt,
@@ -77,6 +90,7 @@ impl App {
         self.runtime.agent_task = Some(tokio::spawn(async move {
             run_agent_loop(config, provider, tx, steering_rx, cancel_rx).await;
         }));
+        true
     }
 
     /// Set streaming flags and spawn the agent task using the current history.
@@ -86,14 +100,21 @@ impl App {
         self.clear_abort_status_notice();
         self.session.live_turn.notices.clear();
         self.ensure_event_log_for_submit();
-        assert!(
-            self.session.session_state.is_some(),
-            "launch_turn called before session_state was initialised"
-        );
+        if self.session.session_state.is_none() {
+            // Guards against a panicking invariant in release builds; the state
+            // is normally ensured by `ensure_event_log_for_submit` above.
+            log::debug!("launch_turn: no session_state; cannot start turn");
+            return;
+        }
         self.agent_turn.start();
         self.log_view.auto_scroll = true;
         self.runtime.reset_abort_stages();
-        self.start_agent_task(provider);
+        if !self.start_agent_task(provider) {
+            self.agent_turn.end();
+            self.push_notice(Message::assistant(
+                "[failed to start agent run — no active session]",
+            ));
+        }
     }
 
     /// Queue a user steering message while the agent loop is running.
@@ -131,7 +152,12 @@ impl App {
 
         self.agent_turn.start();
         self.log_view.auto_scroll = true;
-        self.start_agent_task(provider);
+        if !self.start_agent_task(provider) {
+            self.agent_turn.end();
+            self.push_notice(Message::assistant(
+                "[failed to run compaction — no active session]",
+            ));
+        }
     }
 
     /// Parse `@<path>` tokens from `text`, read each file, and inject a
@@ -209,8 +235,11 @@ impl App {
                         });
                     // No need for pending_attachment_images — image is inline.
                 }
-                AtFileResult::Error { .. } => {
-                    // Silently skip — no error displayed or reported to model.
+                AtFileResult::Error { path, message } => {
+                    // Missing/unreadable @file references are silently skipped
+                    // in the transcript, but the failure is worth keeping for
+                    // troubleshooting.
+                    log::debug!("@file attachment failed: {path}: {message}");
                 }
             }
         }

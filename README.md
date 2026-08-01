@@ -85,10 +85,11 @@ cargo install --path .
 | `F1`            | Show keyboard shortcuts         |
 | `Enter`         | Submit message (or queue steering message if agent loop is running) |
 | `Shift+Enter`   | Insert newline in input         |
+| `Tab` / `Up` / `Down` | Apply / navigate completion suggestions in the input line |
 | `Page Up`       | Scroll chat up one page         |
 | `Page Down`     | Scroll chat to bottom           |
 | `Scroll wheel`  | Scroll chat (3 lines/tick)      |
-| `Ctrl+I`        | Toggle provider/model info bar  |
+| `Ctrl+I` / `Alt+S` | Toggle provider/model info bar  |
 | `Ctrl+F`        | Toggle full tool output         |
 | `Ctrl+R`        | Resume latest session for current folder |
 | `Ctrl+Z`        | Suspend ri only when the UI is idle and no agent/shell subprocess is running |
@@ -97,8 +98,9 @@ cargo install --path .
 | `!`             | Enter shell mode when input is empty |
 | `Alt+C`         | Copy the last assistant response |
 | `Alt+Up` / `Alt+Down` | Step backward / forward through session history |
-| `Ctrl+C`        | Quit (or leave shell mode)      |
+| `Ctrl+C`        | Abort agent loop (1: stop after turn, 2: abort, 3: force-kill); quit in shell mode |
 | `Esc`           | Abort current agent loop; also cancel slash/selection contexts |
+| Mouse drag      | Drag to select text in the log; release to copy to the clipboard |
 
 ## Slash commands
 
@@ -113,7 +115,9 @@ cargo install --path .
 | `/resume`            | Open session picker (local + foreign sessions)   |
 | `/compact [instructions]` | Compact session context now, optionally with summary instructions |
 | `/export [path]`     | Export this session to a self-contained HTML file |
-| `/reload`            | Reload AGENTS.md context and available skills    |
+| `/agent [name]`      | Switch to a named agent profile, or show the agent picker |
+| `/retry`             | Retry the last turn after an error               |
+| `/reload`            | Reload AGENTS.md context, available skills, and agents |
 | `/skill:<name>`      | Invoke a skill by name (e.g. `/skill:plan`)      |
 | `/quit`              | Quit                                             |
 
@@ -153,3 +157,34 @@ For example:
   }
 }
 ```
+
+## Agents and subagents
+
+Agent profiles live in `~/.ri/agents/<name>/` (global) and `.ri/agents/<name>/`
+(project-local, shadowing global). Each agent uses a `SYSTEM.md` (with YAML
+frontmatter) as its system prompt and an optional `AGENTS.md` that replaces the
+global instructions. Tool/skill availability can be restricted per agent with
+`include_tools` / `exclude_tools` / `include_skills` / `exclude_skills` globs.
+Switch agents with `/agent [name]` or the `/agent` picker.
+
+Agents with `mode: subagent` in the frontmatter are *subagents*: they never
+appear in the picker but can be delegated to by the orchestrator via the
+`invoke_subagent` tool. A subagent runs with its own system prompt and tool
+universe (filters applied, `invoke_subagent` removed to prevent recursion) and
+finishes within a bounded number of steps.
+
+## File attachments (`@file`)
+
+Reference a file directly in your prompt with `@path` (tab-completable). ri
+reads the file and attaches its contents (or the image itself, for image
+files) to the message before the agent runs — useful for giving the model
+context without a separate `read_file` turn.
+
+## Session persistence and resuming
+
+Every conversation is stored as an append-only event log under the XDG data
+directory (grouped by working folder). Press `Ctrl+R` to resume the latest
+session for the current folder, `/resume` for the full picker, and `/export`
+to write a self-contained HTML transcript. Long sessions are automatically
+compacted against the active model's context window; `/compact` forces it
+manually, optionally with custom summary instructions.

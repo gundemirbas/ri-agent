@@ -155,6 +155,7 @@ pub mod custom;
 pub mod edit;
 pub mod exec;
 pub mod find;
+pub mod invoke_subagent;
 pub mod read;
 pub mod read_skill;
 pub mod subprocess;
@@ -168,6 +169,7 @@ use bash::BashTool;
 use edit::EditTool;
 use exec::ExecTool;
 use find::FindTool;
+use invoke_subagent::InvokeSubagentTool;
 use read::ReadFileTool;
 use read_skill::ReadSkillTool;
 use write::WriteTool;
@@ -200,6 +202,7 @@ pub async fn register_builtin_tools(
 
     tools.push(Arc::new(BashTool));
     tools.push(Arc::new(ExecTool));
+    tools.push(Arc::new(InvokeSubagentTool));
 
     for tool in tools {
         registry.insert(tool.name().to_string(), tool);
@@ -466,5 +469,22 @@ mod tests {
             msg.contains("expected an object, got null"),
             "unfriendly error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn register_builtin_tools_includes_invoke_subagent() {
+        use crate::agent::file_tracker::FileTracker;
+        use std::sync::{Arc, Mutex};
+
+        let registry = super::register_builtin_tools(
+            None,
+            Arc::new(Mutex::new(FileTracker::new())),
+            Arc::new(vec![]),
+            vec![],
+        )
+        .await;
+        let tool = registry.get("invoke_subagent").expect("tool registered");
+        assert!(tool.description().contains("subagent"));
+        assert_eq!(tool.streaming_field(), Some("task"));
     }
 }

@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Subagents (completed)**: `mode: subagent` agent profiles can now be invoked
+  by the orchestrator through the new `invoke_subagent` tool. Each subagent runs
+  with its own system prompt, tool/skill filters (with `invoke_subagent` stripped
+  to prevent recursion), and a bounded 20-step loop; live output streams under
+  the outer tool call and only the final answer is persisted. Wired in both the
+  TUI and `--print` mode.
+- **CI release artifact**: pushes to `main`/`master` now build and upload a static
+  `x86_64-unknown-linux-musl` release binary.
+
+### Fixed
+
+- **CI branch mismatch**: the workflow now runs on `main` *and* `master`, so
+  pushes to the active default branch (`master`) trigger checks.
+- **Session ID collisions**: session/ephemeral IDs now use 8 random bytes plus a
+  unique fallback (nanos+pid) if entropy is unavailable; migrated `getrandom` to
+  0.3 (`fill`).
+- **Panic on missing session state**: `start_agent_task` no longer
+  `.expect()`s — it returns `false` and surfaces a notice instead.
+- **Redundant assignment** in `/model` handler removed.
+- **Dead code removed**: identity-function `normalize_cwd_for_match` and the
+  stale `#[allow(dead_code)]` guards on agent `path`/`base_dir`/`resolve_agent`
+  (now consumed by the subagent runner).
+
+### Internal
+
+- Rebranded `XiConfig` → `RiConfig` and remaining "Xi" references in code/docs to
+  "ri".
+- Added `rust-version = "1.85"` to `Cargo.toml`.
+- Removed duplicate doc comments; documented `/agent`, `/retry`, `@file`
+  attachments, mouse selection, and subagents in the README.
+
 ## v0.5.0 — 2026-07-20
 
 ### Added

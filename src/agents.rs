@@ -29,7 +29,9 @@ use crate::skills::SkillMeta;
 pub enum AgentMode {
     /// User-selectable agent shown in picker and switchable via `/agent`.
     Primary,
-    /// Only invokable as a subagent by the orchestrator (Phase 2 — parsed but not wired).
+    /// Invokable as a subagent by the orchestrator via the `invoke_subagent`
+    /// tool (runs with its own system prompt, tool/skill filters, and a
+    /// bounded step count).
     Subagent,
 }
 
@@ -52,10 +54,10 @@ pub struct AgentMeta {
     /// the global `~/.ri/AGENTS.md` entry in the system prompt.
     pub agents_md: Option<String>,
     /// Absolute path to the metadata file (`SYSTEM.md` or `AGENT.md`).
-    #[allow(dead_code)] // Reserved for future use (subagent file references, etc.)
+    /// Used to surface the agent's definition location to the subagent runner.
     pub path: PathBuf,
-    /// Directory containing the agent definition files.
-    #[allow(dead_code)] // Reserved for future use (relative path resolution in subagents)
+    /// Directory containing the agent definition files. Used as the base for
+    /// resolving relative references inside the agent's instructions.
     pub base_dir: PathBuf,
 }
 
@@ -400,7 +402,6 @@ pub fn filter_skills(
 
 /// Find an agent by name in a list.  Returns `None` when `name` is empty
 /// (representing "default / no agent").
-#[allow(dead_code)] // Will be used by Phase 2 subagent orchestration
 pub fn resolve_agent<'a>(agents: &'a [AgentMeta], name: &str) -> Option<&'a AgentMeta> {
     if name.is_empty() {
         return None;

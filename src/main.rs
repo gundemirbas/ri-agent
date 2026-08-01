@@ -74,7 +74,7 @@ use agents::load_agents;
 use app::App;
 use app_event::AppEvent;
 
-use config::XiConfig;
+use config::RiConfig;
 use llm::{LlmProvider, Message};
 use provider::{ThinkingSupport, build_provider_for_instance, thinking_support_for_instance};
 use provider_instance::ProviderInstance;
@@ -136,7 +136,7 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let mut config = XiConfig::load().map_err(|e| {
+    let mut config = RiConfig::load().map_err(|e| {
         eprintln!(
             "error: failed to load config.toml: {e}\n\
              Refusing to start with default config to prevent data loss.\n\
@@ -368,7 +368,7 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     provider: &Arc<dyn LlmProvider + Send + Sync>,
-    config: &XiConfig,
+    config: &RiConfig,
 ) -> io::Result<RunResult> {
     let mut crossterm_events = EventStream::new();
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(320));
@@ -551,12 +551,11 @@ async fn handle_new_session(
 
 fn handle_change_model(
     app: &mut App,
-    config: &mut XiConfig,
+    config: &mut RiConfig,
     name: String,
     prompt_thinking_selection: bool,
 ) {
     app.provider.current_instance.model = Some(name.clone());
-    app.provider.current_model = name.clone();
     app.provider.current_model = name;
     app.provider.current_thinking =
         provider_setup::resolve_thinking_level_for_model(config, &app.provider.current_model);
@@ -577,7 +576,7 @@ fn handle_change_model(
 }
 
 /// Returns `true` if the outer loop should `continue` (skip provider rebuild).
-fn handle_change_provider(app: &mut App, config: &mut XiConfig, id: String) -> bool {
+fn handle_change_provider(app: &mut App, config: &mut RiConfig, id: String) -> bool {
     if let Some(inst) = config.resolve_provider(&id) {
         app.provider.provider_selected = true;
 
@@ -603,7 +602,7 @@ fn handle_change_provider(app: &mut App, config: &mut XiConfig, id: String) -> b
     false
 }
 
-fn handle_add_provider(app: &mut App, config: &mut XiConfig, instance: ProviderInstance) {
+fn handle_add_provider(app: &mut App, config: &mut RiConfig, instance: ProviderInstance) {
     app.clear_pending_provider_setup();
     let instance_id = instance.id.clone();
     let current_model_for_instance = provider_setup::resolve_model_for_instance(None, &instance);
@@ -634,7 +633,7 @@ fn handle_add_provider(app: &mut App, config: &mut XiConfig, instance: ProviderI
 
 fn handle_update_provider(
     app: &mut App,
-    config: &mut XiConfig,
+    config: &mut RiConfig,
     original_id: Option<String>,
     instance: ProviderInstance,
 ) {
@@ -671,7 +670,7 @@ fn handle_update_provider(
     )));
 }
 
-fn handle_remove_provider(app: &mut App, config: &mut XiConfig, id: String) {
+fn handle_remove_provider(app: &mut App, config: &mut RiConfig, id: String) {
     app.clear_pending_provider_setup();
     app.clear_pending_provider_removal();
     if config.remove_provider(&id) {
@@ -701,7 +700,7 @@ fn handle_remove_provider(app: &mut App, config: &mut XiConfig, id: String) {
     }
 }
 
-fn handle_change_thinking(app: &mut App, config: &mut XiConfig, level: ThinkingLevel) {
+fn handle_change_thinking(app: &mut App, config: &mut RiConfig, level: ThinkingLevel) {
     app.provider.current_thinking = level;
     app.record_thinking_level_changed();
     provider_setup::persist_provider_model_selection_v2(config, app);
@@ -711,7 +710,7 @@ fn handle_change_thinking(app: &mut App, config: &mut XiConfig, level: ThinkingL
 
 fn handle_configure_provider(
     app: &mut App,
-    config: &mut XiConfig,
+    config: &mut RiConfig,
     instance: ProviderInstance,
     url: Option<String>,
     api_key: Option<String>,
@@ -758,7 +757,7 @@ mod tests {
     use super::provider_setup::{self, with_resolved_model};
     use crate::input::normalize_paste_text;
     use crate::{
-        config::XiConfig,
+        config::RiConfig,
         llm::ProviderError,
         provider_instance::{BackendPreset, ProviderInstance},
         provider_manager::format_provider_error_for_display,
@@ -773,7 +772,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_instance_accepts_exact_configured_provider_id() {
-        let mut cfg = XiConfig::default();
+        let mut cfg = RiConfig::default();
         cfg.providers.push(ProviderInstance::new(
             "work-webui",
             BackendPreset::OpenAiCompatible,
@@ -788,7 +787,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_instance_accepts_hidden_test_provider() {
-        let cfg = XiConfig::default();
+        let cfg = RiConfig::default();
 
         let instance = provider_setup::resolve_provider_instance(Some("test"), &cfg)
             .expect("test should resolve");
@@ -799,7 +798,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_instance_rejects_unknown_cli_provider() {
-        let mut cfg = XiConfig::default();
+        let mut cfg = RiConfig::default();
         cfg.providers.push(ProviderInstance::new(
             "openai",
             BackendPreset::OpenAiCompatible,
@@ -817,9 +816,9 @@ mod tests {
 
     #[test]
     fn resolve_default_provider_instance_prefers_configured_default() {
-        let mut cfg = XiConfig {
+        let mut cfg = RiConfig {
             provider: Some("work-webui".to_string()),
-            ..XiConfig::default()
+            ..RiConfig::default()
         };
         cfg.providers.push(ProviderInstance::new(
             "openai",
@@ -838,7 +837,7 @@ mod tests {
 
     #[test]
     fn resolve_default_provider_instance_falls_back_to_first_effective() {
-        let cfg = XiConfig::default();
+        let cfg = RiConfig::default();
 
         let instance = provider_setup::resolve_default_provider_instance(&cfg);
 
@@ -887,9 +886,9 @@ mod tests {
 
     #[test]
     fn resolve_thinking_uses_model_specific_config() {
-        let mut cfg = XiConfig {
+        let mut cfg = RiConfig {
             thinking: Some("minimal".to_string()),
-            ..XiConfig::default()
+            ..RiConfig::default()
         };
         cfg.thinking_by_model
             .insert("gpt-5".to_string(), "high".to_string());
@@ -900,9 +899,9 @@ mod tests {
 
     #[test]
     fn resolve_thinking_falls_back_to_global_config() {
-        let cfg = XiConfig {
+        let cfg = RiConfig {
             thinking: Some("minimal".to_string()),
-            ..XiConfig::default()
+            ..RiConfig::default()
         };
         let level = provider_setup::resolve_thinking_level_for_model(&cfg, "gpt-4o");
         assert_eq!(level, ThinkingLevel::Minimal);
@@ -910,7 +909,7 @@ mod tests {
 
     #[test]
     fn resolve_thinking_defaults_to_off() {
-        let cfg = XiConfig::default();
+        let cfg = RiConfig::default();
         let level = provider_setup::resolve_thinking_level_for_model(&cfg, "gpt-4o");
         assert_eq!(level, ThinkingLevel::Off);
     }

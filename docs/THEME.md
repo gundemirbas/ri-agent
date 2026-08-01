@@ -1,6 +1,6 @@
-# Xi Theme Guide
+# ri Theme Guide
 
-Xi's visual appearance is fully configurable via a **theme file**. This guide
+ri's visual appearance is fully configurable via a **theme file**. This guide
 describes the file format, all available options, and how to select a theme.
 
 ---
@@ -13,12 +13,12 @@ The default theme file is:
 ~/.config/ri/theme.toml
 ```
 
-You can also point Xi at a different file in two ways:
+You can also point ri at a different file in two ways:
 
-1. **CLI flag** — pass `--theme <path>` when starting Xi.
+1. **CLI flag** — pass `--theme <path>` when starting ri.
 2. **config.toml** — set `theme = "<path>"` in `~/.config/ri/config.toml`.
 
-All fields in `theme.toml` are optional. Missing fields fall back to Xi's
+All fields in `theme.toml` are optional. Missing fields fall back to ri's
 built-in defaults, so you only need to specify the values you want to change.
 
 ---
@@ -332,7 +332,7 @@ Per-tool presentation. Each tool entry has four sub-specs:
   specify it when you want the headline to look different from the output.
 - **`body`** — the style of the tool result content area.
 - **`placeholder`** — the style used *before* the argument has streamed far
-  enough to extract a meaningful label. While Xi is waiting for the filename,
+  enough to extract a meaningful label. While ri is waiting for the filename,
   command, or path to arrive in the JSON stream, it shows a short pending
   label like `"editing…"` or `"running…"`. The `placeholder.text` field
   overrides that default text; the other attributes style it. Once the real

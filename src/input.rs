@@ -6,7 +6,7 @@ use crate::{
     agent::types::CancelLevel,
     app::{App, InputMode, SelectionResult},
     commands::CommandAction,
-    config::XiConfig,
+    config::RiConfig,
     keybindings::{self, KeyBindingId},
     llm::{LlmProvider, Message},
     provider::{ThinkingSupport, thinking_support_for_instance},
@@ -64,13 +64,13 @@ pub(crate) fn provider_setup_requires_api_key(instance: &ProviderInstance) -> bo
     instance.backend_preset.is_user_supplied()
 }
 
-fn resolve_current_run_instance(app: &App, config: &XiConfig) -> ProviderInstance {
+fn resolve_current_run_instance(app: &App, config: &RiConfig) -> ProviderInstance {
     config
         .resolve_provider(&app.provider.current_instance.id)
         .unwrap_or_else(|| resolve_default_provider_instance(config))
 }
 
-fn thinking_supported_for_current_provider(app: &App, config: &XiConfig) -> bool {
+fn thinking_supported_for_current_provider(app: &App, config: &RiConfig) -> bool {
     config
         .resolve_provider(&app.provider.current_instance.id)
         .map(|inst| {
@@ -119,7 +119,7 @@ pub(crate) fn apply_paste(
 pub(crate) fn handle_key_event(
     app: &mut App,
     provider: &Arc<dyn LlmProvider + Send + Sync>,
-    config: &XiConfig,
+    config: &RiConfig,
     key: KeyEvent,
 ) -> Option<RunResult> {
     // On Windows with keyboard enhancement flags enabled,
@@ -321,7 +321,7 @@ fn handle_shell_mode_key(app: &mut App, key: KeyEvent) -> KeyDispatch {
     KeyDispatch::Continue
 }
 
-fn handle_selection_mode_key(app: &mut App, config: &XiConfig, key: KeyEvent) -> KeyDispatch {
+fn handle_selection_mode_key(app: &mut App, config: &RiConfig, key: KeyEvent) -> KeyDispatch {
     match key.code {
         KeyCode::Up => {
             if key.modifiers.contains(KeyModifiers::ALT) {
@@ -483,7 +483,7 @@ fn handle_selection_enter(app: &mut App) -> KeyDispatch {
 fn handle_chat_mode_key(
     app: &mut App,
     provider: &Arc<dyn LlmProvider + Send + Sync>,
-    config: &XiConfig,
+    config: &RiConfig,
     key: KeyEvent,
 ) -> KeyDispatch {
     if key.code == KeyCode::Esc {
@@ -555,7 +555,7 @@ fn handle_chat_mode_key(
 fn handle_chat_submit(
     app: &mut App,
     provider: &Arc<dyn LlmProvider + Send + Sync>,
-    config: &XiConfig,
+    config: &RiConfig,
 ) -> KeyDispatch {
     match app.provider.setup_step.clone() {
         ProviderSetupStep::Endpoint => {
@@ -671,7 +671,7 @@ fn handle_chat_submit(
 fn handle_slash_submit(
     app: &mut App,
     provider: &Arc<dyn LlmProvider + Send + Sync>,
-    config: &XiConfig,
+    config: &RiConfig,
 ) -> KeyDispatch {
     let input = app.slash_submit_text().unwrap_or_default();
     app.reset_textarea();

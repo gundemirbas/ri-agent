@@ -1,6 +1,6 @@
-# Xi Configuration Guide
+# ri Configuration Guide
 
-Xi is configured via `~/.config/ri/config.toml`. All fields are optional;
+ri is configured via `~/.config/ri/config.toml`. All fields are optional;
 missing values fall back to built-in defaults.
 
 ---

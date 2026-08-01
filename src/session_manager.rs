@@ -168,19 +168,19 @@ impl SessionManager {
 }
 
 /// Generate a random ephemeral session ID for use when persistence is
-/// unavailable.  Uses 4 random bytes hex-encoded to keep paths short
+/// unavailable.  Uses 8 random bytes hex-encoded to keep paths short
 /// while avoiding collisions between concurrent processes.
 fn ephemeral_session_id() -> String {
-    let mut bytes = [0u8; 4];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        // Last resort: use timestamp to avoid complete collision.
-        return format!(
-            "ephemeral-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        );
+    // 8 random bytes (64 bits of entropy) to keep collisions negligible
+    // between concurrent processes while the suffix stays path-friendly.
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Last resort: use timestamp + pid to avoid complete collision.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        return format!("ephemeral-{ts:016x}{}", std::process::id());
     }
     let suffix = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     format!("ephemeral-{suffix}")

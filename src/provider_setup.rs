@@ -2,7 +2,7 @@
 //! unavailable-provider sentinel used when no provider is available.
 
 use crate::app::App;
-use crate::config::XiConfig;
+use crate::config::RiConfig;
 use crate::llm::{LlmEvent, LlmProvider, LlmStream, Message, ModelListFuture, ToolDefinition};
 use crate::provider::{ThinkingSupport, thinking_support_for_instance};
 use crate::provider_instance::{BackendPreset, ProviderInstance};
@@ -35,7 +35,7 @@ impl LlmProvider for UnavailableProvider {
 /// 1. `config.provider` matched against effective providers
 /// 2. First effective provider
 /// 3. Fallback synthetic default (OpenAI)
-pub(crate) fn resolve_default_provider_instance(config: &XiConfig) -> ProviderInstance {
+pub(crate) fn resolve_default_provider_instance(config: &RiConfig) -> ProviderInstance {
     let effective = config.resolve_effective_providers();
 
     if let Some(ref id) = config.provider
@@ -51,7 +51,7 @@ pub(crate) fn resolve_default_provider_instance(config: &XiConfig) -> ProviderIn
 
 pub(crate) fn resolve_provider_instance(
     cli_override: Option<&str>,
-    config: &XiConfig,
+    config: &RiConfig,
 ) -> Result<ProviderInstance, String> {
     if let Some(id) = cli_override {
         if id == "test" {
@@ -101,7 +101,7 @@ pub(crate) fn with_resolved_model(
 /// Instance-based variant of `persist_provider_model_selection`.
 ///
 /// Updates the named instance's model in the providers list and persists config.
-pub(crate) fn persist_provider_model_selection_v2(config: &mut XiConfig, app: &mut App) {
+pub(crate) fn persist_provider_model_selection_v2(config: &mut RiConfig, app: &mut App) {
     let instance = &app.provider.current_instance;
     let model = &app.provider.current_model;
     let thinking = app.provider.current_thinking;
@@ -131,7 +131,7 @@ pub(crate) fn persist_provider_model_selection_v2(config: &mut XiConfig, app: &m
 
 // ── Thinking helpers ──────────────────────────────────────────────────────
 
-pub(crate) fn resolve_thinking_level_for_model(config: &XiConfig, model: &str) -> ThinkingLevel {
+pub(crate) fn resolve_thinking_level_for_model(config: &RiConfig, model: &str) -> ThinkingLevel {
     config
         .thinking_by_model
         .get(model)

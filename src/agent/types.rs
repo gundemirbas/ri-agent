@@ -254,6 +254,9 @@ pub struct ToolCallContext {
     /// When `Some`, tools can poll this to detect when the user has requested
     /// a hard abort or force kill.
     pub cancel_rx: Option<tokio::sync::watch::Receiver<CancelLevel>>,
+    /// Enables the `invoke_subagent` tool. `None` when subagent invocation is
+    /// not wired in this context (e.g. tests, headless tool runs).
+    pub subagent: Option<SubagentContext>,
 }
 
 #[cfg(test)]
@@ -264,8 +267,26 @@ impl ToolCallContext {
             id: id.into(),
             tx: None,
             cancel_rx: None,
+            subagent: None,
         }
     }
+}
+
+/// Runtime context handed to the `invoke_subagent` tool so it can run a named
+/// subagent against the current provider and tool universe.
+#[derive(Clone)]
+pub struct SubagentContext {
+    /// Provider used for the subagent's own LLM calls.
+    pub provider: std::sync::Arc<dyn crate::llm::LlmProvider + Send + Sync + 'static>,
+    /// All loaded agent definitions (project-local shadows global).
+    pub agents: std::sync::Arc<Vec<crate::agents::AgentMeta>>,
+    /// All loaded skills, filtered per-agent inside the subagent runner.
+    pub skills: std::sync::Arc<Vec<crate::skills::SkillMeta>>,
+    /// Working directory the subagent operates in.
+    pub cwd: String,
+    /// Outer tool registry from which the subagent's filtered tool set is
+    /// derived (excluding `invoke_subagent` itself to prevent recursion).
+    pub tools: ToolRegistry,
 }
 
 // ── Tool trait ────────────────────────────────────────────────────────────────
@@ -341,12 +362,18 @@ pub struct DefaultToolExecutor {
     /// Optional cancellation receiver for mid-tool abort checks (passed to
     /// [`ToolCallContext`]).
     pub cancel_rx: Option<tokio::sync::watch::Receiver<CancelLevel>>,
+    /// Subagent-launch context passed through to tools. When present, the
+    /// `invoke_subagent` tool can run named subagents (see [`SubagentContext`]).
+    pub subagent: Option<SubagentContext>,
 }
 
 impl DefaultToolExecutor {
     /// Create a new executor with empty context.
     pub fn new() -> Self {
-        Self { cancel_rx: None }
+        Self {
+            cancel_rx: None,
+            subagent: None,
+        }
     }
 }
 
@@ -373,6 +400,13 @@ impl ToolExecutor for DefaultToolExecutor {
                         id: id.to_string(),
                         tx,
                         cancel_rx: self.cancel_rx.clone(),
+                        subagent: self.subagent.as_ref().map(|s| SubagentContext {
+                            provider: s.provider.clone(),
+                            agents: s.agents.clone(),
+                            skills: s.skills.clone(),
+                            cwd: s.cwd.clone(),
+                            tools: tools.clone(),
+                        }),
                     };
                     let r = tool.run(args.clone(), ctx).await;
                     let cmd_summary = args.get("command").and_then(|v| v.as_str());
