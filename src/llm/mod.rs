@@ -316,35 +316,17 @@ pub type ModelListFuture =
 
 /// Trait every LLM backend must implement.
 ///
-/// `stream_chat` returns an `LlmStream` rather than accepting a channel
-/// sender. This decouples the trait from any specific async runtime primitive
-/// and makes implementors independently testable by collecting the stream.
-/// Session-owned request context supplied at send time.
-///
-/// Currently an empty marker; kept as the single place to add per-request,
-/// session-scoped routing hints without churning every `LlmProvider`
-/// signature.
-#[derive(Debug, Clone, Default)]
-pub struct LlmRequestContext {}
-
+/// `stream` returns an `LlmStream` rather than accepting a channel sender.
+/// This decouples the trait from any specific async runtime primitive and
+/// makes implementors independently testable by collecting the stream.
 pub trait LlmProvider: Send + Sync {
-    fn stream_chat(&self, messages: Vec<Message>, context: LlmRequestContext) -> LlmStream;
-
-    /// Stream a chat request with tool schemas available to the model.
+    /// Stream a chat request with the given tool schemas available to the
+    /// model.
     ///
     /// The returned stream may yield `LlmEvent::ToolCall` events when the
-    /// model decides to call a tool, or `LlmEvent::Token` events for normal
+    /// model decides to call a tool, `LlmEvent::Token` events for normal
     /// text responses — or a mix of both.
-    ///
-    /// The default implementation ignores `tools` and delegates to `stream_chat`.
-    fn stream_chat_with_tools(
-        &self,
-        messages: Vec<Message>,
-        _tools: Vec<ToolDefinition>,
-        context: LlmRequestContext,
-    ) -> LlmStream {
-        self.stream_chat(messages, context)
-    }
+    fn stream(&self, messages: Vec<Message>, tools: Vec<ToolDefinition>) -> LlmStream;
 
     /// Return the list of model names available from this provider.
     /// The default implementation returns an empty list; providers that

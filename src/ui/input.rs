@@ -270,21 +270,12 @@ pub(super) fn render_input_panel(
         } else {
             app.session.current_cwd.clone()
         };
-        let prefix = if app.shell.available.len() > 1 {
-            format!(
-                "[{}] {}{} ",
-                app.shell.selected.label(),
-                cwd,
-                app.shell.selected.prompt_char()
-            )
-        } else {
-            format!("{}{} ", cwd, app.shell.selected.prompt_char())
-        };
+        let prefix = format!("{cwd}$ ");
         (
             app.shell.textarea.lines().to_vec(),
             app.shell.textarea.cursor(),
             prefix,
-            (app.shell.available.len() > 1).then_some("Ctrl+S switch".to_string()),
+            None::<String>,
         )
     } else if app.provider.setup_step != ProviderSetupStep::Idle {
         let instance = app.pending_provider_instance();

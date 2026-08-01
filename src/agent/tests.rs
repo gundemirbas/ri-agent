@@ -5,12 +5,12 @@ use futures_util::stream;
 use tokio::sync::mpsc;
 
 use crate::agent::tools::ask_user::AskUserTool;
-use crate::agent::types::{AgentEvent, AskUserResponse, CancelLevel, Tool};
+use crate::agent::types::{AgentEvent, AskUserResponse, CancelLevel, Tool, ToolResult};
 use crate::agent::{AgentLoopConfig, DefaultToolExecutor, run_agent_loop};
 use crate::app_event::AppEvent;
 use crate::llm::{
-    AssistantPhase, LlmEvent, LlmProvider, LlmRequestContext, LlmStream, Message, ModelListFuture,
-    ToolDefinition, UsageStats,
+    AssistantPhase, LlmEvent, LlmProvider, LlmStream, Message, ModelListFuture, ToolDefinition,
+    UsageStats,
 };
 
 // ── MockProvider ──────────────────────────────────────────────────────────────
@@ -30,16 +30,7 @@ impl MockProvider {
 }
 
 impl LlmProvider for MockProvider {
-    fn stream_chat(&self, messages: Vec<Message>, context: LlmRequestContext) -> LlmStream {
-        self.stream_chat_with_tools(messages, vec![], context)
-    }
-
-    fn stream_chat_with_tools(
-        &self,
-        _messages: Vec<Message>,
-        _tools: Vec<ToolDefinition>,
-        _context: LlmRequestContext,
-    ) -> LlmStream {
+    fn stream(&self, _messages: Vec<Message>, _tools: Vec<ToolDefinition>) -> LlmStream {
         let events = self.turns.lock().unwrap().pop_front().unwrap_or_default();
         Box::pin(stream::iter(events))
     }
@@ -64,16 +55,7 @@ impl DelayedMockProvider {
 }
 
 impl LlmProvider for DelayedMockProvider {
-    fn stream_chat(&self, messages: Vec<Message>, context: LlmRequestContext) -> LlmStream {
-        self.stream_chat_with_tools(messages, vec![], context)
-    }
-
-    fn stream_chat_with_tools(
-        &self,
-        _messages: Vec<Message>,
-        _tools: Vec<ToolDefinition>,
-        _context: LlmRequestContext,
-    ) -> LlmStream {
+    fn stream(&self, _messages: Vec<Message>, _tools: Vec<ToolDefinition>) -> LlmStream {
         let events = self.turns.lock().unwrap().pop_front().unwrap_or_default();
         let delay = self.delay;
         Box::pin(stream::unfold(
@@ -575,15 +557,37 @@ async fn agent_loop_stream_error_is_reported() {
 }
 
 #[tokio::test]
-async fn agent_loop_before_hook_blocks_tool() {
-    // Turn 1: model requests a tool call; `before_tool_call` returns false.
-    // Turn 2: model gives a plain text answer after seeing the error result.
+async fn agent_loop_error_tool_result_completes_loop() {
+    // A tool that returns an error result must not hang or kill the loop: the
+    // model sees the error and answers, then the loop finishes with `Done`.
+    struct FailingTool;
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            "failing_tool"
+        }
+        fn description(&self) -> &str {
+            "test tool that always errors"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn run(
+            &self,
+            _args: serde_json::Value,
+            _ctx: crate::agent::types::ToolCallContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + '_>> {
+            Box::pin(async { ToolResult::err("boom") })
+        }
+    }
+
+    // Turn 1: model requests a tool that errors. Turn 2: model gives a plain
+    // text answer after seeing the error result.
     let provider = MockProvider::new(vec![
         vec![
             LlmEvent::ToolCall {
                 id: "call_1".to_string(),
-                name: "bash".to_string(),
-                args: serde_json::json!({"command": "echo hi"}),
+                name: "failing_tool".to_string(),
+                args: serde_json::json!({}),
             },
             LlmEvent::Done,
         ],
@@ -597,14 +601,13 @@ async fn agent_loop_before_hook_blocks_tool() {
     ]);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+    let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
+    tools.insert("failing_tool".to_string(), Arc::new(FailingTool));
     let config = AgentLoopConfig {
-        tools: HashMap::new(),
+        tools,
         file_tracker: make_tracker(),
         tool_output_log: make_log(),
-        executor: std::sync::Arc::new(crate::agent::types::DefaultToolExecutor::with_hooks(
-            Some(Box::new(|_name, _args| false)), // block everything
-            None,
-        )),
+        executor: make_executor(),
         session_events: vec![],
         current_model: "gpt-4o".to_string(),
         auto_compaction_enabled: true,
@@ -622,18 +625,18 @@ async fn agent_loop_before_hook_blocks_tool() {
         }
     }
 
-    let has_blocked_result = events
-        .iter()
-        .any(|ev| matches!(ev, AgentEvent::ToolCallEnd { result, .. } if result.is_error));
+    // The error result is delivered to the model as-is (is_error set).
     assert!(
-        has_blocked_result,
-        "expected a blocked (is_error) ToolCallEnd"
+        events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::ToolCallEnd { result, .. } if result.is_error)),
+        "expected an error ToolCallEnd"
     );
 
     // Loop should still complete (not hang or error out).
     assert!(
         matches!(events.last().unwrap(), AgentEvent::Done),
-        "expected Done after blocked tool call"
+        "expected Done after error tool result"
     );
 }
 
@@ -935,15 +938,7 @@ async fn agent_loop_pre_cancelled_exits_immediately() {
     // Provider would panic if called — any invocation means the test fails.
     struct PanicProvider;
     impl LlmProvider for PanicProvider {
-        fn stream_chat(&self, _: Vec<Message>, _: LlmRequestContext) -> LlmStream {
-            panic!("LLM should not be called when pre-cancelled")
-        }
-        fn stream_chat_with_tools(
-            &self,
-            _: Vec<Message>,
-            _: Vec<ToolDefinition>,
-            _: LlmRequestContext,
-        ) -> LlmStream {
+        fn stream(&self, _: Vec<Message>, _: Vec<ToolDefinition>) -> LlmStream {
             panic!("LLM should not be called when pre-cancelled")
         }
         fn list_models(&self) -> ModelListFuture {
@@ -1010,7 +1005,11 @@ async fn agent_loop_cancel_after_tool_call_stops_before_next_turn() {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let (_steering_tx, steering_rx) = mpsc::unbounded_channel();
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(CancelLevel::None);
+    // SoftStop set before the loop starts: the first turn runs to completion
+    // (including its tool call and result), then the loop stops at the turn
+    // boundary before invoking the model again.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(CancelLevel::SoftStop);
+    drop(cancel_tx);
 
     let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
     tools.insert("slow_tool".to_string(), Arc::new(SlowTool));
@@ -1019,14 +1018,7 @@ async fn agent_loop_cancel_after_tool_call_stops_before_next_turn() {
         tools,
         file_tracker: make_tracker(),
         tool_output_log: make_log(),
-        executor: std::sync::Arc::new(crate::agent::types::DefaultToolExecutor::with_hooks(
-            None,
-            // Cancel via the watch channel as soon as the tool call finishes.
-            Some(Box::new(move |_name, _result| {
-                let _ = cancel_tx.send(CancelLevel::HardAbort);
-                None
-            })),
-        )),
+        executor: make_executor(),
         session_events: vec![],
         current_model: "gpt-4o".to_string(),
         auto_compaction_enabled: true,

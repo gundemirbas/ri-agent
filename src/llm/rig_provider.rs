@@ -23,10 +23,10 @@ use rig_core::providers::openai::{Client as ResponsesClient, CompletionsClient};
 use rig_core::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 
 use super::{
-    AssistantPhase, LlmEvent, LlmRequestContext, LlmStream, Message, ModelListFuture, Role,
-    ToolDefinition, UsageStats,
+    AssistantPhase, LlmEvent, LlmStream, Message, ModelListFuture, Role, ToolDefinition, UsageStats,
 };
 use crate::llm::{ProviderError, ProviderErrorKind};
+use crate::provider_instance::ensure_v1_prefix;
 
 /// Which OpenAI wire protocol this provider uses.
 pub enum RigOpenAiApi {
@@ -50,15 +50,23 @@ pub struct RigOpenAiProvider {
     model: String,
     base_url: String,
     api_key: String,
+    /// Alternate base URL (with/without the `/v1` prefix, whichever the
+    /// primary does not use). Tried once on a pre-content 404 so that both
+    /// `…/v1` and pathless endpoint styles work.
+    alternate_base_url: Option<String>,
+    /// Per-request HTTP headers passed at construction, kept so a fallback
+    /// client can be rebuilt with the same headers.
+    headers: Vec<(String, String)>,
     reasoning_effort: Option<&'static str>,
 }
 
 impl RigOpenAiProvider {
     /// Create a provider for an OpenAI endpoint using `api_type`.
     ///
-    /// `base_url` should include the API version prefix, e.g.
-    /// `http://localhost:8000/v1` (rig appends `/chat/completions` or
-    /// `/responses`).
+    /// `base_url` may omit the `/v1` version prefix — it is added
+    /// automatically when the URL has no path of its own (e.g.
+    /// `https://api.openai.com` → `https://api.openai.com/v1`; rig then appends
+    /// `/chat/completions` or `/responses`).
     pub fn new(
         api_type: RigOpenAiApi,
         base_url: impl Into<String>,
@@ -76,9 +84,10 @@ impl RigOpenAiProvider {
         api_key: impl Into<String>,
         headers: Vec<(String, String)>,
     ) -> anyhow::Result<Self> {
-        let base_url = base_url.into().trim_end_matches('/').to_string();
+        let base_url = ensure_v1_prefix(&base_url.into());
+        let alternate_base_url = alternate_base_url(&base_url);
         let api_key: String = api_key.into();
-        let header_map = header_map_from_pairs(headers);
+        let header_map = header_map_from_pairs(headers.clone());
         let client = match api_type {
             RigOpenAiApi::Responses => {
                 RigClient::Responses(build_responses_client(&base_url, &api_key, header_map)?)
@@ -91,7 +100,9 @@ impl RigOpenAiProvider {
             client,
             model: model.into(),
             base_url,
+            alternate_base_url,
             api_key,
+            headers,
             reasoning_effort: None,
         })
     }
@@ -119,6 +130,29 @@ fn header_map_from_pairs(headers: Vec<(String, String)>) -> HeaderMap {
         map.insert(k, v);
     }
     map
+}
+
+/// Whether a provider error is an HTTP 404 (endpoint not found) — the
+/// signal used to retry the alternate base URL.
+fn is_not_found(e: &CompletionError) -> bool {
+    e.provider_response_status() == Some(http::StatusCode::NOT_FOUND)
+}
+
+/// The opposite of the configured base URL's `/v1` treatment: if the base
+/// ends with `/v1`, the alternate drops it; otherwise it appends `/v1`.
+fn alternate_base_url(base_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(base_url).ok()?;
+    let path = parsed.path().trim_end_matches('/');
+    let alt = if path.ends_with("/v1") {
+        let mut url = parsed.clone();
+        let base = path.strip_suffix("/v1").unwrap_or_default();
+        url.set_path(if base.is_empty() { "/" } else { base });
+        url
+    } else {
+        reqwest::Url::parse(&format!("{}/v1", base_url.trim_end_matches('/'))).ok()?
+    };
+    let alt_str = alt.to_string().trim_end_matches('/').to_string();
+    (alt_str != base_url).then_some(alt_str)
 }
 
 fn build_responses_client(
@@ -376,29 +410,23 @@ fn map_stream_item<R: GetTokenUsage>(
 }
 
 impl super::LlmProvider for RigOpenAiProvider {
-    fn stream_chat(&self, messages: Vec<Message>, context: LlmRequestContext) -> LlmStream {
-        self.stream_chat_with_tools(messages, vec![], context)
-    }
-
-    fn stream_chat_with_tools(
-        &self,
-        messages: Vec<Message>,
-        tools: Vec<ToolDefinition>,
-        _context: LlmRequestContext,
-    ) -> LlmStream {
+    fn stream(&self, messages: Vec<Message>, tools: Vec<ToolDefinition>) -> LlmStream {
         let client = self.client.clone();
         let model_name = self.model.clone();
         let reasoning_effort = self.reasoning_effort;
+        let api_key = self.api_key.clone();
+        let alternate_base_url = self.alternate_base_url.clone();
+        let headers = self.headers.clone();
         let rig_messages = to_rig_messages(&messages);
         let rig_tools = to_rig_tools(&tools);
 
-        let openai_completion_request = || CompletionRequest {
+        let openai_completion_request = move || CompletionRequest {
             model: None,
             preamble: None,
-            chat_history: OneOrMany::from_iter_optional(rig_messages)
+            chat_history: OneOrMany::from_iter_optional(rig_messages.clone())
                 .unwrap_or_else(|| OneOrMany::one(RigMessage::user(""))),
             documents: vec![],
-            tools: rig_tools,
+            tools: rig_tools.clone(),
             temperature: None,
             max_tokens: None,
             tool_choice: None,
@@ -409,70 +437,134 @@ impl super::LlmProvider for RigOpenAiProvider {
 
         match client {
             RigClient::Responses(client) => Box::pin(stream! {
-                let model = client.completion_model(model_name.clone());
-                let mut request = openai_completion_request();
-                // Responses API carries reasoning effort as `reasoning.effort`.
-                request.additional_params = reasoning_effort
-                    .map(|e| serde_json::json!({ "reasoning": { "effort": e } }));
-                let mut stream = match model.stream(request).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        yield LlmEvent::Error(to_provider_error(e));
-                        return;
-                    }
-                };
-                let mut phase = StreamPhase::Idle;
+                let mut client = client;
+                let mut retried = false;
+                let mut emitted = false;
                 let mut latest_usage: Option<UsageStats> = None;
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(item) => {
-                            let (events, usage) = map_stream_item(item, &mut phase);
-                            latest_usage = usage.or(latest_usage);
-                            for ev in events {
-                                yield ev;
+
+                'stream: loop {
+                    let model = client.completion_model(model_name.clone());
+                    // Responses API carries reasoning effort as `reasoning.effort`.
+                    let mut request = openai_completion_request();
+                    request.additional_params = reasoning_effort
+                        .map(|e| serde_json::json!({ "reasoning": { "effort": e } }));
+                    let mut stream = match model.stream(request).await {
+                        Ok(s) => s,
+                        Err(e) if !retried && is_not_found(&e) => {
+                            if let Some(alt) = alternate_base_url.clone()
+                                && let Ok(c) = build_responses_client(&alt, &api_key, header_map_from_pairs(headers.clone()))
+                            {
+                                client = c;
+                                retried = true;
+                                continue 'stream;
                             }
+                            yield LlmEvent::Error(to_provider_error(e));
+                            return;
                         }
                         Err(e) => {
                             yield LlmEvent::Error(to_provider_error(e));
                             return;
                         }
+                    };
+
+                    let mut phase = StreamPhase::Idle;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(item) => {
+                                emitted = true;
+                                let (events, usage) = map_stream_item(item, &mut phase);
+                                latest_usage = usage.or(latest_usage);
+                                for ev in events {
+                                    yield ev;
+                                }
+                            }
+                            Err(e) if !retried && !emitted && is_not_found(&e) => {
+                                if let Some(alt) = alternate_base_url.clone()
+                                    && let Ok(c) = build_responses_client(&alt, &api_key, header_map_from_pairs(headers.clone()))
+                                {
+                                    client = c;
+                                    retried = true;
+                                    continue 'stream;
+                                }
+                                yield LlmEvent::Error(to_provider_error(e));
+                                return;
+                            }
+                            Err(e) => {
+                                yield LlmEvent::Error(to_provider_error(e));
+                                return;
+                            }
+                        }
                     }
+                    break 'stream;
                 }
+
                 if let Some(usage) = latest_usage {
                     yield LlmEvent::Usage(usage);
                 }
                 yield LlmEvent::Done;
             }),
             RigClient::Completions(client) => Box::pin(stream! {
-                let model = client.completion_model(model_name.clone());
-                let mut request = openai_completion_request();
-                // Chat Completions sends reasoning effort as a top-level param.
-                request.additional_params = reasoning_effort
-                    .map(|e| serde_json::json!({ "reasoning_effort": e }));
-                let mut stream = match model.stream(request).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        yield LlmEvent::Error(to_provider_error(e));
-                        return;
-                    }
-                };
-                let mut phase = StreamPhase::Idle;
+                let mut client = client;
+                let mut retried = false;
+                let mut emitted = false;
                 let mut latest_usage: Option<UsageStats> = None;
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(item) => {
-                            let (events, usage) = map_stream_item(item, &mut phase);
-                            latest_usage = usage.or(latest_usage);
-                            for ev in events {
-                                yield ev;
+
+                'stream: loop {
+                    let model = client.completion_model(model_name.clone());
+                    // Chat Completions sends reasoning effort as a top-level param.
+                    let mut request = openai_completion_request();
+                    request.additional_params = reasoning_effort
+                        .map(|e| serde_json::json!({ "reasoning_effort": e }));
+                    let mut stream = match model.stream(request).await {
+                        Ok(s) => s,
+                        Err(e) if !retried && is_not_found(&e) => {
+                            if let Some(alt) = alternate_base_url.clone()
+                                && let Ok(c) = build_completions_client(&alt, &api_key, header_map_from_pairs(headers.clone()))
+                            {
+                                client = c;
+                                retried = true;
+                                continue 'stream;
                             }
+                            yield LlmEvent::Error(to_provider_error(e));
+                            return;
                         }
                         Err(e) => {
                             yield LlmEvent::Error(to_provider_error(e));
                             return;
                         }
+                    };
+
+                    let mut phase = StreamPhase::Idle;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(item) => {
+                                emitted = true;
+                                let (events, usage) = map_stream_item(item, &mut phase);
+                                latest_usage = usage.or(latest_usage);
+                                for ev in events {
+                                    yield ev;
+                                }
+                            }
+                            Err(e) if !retried && !emitted && is_not_found(&e) => {
+                                if let Some(alt) = alternate_base_url.clone()
+                                    && let Ok(c) = build_completions_client(&alt, &api_key, header_map_from_pairs(headers.clone()))
+                                {
+                                    client = c;
+                                    retried = true;
+                                    continue 'stream;
+                                }
+                                yield LlmEvent::Error(to_provider_error(e));
+                                return;
+                            }
+                            Err(e) => {
+                                yield LlmEvent::Error(to_provider_error(e));
+                                return;
+                            }
+                        }
                     }
+                    break 'stream;
                 }
+
                 if let Some(usage) = latest_usage {
                     yield LlmEvent::Usage(usage);
                 }
@@ -482,31 +574,48 @@ impl super::LlmProvider for RigOpenAiProvider {
     }
 
     fn list_models(&self) -> ModelListFuture {
-        let url = format!("{}/models", self.base_url);
+        let mut endpoints = vec![format!("{}/models", self.base_url)];
+        if let Some(alt) = &self.alternate_base_url {
+            let alt = format!("{alt}/models");
+            if !endpoints.contains(&alt) {
+                endpoints.push(alt);
+            }
+        }
         let api_key = self.api_key.clone();
         Box::pin(async move {
             let client = reqwest::Client::new();
-            let response = match client.get(&url).bearer_auth(api_key).send().await {
-                Ok(r) => r,
-                Err(e) => return Err(ProviderError::network("openai", e.to_string())),
-            };
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            if !(200..300).contains(&status) {
-                return Err(provider_error_for_status(status, body));
+            let mut last_error: Option<ProviderError> = None;
+            for url in endpoints {
+                let response = match client.get(&url).bearer_auth(&api_key).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_error = Some(ProviderError::network("openai", e.to_string()));
+                        continue;
+                    }
+                };
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    last_error = Some(provider_error_for_status(status, body));
+                    // On 404 the `/v1` variant may be the wrong one — try the
+                    // alternate endpoint before giving up.
+                    continue;
+                }
+                let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                    ProviderError::other("openai", format!("failed to parse /models: {e}"))
+                })?;
+                let ids = value["data"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m["id"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok(ids);
             }
-            let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-                ProviderError::other("openai", format!("failed to parse /models: {e}"))
-            })?;
-            let ids = value["data"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| m["id"].as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            Ok(ids)
+            Err(last_error
+                .unwrap_or_else(|| ProviderError::other("openai", "no model endpoint responded")))
         })
     }
 }
@@ -524,6 +633,30 @@ mod tests {
 
     fn assistant_msg(content: &str) -> Message {
         Message::assistant(content)
+    }
+
+    #[test]
+    fn constructor_appends_v1_to_pathless_base_url() {
+        let p = RigOpenAiProvider::new(
+            RigOpenAiApi::Responses,
+            "http://localhost:9999",
+            "main",
+            "key",
+        )
+        .unwrap();
+        assert_eq!(p.base_url, "http://localhost:9999/v1");
+    }
+
+    #[test]
+    fn constructor_keeps_existing_path_untouched() {
+        let p = RigOpenAiProvider::new(
+            RigOpenAiApi::Responses,
+            "http://localhost:9999/api",
+            "main",
+            "key",
+        )
+        .unwrap();
+        assert_eq!(p.base_url, "http://localhost:9999/api");
     }
 
     #[test]
@@ -716,11 +849,7 @@ data: [DONE]
             "test",
         )
         .unwrap();
-        let mut stream = provider.stream_chat_with_tools(
-            vec![Message::user("naber")],
-            vec![],
-            LlmRequestContext {},
-        );
+        let mut stream = provider.stream(vec![Message::user("naber")], vec![]);
         let mut tokens = Vec::new();
         let mut done = false;
         while let Some(ev) = stream.next().await {
@@ -774,11 +903,7 @@ data: [DONE]
             "test",
         )
         .unwrap();
-        let mut stream = provider.stream_chat_with_tools(
-            vec![Message::user("naber")],
-            vec![],
-            LlmRequestContext {},
-        );
+        let mut stream = provider.stream(vec![Message::user("naber")], vec![]);
         let mut tokens = Vec::new();
         let mut done = false;
         while let Some(ev) = stream.next().await {
@@ -794,5 +919,106 @@ data: [DONE]
         }
         assert!(done, "expected Done");
         assert_eq!(tokens.join(""), "merhaba");
+    }
+
+    /// A pathless base URL is normalized to `/v1`, so the primary request hits
+    /// `/v1/...` and works out of the box.
+    #[tokio::test]
+    async fn pathless_base_url_auto_appends_v1() {
+        use futures_util::StreamExt;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let sse = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"main","choices":[{"index":0,"delta":{"content":"merhaba"},"finish_reason":null}]}
+
+data: [DONE]
+
+"#;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        // No `/v1` in the configured URL — it must be appended automatically.
+        let provider =
+            RigOpenAiProvider::new(RigOpenAiApi::Completions, server.uri(), "main", "test")
+                .unwrap();
+        let mut stream = provider.stream(vec![Message::user("naber")], vec![]);
+        let mut tokens = Vec::new();
+        let mut done = false;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                LlmEvent::Token { text, .. } => tokens.push(text),
+                LlmEvent::Done => {
+                    done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(done, "expected Done");
+        assert_eq!(tokens.join(""), "merhaba");
+    }
+
+    /// When the primary (`/v1`) endpoint 404s but the pathless one works, the
+    /// stream must transparently fall back and still produce the answer.
+    #[tokio::test]
+    async fn falls_back_to_alternate_base_on_404() {
+        use futures_util::StreamExt;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let sse = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"main","choices":[{"index":0,"delta":{"content":"fallback"},"finish_reason":null}]}
+
+data: [DONE]
+
+"#;
+        let server = MockServer::start().await;
+        // Primary: `/v1/chat/completions` → 404 (server exposes API at root).
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        // Alternate: `/chat/completions` → succeeds.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        // Configured without `/v1`: normalization adds it as the primary; the
+        // pathless URL becomes the fallback.
+        let provider =
+            RigOpenAiProvider::new(RigOpenAiApi::Completions, server.uri(), "main", "test")
+                .unwrap();
+        let mut stream = provider.stream(vec![Message::user("naber")], vec![]);
+        let mut tokens = Vec::new();
+        let mut done = false;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                LlmEvent::Token { text, .. } => tokens.push(text),
+                LlmEvent::Done => {
+                    done = true;
+                    break;
+                }
+                LlmEvent::Error(e) => eprintln!("EVENT ERROR: {:?} | {}", e.kind, e.message),
+                _ => {}
+            }
+        }
+        assert!(done, "expected Done after fallback");
+        assert_eq!(tokens.join(""), "fallback");
     }
 }

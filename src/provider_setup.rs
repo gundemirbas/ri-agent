@@ -3,7 +3,7 @@
 
 use crate::app::App;
 use crate::config::XiConfig;
-use crate::llm::{LlmEvent, LlmProvider, LlmStream, Message, ModelListFuture};
+use crate::llm::{LlmEvent, LlmProvider, LlmStream, Message, ModelListFuture, ToolDefinition};
 use crate::provider::{ThinkingSupport, thinking_support_for_instance};
 use crate::provider_instance::{BackendPreset, ProviderInstance};
 use crate::thinking::ThinkingLevel;
@@ -15,24 +15,11 @@ pub(crate) struct UnavailableProvider {
 }
 
 impl LlmProvider for UnavailableProvider {
-    fn stream_chat(
-        &self,
-        _messages: Vec<Message>,
-        _context: crate::llm::LlmRequestContext,
-    ) -> LlmStream {
+    fn stream(&self, _messages: Vec<Message>, _tools: Vec<ToolDefinition>) -> LlmStream {
         let msg = self.message.clone();
         Box::pin(async_stream::stream! {
             yield LlmEvent::Error(crate::llm::ProviderError::other("unavailable", msg));
         })
-    }
-
-    fn stream_chat_with_tools(
-        &self,
-        _messages: Vec<Message>,
-        _tools: Vec<crate::llm::ToolDefinition>,
-        _context: crate::llm::LlmRequestContext,
-    ) -> LlmStream {
-        self.stream_chat(vec![], crate::llm::LlmRequestContext::default())
     }
 
     fn list_models(&self) -> ModelListFuture {

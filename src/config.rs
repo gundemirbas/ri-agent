@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs, path::PathBuf};
 
 use anyhow::Context;
 
-use crate::provider_instance::{BackendClass, BackendPreset, ProviderInstance};
+use crate::provider_instance::{BackendPreset, ProviderInstance};
 
 /// Display thresholds — presentation choices that control how much content
 /// is shown in the UI. These do not affect how much is sent to the model.
@@ -43,12 +43,6 @@ pub struct XiConfig {
     /// Named provider instances.
     #[serde(default)]
     pub providers: Vec<ProviderInstance>,
-
-    // Provider-specific persisted settings (legacy per-preset config; kept for
-    // backward-compatible TOML parsing and any UI convenience state that still
-    // reads from them).
-    #[serde(default)]
-    pub openai: OpenAiConfig,
 }
 
 impl XiConfig {
@@ -80,47 +74,18 @@ impl XiConfig {
         self.providers.len() < before
     }
 
-    /// Return all available providers: built-in catalog defaults merged with
-    /// user config overrides, plus user-created instances.
+    /// Return all user-configured provider instances, sorted by id.
     ///
-    /// Built-in hosted providers always appear (from catalog or config override).
-    /// User-supplied providers appear only when present in config.
-    /// Sorted: built-ins before user-created, alphabetical within each group.
+    /// There are no built-in hosted providers — every usable provider is a
+    /// user-configured instance (the internal test preset is excluded).
     pub fn resolve_effective_providers(&self) -> Vec<ProviderInstance> {
-        let mut result = Vec::new();
-
-        // Built-in hosted providers: catalog defaults, overridden by config.
-        for preset in BackendPreset::built_in_hosted() {
-            let id = preset.id().to_string();
-            if let Some(cfg) = self.find_provider(&id) {
-                result.push(cfg.clone());
-            } else {
-                result.push(ProviderInstance::new(id, preset.clone()));
-            }
-        }
-
-        // User-supplied providers: config only.
-        for provider in &self.providers {
-            if provider.backend_preset.def().backend_class == BackendClass::UserSuppliedService {
-                result.push(provider.clone());
-            }
-        }
-
-        // Sort: built-ins before user-created, alphabetical within each group.
-        result.sort_by(|a, b| {
-            let a_builtin = BackendPreset::built_in_hosted()
-                .iter()
-                .any(|p| p.id() == a.id);
-            let b_builtin = BackendPreset::built_in_hosted()
-                .iter()
-                .any(|p| p.id() == b.id);
-            match (a_builtin, b_builtin) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.id.cmp(&b.id),
-            }
-        });
-
+        let mut result: Vec<ProviderInstance> = self
+            .providers
+            .iter()
+            .filter(|p| p.backend_preset.is_user_supplied())
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| a.id.cmp(&b.id));
         result
     }
 
@@ -132,13 +97,6 @@ impl XiConfig {
         }
         BackendPreset::from_id(id).map(|preset| ProviderInstance::new(id, preset))
     }
-}
-
-#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
-pub struct OpenAiConfig {
-    pub api_key: Option<String>,
-    pub base_url: Option<String>,
-    pub model: Option<String>,
 }
 
 impl XiConfig {
@@ -198,54 +156,6 @@ mod tests {
         save_config(&path, &cfg).unwrap();
 
         assert!(path.exists());
-    }
-
-    #[test]
-    fn provider_sections_parse_without_synthesising_instances() {
-        let raw = r#"
-provider = "openai"
-thinking = "low"
-
-[thinking_by_model]
-gpt-4o-mini = "minimal"
-gpt-5 = "high"
-
-[openai]
-api_key = "sk-test"
-base_url = "https://api.openai.com/v1"
-model = "gpt-4o-mini"
-
-[gemini]
-base_url = "https://cloudcode-pa.googleapis.com"
-model = "gemini-2.5-pro"
-
-[ollama]
-base_url = "http://localhost:11434"
-model = "llama3.1"
-recent_endpoints = ["http://localhost:11434", "http://gpu-box:11434"]
-"#;
-
-        let cfg = XiConfig::from_toml_str(raw).expect("config parses");
-
-        assert_eq!(cfg.provider.as_deref(), Some("openai"));
-        assert_eq!(cfg.thinking.as_deref(), Some("low"));
-        assert_eq!(
-            cfg.thinking_by_model.get("gpt-4o-mini").map(String::as_str),
-            Some("minimal")
-        );
-        assert_eq!(
-            cfg.thinking_by_model.get("gpt-5").map(String::as_str),
-            Some("high")
-        );
-        assert_eq!(cfg.openai.api_key.as_deref(), Some("sk-test"));
-        assert_eq!(
-            cfg.openai.base_url.as_deref(),
-            Some("https://api.openai.com/v1")
-        );
-        assert_eq!(cfg.openai.model.as_deref(), Some("gpt-4o-mini"));
-        // Legacy [gemini]/[ollama] sections are silently ignored — no provider
-        // instance synthesised.
-        assert!(cfg.providers.is_empty());
     }
 
     #[test]
@@ -336,27 +246,9 @@ base_url = "http://gpu-box:11434"
     }
 
     #[test]
-    fn resolve_effective_providers_includes_builtins_on_empty_config() {
+    fn resolve_effective_providers_empty_on_empty_config() {
         let cfg = XiConfig::default();
-        let effective = cfg.resolve_effective_providers();
-        // All built-in hosted presets are present.
-        for preset in BackendPreset::built_in_hosted() {
-            assert!(
-                effective.iter().any(|p| p.id == preset.id()),
-                "missing built-in: {}",
-                preset.id()
-            );
-        }
-        // No user-supplied providers on empty config.
-        let builtin_ids: Vec<&str> = BackendPreset::built_in_hosted()
-            .iter()
-            .map(|p| p.id())
-            .collect();
-        for p in &effective {
-            if !builtin_ids.contains(&p.id.as_str()) {
-                panic!("unexpected non-builtin provider: {}", p.id);
-            }
-        }
+        assert!(cfg.resolve_effective_providers().is_empty());
     }
 
     #[test]

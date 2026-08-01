@@ -1,22 +1,17 @@
 use ratatui_textarea::TextArea;
 
-use crate::shell::{self, ShellKind};
-
 /// State owned by the shell input mode.
+///
+/// ri is Linux-only and always runs commands through `sh`, so there is no
+/// shell selection — this struct only owns the shell-mode textarea.
 pub struct ShellState {
     pub(crate) textarea: TextArea<'static>,
-    pub(crate) selected: ShellKind,
-    pub(crate) available: Vec<ShellKind>,
 }
 
 impl ShellState {
     pub fn new() -> Self {
-        let available = shell::discover_available_shells();
-        let selected = available.first().copied().unwrap_or(ShellKind::Bash);
         Self {
             textarea: Self::make_textarea(),
-            selected,
-            available,
         }
     }
 
@@ -33,18 +28,6 @@ impl ShellState {
             .lines()
             .iter()
             .all(|line| line.trim().is_empty())
-    }
-
-    pub fn cycle(&mut self) {
-        if self.available.len() <= 1 {
-            return;
-        }
-        let idx = self
-            .available
-            .iter()
-            .position(|s| *s == self.selected)
-            .unwrap_or(0);
-        self.selected = self.available[(idx + 1) % self.available.len()];
     }
 }
 

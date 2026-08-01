@@ -11,7 +11,7 @@
 //! textarea and selection widgets.  `ProviderManager` is a pure data holder.
 
 use crate::provider_instance::ProviderInstance;
-use crate::provider_instance::{ApiType, AuthMode, BackendPreset};
+use crate::provider_instance::{ApiType, BackendPreset};
 use crate::thinking::ThinkingLevel;
 
 /// Tracks which step of the provider setup input flow is currently active.
@@ -322,13 +322,7 @@ impl SetupInputKind {
                     .unwrap_or_else(|| "URL: ".to_string()),
                 None => "URL: ".to_string(),
             },
-            Self::ApiKey => match instance {
-                Some(p) => match p.backend_preset.def().auth_mode {
-                    AuthMode::ApiKey => "API key: ".to_string(),
-                    _ => "token: ".to_string(),
-                },
-                None => "API key: ".to_string(),
-            },
+            Self::ApiKey => "API key: ".to_string(),
         }
     }
 }

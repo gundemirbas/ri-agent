@@ -309,10 +309,10 @@ pub type ToolRegistry = HashMap<String, Arc<dyn Tool>>;
 
 /// Abstraction over the execution of a single tool call.
 ///
-/// Implementors decide whether to allow, block, override, or log the call.
-/// The agent loop calls [`ToolExecutor::execute_tool`] instead of invoking the
-/// `Tool` trait directly, so test doubles can inject controlled behaviour
-/// without constructing shared-state wrappers.
+/// Implementors decide how to dispatch and log the call. The agent loop calls
+/// [`ToolExecutor::execute_tool`] instead of invoking the `Tool` trait
+/// directly, so test doubles can inject controlled behaviour without
+/// constructing shared-state wrappers.
 pub trait ToolExecutor: Send + Sync {
     /// Execute the named tool with the given arguments.
     ///
@@ -335,41 +335,18 @@ pub trait ToolExecutor: Send + Sync {
 
 /// The default [`ToolExecutor`] used in production.
 ///
-/// Runs the optional `before_tool_call` guard (returning an error result when
-/// it returns `false`), dispatches to the matching [`Tool`], applies the log
-/// notice for tools that save output, then runs the optional `after_tool_call`
-/// override.
+/// Looks up the matching [`Tool`], runs it, and applies the log notice for
+/// tools that save output.
 pub struct DefaultToolExecutor {
-    /// Optional hook called before each tool execution. Return `false` to block.
-    pub before_tool_call: Option<BeforeToolCall>,
-    /// Optional hook called after each tool execution. Return `Some(result)` to override.
-    pub after_tool_call: Option<AfterToolCall>,
     /// Optional cancellation receiver for mid-tool abort checks (passed to
     /// [`ToolCallContext`]).
     pub cancel_rx: Option<tokio::sync::watch::Receiver<CancelLevel>>,
 }
 
 impl DefaultToolExecutor {
-    /// Create a new executor with no hooks and empty context.
+    /// Create a new executor with empty context.
     pub fn new() -> Self {
-        Self {
-            before_tool_call: None,
-            after_tool_call: None,
-            cancel_rx: None,
-        }
-    }
-
-    /// Create an executor with optional before/after hooks (for tests only).
-    #[cfg(test)]
-    pub fn with_hooks(
-        before_tool_call: Option<BeforeToolCall>,
-        after_tool_call: Option<AfterToolCall>,
-    ) -> Self {
-        Self {
-            before_tool_call,
-            after_tool_call,
-            ..Self::new()
-        }
+        Self { cancel_rx: None }
     }
 }
 
@@ -390,37 +367,19 @@ impl ToolExecutor for DefaultToolExecutor {
         tx: Option<UnboundedSender<crate::app_event::AppEvent>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let blocked = self
-                .before_tool_call
-                .as_ref()
-                .map(|f| !f(name, &args))
-                .unwrap_or(false);
-
-            let mut result = if blocked {
-                ToolResult::err(format!("Tool call '{name}' was blocked"))
-            } else {
-                match tools.get(name) {
-                    Some(tool) => {
-                        let ctx = ToolCallContext {
-                            id: id.to_string(),
-                            tx,
-                            cancel_rx: self.cancel_rx.clone(),
-                        };
-                        let r = tool.run(args.clone(), ctx).await;
-                        let cmd_summary = args.get("command").and_then(|v| v.as_str());
-                        r.with_log_notice(id, cmd_summary, &mut log.lock().unwrap())
-                    }
-                    None => ToolResult::err(format!("Unknown tool: '{name}'")),
+            match tools.get(name) {
+                Some(tool) => {
+                    let ctx = ToolCallContext {
+                        id: id.to_string(),
+                        tx,
+                        cancel_rx: self.cancel_rx.clone(),
+                    };
+                    let r = tool.run(args.clone(), ctx).await;
+                    let cmd_summary = args.get("command").and_then(|v| v.as_str());
+                    r.with_log_notice(id, cmd_summary, &mut log.lock().unwrap())
                 }
-            };
-
-            if let Some(f) = &self.after_tool_call
-                && let Some(override_result) = f(name, &result)
-            {
-                result = override_result;
+                None => ToolResult::err(format!("Unknown tool: '{name}'")),
             }
-
-            result
         })
     }
 }
@@ -511,12 +470,6 @@ pub enum AgentEvent {
 
 // ── Agent loop configuration ──────────────────────────────────────────────────
 
-/// Hook called before each tool execution. Return `false` to block the call.
-pub type BeforeToolCall = Box<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
-
-/// Hook called after each tool execution. Return `Some(result)` to override.
-pub type AfterToolCall = Box<dyn Fn(&str, &ToolResult) -> Option<ToolResult> + Send + Sync>;
-
 /// Configuration passed to `run_agent_loop`.
 pub struct AgentLoopConfig {
     /// Tools available to the model.
@@ -528,7 +481,6 @@ pub struct AgentLoopConfig {
     pub tool_output_log:
         std::sync::Arc<std::sync::Mutex<crate::agent::tool_output_log::ToolOutputLog>>,
     /// Executor responsible for dispatching individual tool calls.
-    /// Wraps the before/after hooks and any override logic.
     pub executor: std::sync::Arc<dyn ToolExecutor>,
     /// Current session event log snapshot used for compaction decisions.
     pub session_events: Vec<crate::session_event::SessionEvent>,

@@ -23,16 +23,15 @@
   4. interactive rows
 - Interactive rows are mutually exclusive by mode:
   - menu rows (completions / selection) in normal interaction mode
-  - login panel rows during `/login <provider>`
 - Any control-band row may be hidden when inactive, but relative ordering is invariant.
 - Render a scrollable, paginated view of the session history, with the most recent command at the bottom.
 - Tool invocations are rendered as "<icon> <args>", where <icon> is a visual representation of the tool (e.g. a terminal icon for `bash`, a pencil for `edit`, etc.).
-  - Shell tool calls (`bash` / `cmd` / `powershell`) show the command with embedded newlines preserved, up to 5 lines. When truncated, the display shows `…` on its own line.
+  - Shell tool call (`bash`) and local shell mode show the command with embedded newlines preserved, up to 5 lines. When truncated, the display shows `…` on its own line.
   - `👀` read_file
   - `✏️` write_file
   - `📝` edit_file
   - `🔍` find_files
-  - `💻` shell tools (`bash` / `cmd` / `powershell`)
+  - `💻` shell tool (`bash`) and local shell mode
   - `❓` ask_user
 - System message/status icons:
   - `ℹ️` system/info (neutral system message)
@@ -59,29 +58,4 @@
 - When automatic or manual compaction runs, the UI shows a visible `compacting…` status and then a `[compacted: Xk → Yk tokens]` marker in the session log.
 - Slash commands include `/compact [instructions]`, which triggers immediate context compaction and passes optional user guidance into the compaction summary prompt.
 - While the agent loop is running, Enter enqueues the typed text as a **steering message**. Queued steering messages are shown at the bottom of the chat log with a `🕹️` icon. When the agent loop consumes a steering message at the next turn boundary, it is removed from the pinned area and inserted into the conversation as a regular user message after the completed assistant turn and before the next assistant turn begins. Queued steering does not cancel already-emitted tool calls in the current turn.
-
-## Login panel
-
-When `/login <provider>` is active (currently `copilot`, `codex`, or `gemini`) the input area is replaced by a login panel
-injected at the bottom of the screen (the same vertical layout slot as the
-selection menu).
-
-Layout:
-
-```
-┌─ header row ──────────────────────────────────── Esc cancel ─┐
-│  <status/progress line>                                       │
-│                                                               │
-│  URL: [open in browser →]   ← OSC 8 hyperlink                │
-│  Code: XXXX-YYYY            ← device flow only               │
-└───────────────────────────────────────────────────────────────┘
-```
-
-- The browser is opened automatically via `xdg-open` / `open` / `start`.
-- The `open in browser →` label is an OSC 8 terminal hyperlink; clicking it
-  opens the URL in terminals that support hyperlinks (Kitty, WezTerm, iTerm2,
-  GNOME Terminal ≥ 3.26, foot, …). In other terminals it renders as underlined
-  text.
-- `Esc` cancels the flow; success or failure is appended to the chat log.
-- The panel height adjusts automatically to the number of content rows.
 

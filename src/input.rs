@@ -10,7 +10,7 @@ use crate::{
     keybindings::{self, KeyBindingId},
     llm::{LlmProvider, Message},
     provider::{ThinkingSupport, thinking_support_for_instance},
-    provider_instance::{AuthMode, ProviderInstance},
+    provider_instance::ProviderInstance,
     provider_manager::ProviderSetupStep,
     provider_setup::resolve_default_provider_instance,
     thinking::ThinkingLevel,
@@ -58,7 +58,7 @@ pub(crate) fn normalize_paste_text(text: &str) -> String {
 }
 
 pub(crate) fn provider_setup_requires_api_key(instance: &ProviderInstance) -> bool {
-    instance.backend_preset.def().auth_mode == AuthMode::ApiKey
+    instance.backend_preset.is_user_supplied()
 }
 
 fn resolve_current_run_instance(app: &App, config: &XiConfig) -> ProviderInstance {
@@ -304,11 +304,6 @@ fn handle_global_key_shortcuts(
 }
 
 fn handle_shell_mode_key(app: &mut App, key: KeyEvent) -> KeyDispatch {
-    if keybindings::matches(KeyBindingId::CycleShell, key) {
-        app.cycle_shell();
-        return KeyDispatch::Continue;
-    }
-
     match key.code {
         KeyCode::Esc => app.exit_shell_mode(),
         KeyCode::Backspace if app.shell_input_is_empty() => app.exit_shell_mode(),
@@ -371,8 +366,7 @@ fn handle_selection_mode_key(app: &mut App, config: &XiConfig, key: KeyEvent) ->
         {
             if let Some(id) = app.selected_provider_id()
                 && let Some(instance) = config.find_provider(id)
-                && instance.backend_preset.def().backend_class
-                    == crate::provider_instance::BackendClass::UserSuppliedService
+                && instance.backend_preset.is_user_supplied()
             {
                 app.enter_provider_edit_mode(instance);
             }
@@ -384,8 +378,7 @@ fn handle_selection_mode_key(app: &mut App, config: &XiConfig, key: KeyEvent) ->
         {
             if let Some(id) = app.selected_provider_id()
                 && let Some(instance) = config.find_provider(id)
-                && instance.backend_preset.def().backend_class
-                    == crate::provider_instance::BackendClass::UserSuppliedService
+                && instance.backend_preset.is_user_supplied()
             {
                 app.enter_provider_removal_confirmation_mode(instance);
             }
@@ -575,12 +568,7 @@ fn handle_chat_submit(
                 && app
                     .pending_provider_instance()
                     .as_ref()
-                    .map(|i| {
-                        matches!(
-                            i.backend_preset.def().endpoint_behavior,
-                            crate::provider_instance::EndpointBehavior::UserSupplied
-                        )
-                    })
+                    .map(|i| i.backend_preset.is_user_supplied())
                     .unwrap_or(false);
 
             if is_two_step {

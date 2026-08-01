@@ -67,7 +67,6 @@ cargo install --path .
 | `Ctrl+Z`        | Suspend ri only when the UI is idle and no agent/shell subprocess is running |
 | `Ctrl+D`        | Quit when input is empty (or leave shell mode if shell input is empty) |
 | `Ctrl+E`        | Edit the selected custom provider (provider picker) |
-| `Ctrl+S`        | Cycle between available shells (shell mode) |
 | `!`             | Enter shell mode when input is empty |
 | `Alt+C`         | Copy the last assistant response |
 | `Alt+Up` / `Alt+Down` | Step backward / forward through session history |

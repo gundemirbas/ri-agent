@@ -41,7 +41,7 @@ Each agent output line and tool invocation is prefixed with an indicator icon:
 | Agent final response           | 💬   |
 | Agent provisional response     | 💭   |
 | Agent thinking                 | 🧠   |
-| `bash` / `cmd` / `powershell`  | 💻   |
+| `bash`                        | 💻   |
 | `exec`                         | ⚙️   |
 | `read_file`                    | 👀   |
 | `write_file`                   | ✏️   |
@@ -96,7 +96,7 @@ This convention applies consistently to all tool bodies.
 - Intent: rendered from available arguments — `🔍 <pattern>`, `🔍 <pattern> in <path>`, or `🔍 in <path>` — using whichever fields are present. At minimum shows `🔍 find_files` if no arguments are yet available.
 - Body: list of matched file paths, head-truncated to 8 entries.
 
-#### `bash` / `cmd` / `powershell`
+#### `bash`
 
 - Intent: `💻 <command>` — multiline commands preserved up to 5 lines, then `…` on its own line. Streams in as the LLM generates the `command` argument.
 - Body: combined stdout/stderr output interleaved as produced, tail-truncated to 8 lines.

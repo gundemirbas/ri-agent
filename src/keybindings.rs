@@ -11,7 +11,6 @@ pub(crate) enum KeyBindingId {
     CopyLastAssistantResponse,
     ToggleFullOutput,
     ResumeLatestSession,
-    CycleShell,
     EditProvider,
     RemoveProvider,
     EnterShellMode,
@@ -160,12 +159,6 @@ pub(crate) const KEYBINDINGS: &[KeyBinding] = &[
         description: "Insert a newline in chat input",
     },
     KeyBinding {
-        id: Some(KeyBindingId::CycleShell),
-        shortcut: "Ctrl+S",
-        context: BindingContext::Shell,
-        description: "Cycle between available shells",
-    },
-    KeyBinding {
         id: Some(KeyBindingId::ExitShellOnEmptyBackspace),
         shortcut: "Backspace",
         context: BindingContext::Shell,
@@ -223,9 +216,6 @@ pub(crate) fn matches(id: KeyBindingId, key: KeyEvent) -> bool {
         }
         KeyBindingId::ResumeLatestSession => {
             key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL)
-        }
-        KeyBindingId::CycleShell => {
-            key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL)
         }
         KeyBindingId::EditProvider => {
             key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -302,10 +292,6 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
             ),
             (
-                KeyBindingId::CycleShell,
-                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            ),
-            (
                 KeyBindingId::EditProvider,
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
             ),
@@ -370,11 +356,6 @@ mod tests {
         assert!(!matches(
             KeyBindingId::Abort,
             KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)
-        ));
-        // Alt+S should not match CycleShell (which is Ctrl+S)
-        assert!(!matches(
-            KeyBindingId::CycleShell,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)
         ));
         // Enter+Shift should not match Submit (which requires no modifiers)
         assert!(!matches(

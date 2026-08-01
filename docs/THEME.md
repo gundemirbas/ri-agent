@@ -302,37 +302,6 @@ hint.italic = true
 
 ---
 
-### `[login]`
-
-The provider login / authentication screen. The keys listed below are all
-available keys for this section.
-
-```toml
-[login]
-header.bg = "#141e3c"
-content.bg = "#0f1630"
-
-# Instruction text
-instruction.fg = "#b4b4c8"
-
-# Status info line
-status.fg = "#ffffff"
-
-# "URL:" label
-url_key.fg = "#78c8ff"
-
-# URL value
-url_val.fg = "#64dc64"
-
-# "Code:" label
-code_key.fg = "#78c8ff"
-
-# Code value
-code_val.fg = "#ffff00"
-```
-
----
-
 ### `[markdown]`
 
 Markdown rendering in assistant messages.
@@ -485,12 +454,6 @@ placeholder.text = "asking…"
 placeholder.fg = "#666688"
 placeholder.italic = true
 ```
-
-> **Note:** The Windows shell tools `cmd` and `powershell` follow the same
-> pattern as `bash` — they support `prefix`, `body`, `placeholder`, and
-> `placeholder.lines`. They are not shown above since they fall back to
-> `[tools.default]` on most systems, but can be overridden the same way as
-> any other tool.
 
 Custom tools defined in your skills or tool configs can be styled the same way
 using their tool name as the key:

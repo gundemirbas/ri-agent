@@ -55,7 +55,6 @@ mod session;
 mod session_event;
 mod session_manager;
 mod session_state;
-mod shell;
 mod shell_state;
 mod skills;
 mod step_back_state;

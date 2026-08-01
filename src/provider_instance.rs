@@ -40,27 +40,6 @@ pub enum BackendPreset {
     Test,
 }
 
-/// Whether a preset represents a user-supplied service or an internal helper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendClass {
-    UserSuppliedService,
-    Internal,
-}
-
-/// How the user authenticates a provider instance for a preset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthMode {
-    ApiKey,
-    None,
-}
-
-/// Whether the endpoint is supplied by the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EndpointBehavior {
-    UserSupplied,
-    Internal,
-}
-
 /// URL normalization parameters for a backend preset that accepts a user-supplied URL.
 pub struct UrlNormalization {
     /// Default scheme to prepend when none is present (e.g. `"https"`).
@@ -90,7 +69,26 @@ impl UrlNormalization {
             _ => return None,
         }
         url.host_str()?;
-        Some(url.to_string().trim_end_matches('/').to_string())
+        Some(ensure_v1_prefix(url.as_ref()))
+    }
+}
+
+/// Ensure an API base URL includes the version prefix real servers expect.
+///
+/// OpenAI-compatible servers expose their API under a `/v1` path (rig appends
+/// `/chat/completions` or `/responses`). When the configured URL has no path of
+/// its own (e.g. `https://api.openai.com` or `http://localhost:11434`), append
+/// `/v1` so these bare endpoints work out of the box. URLs that already carry a
+/// path (e.g. `/api` for Open WebUI) are left untouched.
+pub fn ensure_v1_prefix(base_url: &str) -> String {
+    match reqwest::Url::parse(base_url) {
+        Ok(mut url) => {
+            if url.path().is_empty() || url.path() == "/" {
+                url.set_path("/v1");
+            }
+            url.to_string().trim_end_matches('/').to_string()
+        }
+        Err(_) => base_url.trim_end_matches('/').to_string(),
     }
 }
 
@@ -100,8 +98,6 @@ pub struct BackendPresetDef {
     pub id: &'static str,
     /// Human-readable display label.
     pub label: &'static str,
-    /// Which class of backend this preset belongs to.
-    pub backend_class: BackendClass,
     /// Whether the user is asked to choose an API type when adding this preset
     /// (i.e. the preset supports more than one selectable protocol).
     pub user_selects_api: bool,
@@ -109,10 +105,6 @@ pub struct BackendPresetDef {
     pub allowed_apis: &'static [ApiType],
     /// The recommended / default API type.
     pub default_api: ApiType,
-    /// Whether the endpoint is predetermined or user-supplied.
-    pub endpoint_behavior: EndpointBehavior,
-    /// Which authentication mode this preset requires.
-    pub auth_mode: AuthMode,
     /// URL normalization parameters for presets that accept a user-supplied URL.
     /// `None` for presets with internal endpoints.
     pub url_normalization: Option<UrlNormalization>,
@@ -123,12 +115,9 @@ pub const BACKEND_PRESET_CATALOG: &[BackendPresetDef] = &[
     BackendPresetDef {
         id: "openai-compatible",
         label: "OpenAI-compatible endpoint",
-        backend_class: BackendClass::UserSuppliedService,
         user_selects_api: true,
         allowed_apis: &[ApiType::OpenAiResponses, ApiType::OpenAiCompatible],
         default_api: ApiType::OpenAiCompatible,
-        endpoint_behavior: EndpointBehavior::UserSupplied,
-        auth_mode: AuthMode::ApiKey,
         url_normalization: Some(UrlNormalization {
             default_scheme: "https",
             endpoint_label: "URL: ",
@@ -137,12 +126,9 @@ pub const BACKEND_PRESET_CATALOG: &[BackendPresetDef] = &[
     BackendPresetDef {
         id: "test",
         label: "Test (UI exercise)",
-        backend_class: BackendClass::Internal,
         user_selects_api: false,
         allowed_apis: &[ApiType::Test],
         default_api: ApiType::Test,
-        endpoint_behavior: EndpointBehavior::Internal,
-        auth_mode: AuthMode::None,
         url_normalization: None,
     },
 ];
@@ -168,12 +154,10 @@ impl BackendPreset {
         self.def().label
     }
 
-    /// Built-in hosted providers that always appear in the provider picker.
-    ///
-    /// There are no unconditional hosted singletons anymore — every usable
-    /// provider is a user-configured service.
-    pub fn built_in_hosted() -> &'static [BackendPreset] {
-        &[]
+    /// Whether this preset is a user-configurable service (the only one users
+    /// ever add). False for the internal test preset.
+    pub fn is_user_supplied(&self) -> bool {
+        matches!(self, Self::OpenAiCompatible)
     }
 
     pub fn from_id(s: &str) -> Option<Self> {
@@ -285,16 +269,17 @@ mod tests {
     }
 
     #[test]
-    fn built_in_hosted_is_empty() {
-        assert!(BackendPreset::built_in_hosted().is_empty());
-    }
-
-    #[test]
     fn provider_preset_metadata_matches_spec_semantics() {
-        let compat = BackendPreset::OpenAiCompatible.def();
-        assert_eq!(compat.backend_class, BackendClass::UserSuppliedService);
-        assert_eq!(compat.auth_mode, AuthMode::ApiKey);
-        assert_eq!(compat.endpoint_behavior, EndpointBehavior::UserSupplied);
+        // Only the user-facing preset is selectable/user-supplied; test is internal.
+        assert!(BackendPreset::OpenAiCompatible.is_user_supplied());
+        assert!(!BackendPreset::Test.is_user_supplied());
+        assert!(
+            BackendPreset::OpenAiCompatible
+                .def()
+                .url_normalization
+                .is_some()
+        );
+        assert!(BackendPreset::Test.def().url_normalization.is_none());
     }
 
     #[test]
@@ -322,5 +307,42 @@ mod tests {
             Some("https://localhost:8000/v1".into())
         );
         assert_eq!(norm.normalize(""), None);
+    }
+
+    #[test]
+    fn url_normalization_appends_v1_when_path_is_empty() {
+        let norm = UrlNormalization {
+            default_scheme: "https",
+            endpoint_label: "URL: ",
+        };
+        assert_eq!(
+            norm.normalize("api.openai.com"),
+            Some("https://api.openai.com/v1".into())
+        );
+        // Existing paths (e.g. Open WebUI /api) are left untouched.
+        assert_eq!(
+            norm.normalize("https://my-webui.example.com/api"),
+            Some("https://my-webui.example.com/api".into())
+        );
+    }
+
+    #[test]
+    fn ensure_v1_prefix_only_touches_pathless_urls() {
+        assert_eq!(
+            ensure_v1_prefix("https://api.openai.com"),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            ensure_v1_prefix("http://localhost:11434"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            ensure_v1_prefix("https://my-webui.example.com/api"),
+            "https://my-webui.example.com/api"
+        );
+        assert_eq!(
+            ensure_v1_prefix("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1"
+        );
     }
 }

@@ -4,9 +4,6 @@
 # User-specific Cargo config
 .cargo/
 
-# Local xi-agent project files
-.xi/
-
 # Editor / IDE
 .vscode/
 .idea/
@@ -28,10 +25,8 @@ log
 .agents/skills/gitea-issue-status
 
 # Session exports
-tau-session-*.html
+ri-session-*.html
 
 # Todo / scratch files
 .todo
 .worktrees/
-.plans/
-.issues/

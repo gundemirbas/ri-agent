@@ -7,9 +7,12 @@
 ## Purpose
 
 `ri-agent` is a terminal AI agent harness. It provides a streaming TUI for
-conversational interaction with LLMs and runs the full agentic loop: user
-message → model response → tool call → tool result → model continues,
-until the model returns a final answer without tool calls.
+conversational interaction with an OpenAI-compatible LLM endpoint and runs the
+full agentic loop: user message → model response → tool call → tool result →
+model continues, until the model returns a final answer without tool calls.
+
+The backend surface is deliberately single: one OpenAI-compatible provider
+(`rig`-powered) plus a hidden `test` provider used to exercise the UI.
 
 ## Module Map
 
@@ -17,93 +20,112 @@ until the model returns a final answer without tool calls.
 src/
   main.rs              — tokio entry point, CLI parsing, outer provider loop
   app.rs               — App state, event handling, submission, scroll
-  ui.rs                — all ratatui rendering, pre-wrapping, scroll logic
-  markdown.rs          — markdown → ratatui Lines renderer (paragraphs, headings, code, tables, lists)
+  app_interaction.rs   — App methods that manipulate UI state (selection,
+                         completion, thinking, provider pickers)
+  app_submission.rs    — submit pipeline (user text → session events → agent loop)
+  app_agent_handlers.rs— handling of AgentEvent → session/live-turn updates
+  app_event.rs         — AppEvent enum (agent events + UI events over mpsc)
+  input.rs             — keyboard routing by input mode
+  keybindings.rs       — keybinding catalog and matching
+  ui.rs (+ ui/)        — all ratatui rendering, pre-wrapping, scroll logic
+  theme.rs             — Theme struct + theme.toml loading
+  markdown.rs          — markdown → ratatui Lines renderer
   mouse_select.rs      — click-drag text selection and copy in the log view
-  commands/
-    mod.rs             — slash-command registry (COMMANDS, SlashCommand, CommandAction, parse)
-  completion.rs        — CompletionItem and completions_for (completion popup logic)
-  completion_state.rs  — CompletionState sub-struct: popup items, selection index, model-fetch status
-  selection_state.rs   — SelectionState, SelectionKind, MAX_SELECTION_VISIBLE
-  login_state.rs       — LoginState, LoginActionKind: auth panel state, login action menu enum, and all login-flow methods (start_login, cancel_login, enter_login_selection_mode, enter_login_action_menu, apply_login_action, apply_login_event, clipboard_set)
-  ask_user_state.rs    — AskUserState, PendingAsk: pending agent ask-user request state
-  agent_runtime.rs     — AgentRuntime: agent task handle, event channels, steering queue, cancellation
-  agents.rs            — AgentMeta, load_agents(), filter_tools/filter_skills, /agent command support
-  config.rs            — config.toml loading (XDG + HOME fallback)
-  provider.rs          — provider routing, thinking support, context-window fallback table
-  provider_instance.rs — BackendPreset/ProviderInstance types and preset metadata catalog
-  event_log.rs          — append-only durable session event log (JSONL, legacy message migration)
-  projection.rs         — pure and incremental projections from SessionEvent history to display/LLM messages
-  session_event.rs      — durable committed conversation/domain event types
-  session_state.rs      — committed session owner: EventLog + display/LLM read models
-  live_turn.rs          — transient in-flight assistant/tool/notices state for one active turn
-  session.rs            — persisted chat session storage/index
+  commands/mod.rs      — slash-command registry (COMMANDS, SlashCommand, parse)
+  completion.rs        — CompletionItem and completions_for (completion popup)
+  completion_state.rs  — CompletionState sub-struct (popup + model-fetch state)
+  selection_state.rs   — SelectionState/SelectionKind menu picker state
+  ask_user_state.rs    — AskUserState/PendingAsk (agent ask-user bridge to TUI)
+  agent_turn_state.rs  — AgentTurnState (streaming status/throbber fields)
+  shell_state.rs       — shell-mode textarea state (bash only)
+  step_back_state.rs   — step-back/step-forward navigation state
+  log_view_state.rs    — LogCache/LogViewState (wrapped-line cache, scroll)
+  agents.rs            — user-definable agent profiles (SYSTEM.md/AGENTS.md,
+                         tool/skill filtering)
+  skills.rs            — SKILL.md loading and /skill: expansion
+  config.rs            — config.toml loading/saving (XDG + HOME fallback)
+  provider.rs          — provider routing, thinking support
+  provider_instance.rs — ProviderInstance type and preset metadata
+  provider_manager.rs  — provider picker/setup/removal state machine
+  provider_setup.rs    — UnavailableProvider sentinel + default resolution
+  thinking.rs          — ThinkingLevel (off/minimal/low/…/xhigh)
+  session.rs           — SessionStore (file-backed JSONL session storage)
+  session_manager.rs   — SessionManager (App-owned session state bundle)
+  event_log.rs         — append-only durable session event log (JSONL)
+  session_event.rs     — durable committed conversation/domain event types
+  session_state.rs     — committed session owner: EventLog + display/LLM models
+  live_turn.rs         — transient in-flight assistant/tool state for one turn
+  projection.rs        — pure/incremental projections from event history
+  context_window.rs    — per-model context-window table and token budgets
+  export.rs            — /export: self-contained HTML session export
   tool_presentation.rs — tool call/result rendering helpers for the TUI
-  auth/                — provider auth store + login/refresh flows + token-state preflight
+  at_file.rs           — @file argument expansion
+  clipboard.rs         — OSC 52 clipboard set
+  atomic_file.rs       — atomic file writes
+  dirs.rs              — shared ProjectDirs + --print-dirs
+  debug_log.rs         — debug logging to ~/.cache/ri
+  tracked.rs           — Tracked<T> (change-tracking wrapper)
+  process.rs           — subprocess detach-from-tty plumbing
+  print_mode.rs        — non-interactive -p/--print mode
   agent/
     mod.rs             — run_agent_loop: the multi-turn agentic loop
-    types.rs           — Tool trait, ToolRegistry, AgentEvent, AgentLoopConfig
-    system_prompt.rs   — build_system_prompt: dynamic system prompt, accepts optional AgentMeta
-    file_tracker.rs    — FileTracker: mtime+hash snapshot, external-change detection, diff generation
+    types.rs           — Tool/ToolExecutor traits, AgentEvent, AgentLoopConfig
+    system_prompt.rs   — build_system_prompt (dynamic, agent-aware)
+    file_tracker.rs    — FileTracker: external-change detection + diff
+    compaction.rs      — context compaction (summary generation, triggers)
     tools/
-      mod.rs           — register_builtin_tools() (built-ins + custom tools)
-      bash.rs          — BashTool  (💻 run shell command)
-      terminal.rs      — apply_terminal_render: emulate terminal cursor behavior for \r
+      mod.rs           — register_builtin_tools (built-ins + custom tools)
+      bash.rs          — BashTool (💻 run shell command)
       read.rs          — ReadFileTool (👀 read file with offset/limit)
       write.rs         — WriteTool (✏️ write/overwrite file)
       edit.rs          — EditTool  (📝 replace exact text in file)
       find.rs          — FindTool  (🔍 search by name glob or content pattern)
+      ask_user.rs      — AskUserTool (❓ interactive question to the user)
+      read_skill.rs    — ReadSkillTool (load a SKILL.md body)
+      exec.rs          — exec-path resolution helpers
+      subprocess.rs    — SubprocessCommand (shared run/stream/cancel logic)
+      truncate.rs      — output truncation (TruncationResult)
+      utf8.rs          — UTF-8/binary handling for file tools
+      terminal.rs      — apply_terminal_render (\r emulation for bash output)
       custom.rs        — CustomTool, load_custom_tools, custom_tool_dirs
   llm/
-    mod.rs             — LlmProvider trait, Message/Role/LlmEvent/ToolDefinition types
-    error.rs           — ProviderError, ProviderErrorKind (typed HTTP/network failures)
-    common.rs          — shared HTTP helpers: send_streaming_request, status→ProviderError mapping
-    openai.rs          — OpenAiProvider (OpenAI Chat Completions, tool-calling)
-    copilot.rs         — CopilotProvider (route by model: vendor from /models cache, name heuristics fallback)
-    codex.rs           — CodexProvider (chatgpt.com/backend-api responses)
-    anthropic.rs       — AnthropicProvider (Messages API transport)
-    gemini.rs          — GeminiProvider (Google Cloud Code Assist streaming)
-    ollama.rs          — OllamaProvider (streaming NDJSON via /api/chat)
-    test_provider.rs   — TestProvider (scripted sequences for UI exercise/testing)
+    mod.rs             — LlmProvider trait, Message/Role/LlmEvent/ToolDefinition
+    error.rs           — ProviderError/ProviderErrorKind (typed failures)
+    rig_provider.rs    — RigOpenAiProvider (OpenAI Responses + Completions via rig)
+    test_provider.rs   — TestProvider (hidden UI/system-prompt exercise provider)
 ```
 
 ## Data Flow
 
 ```
-User keystroke → App::submit
-  └─ ensure SessionState exists
-     └─ append committed UserMessage event via SessionState ingestion
-        └─ spawns tokio task: run_agent_loop(messages, config, provider, tx, steering_rx)
-             └─ drain steering_rx → insert queued user messages before each turn
-                for each turn:
-                  check FileTracker for externally modified files
-                    └─ if any: inject ⚠️ user message with unified diff (or warn-only if large)
-                               send AgentEvent::ExternalFileChange
-                  provider.stream_chat_with_tools(messages, tool_defs)
-                    └─ yields LlmEvent::{Token{..}, ThinkingToken, Usage,
-                                         ToolIntentStart, ToolCall, Done, Error}
-                  if ToolCall → tool.execute(args) → ToolResult
-                    └─ drain steering_rx after each tool → skip remaining tools if non-empty
-                  loop until no tool calls
-                  sends AgentEvent::{TextToken{..}, ThinkingToken, Usage,
-                                     ToolIntentStart, SteeringConsumed,
-                                     ToolCallStart, ToolCallEnd,
-                                     ExternalFileChange,
-                                     TurnEnd, Done, Error} on tx
+User keystroke → input.rs → App::submit
+  └─ ensure SessionState exists (create/resume persisted session)
+     └─ append UserMessage event via SessionState ingestion
+        └─ spawns tokio task: run_agent_loop(config, provider, tx, steering_rx, cancel_rx)
+             instrumented by AppEvent::Agent events
+             for each turn:
+               check FileTracker for externally modified files
+                 └─ if any: inject ⚠️ user message with unified diff
+               provider.stream(messages, tool_defs)
+                 └─ yields LlmEvent::{ThinkingToken, Token{phase}, Usage,
+                                      ToolCall{args}, Done, Error}
+               if ToolCall → executor.execute_tool → ToolResult (+ live chunks)
+               loop until no tool calls
+               sends AgentEvent::{TextToken, ThinkingToken, Usage, …,
+                                  ToolCallStart, ToolCallEnd, TurnEnd,
+                                  Done, Error} on tx
 
 User keystroke (while streaming) → App::enqueue_steering_from_input
-  └─ pushes text onto queued_steering (for 🕹️ UI) + sends on steering_tx
+  └─ pushes text onto queued_steering + sends on steering_tx
+     (consumed at the next turn boundary)
 
 App::apply_event drains tx on each draw tick
-  ├─ committed events → SessionState ingestion
-  │   └─ updates committed display + committed LLM read models
+  ├─ committed events → SessionState ingestion (EventLog + projections)
   └─ transient streaming/tool/notices → LiveTurnState
-      └─ ui::draw renders committed SessionState display + LiveTurnState overlay
+      ui::draw renders committed SessionState display + LiveTurnState overlay
 
 LLM input construction
-  └─ App::prepare_llm_messages
-      └─ system prompt + SessionState committed LLM projection only
-         (LiveTurnState content is excluded)
+  └─ system prompt (agent-aware) + SessionState committed LLM projection only
 ```
 
 ## Key Types
@@ -112,59 +134,35 @@ LLM input construction
 
 ```rust
 pub enum AssistantPhase { Unknown, Provisional, Final }
-
-pub struct UsageStats {
-    pub input_tokens: Option<usize>,
-    pub output_tokens: Option<usize>,
-    pub total_tokens: Option<usize>,
-}
+pub struct UsageStats { input/output/total/cached tokens, used_tokens() }
 
 pub struct Message {
-    pub role: Role,                      // System | User | Assistant | ToolCall | ToolResult
+    pub role: Role,                       // System|User|Assistant|ToolCall|ToolResult
     pub content: String,
-    pub thinking: Option<String>,        // chain-of-thought block
+    pub thinking: Option<String>,         // chain-of-thought block
     pub assistant_phase: Option<AssistantPhase>,
-    pub tool_call_id: Option<String>,
-    pub tool_name: Option<String>,
-    pub tool_args: Option<serde_json::Value>,
+    pub hidden: bool,                     // persisted + sent but not rendered
+    pub include_in_llm: bool,
+    pub tool_call_id / tool_name / tool_args,
     pub is_error: bool,
+    pub display_range: Option<DisplayRange>,   // partial read_file windows
+    pub image_data: Option<ImageData>,         // binary image tool results
 }
-
-// session_state.rs — committed session owner
-pub struct SessionState {
-    event_log: EventLog,
-    display: DisplayProjection,
-    llm: LlmProjection,
-}
-
-// live_turn.rs — transient in-flight turn state
-pub struct LiveTurnState {
-    pub assistant_content: String,
-    pub assistant_thinking: Option<String>,
-    pub assistant_phase: AssistantPhase,
-    pub tool_entries: Vec<LiveToolEntry>,
-    pub notices: Vec<Message>,
-}
-
-// llm/error.rs — typed provider failure
-pub enum ProviderErrorKind { Unauthorized, Forbidden, RateLimited, ServerError, Network, Other }
-pub struct ProviderError { pub kind: ProviderErrorKind, pub status_code: Option<u16>,
-                           pub source: String, pub message: String }
 
 pub enum LlmEvent {
-    Token { text: String, phase: AssistantPhase },
     ThinkingToken(String),
+    Token { text: String, phase: AssistantPhase },
     Usage(UsageStats),
-    ToolIntentStart,
-    ToolCall { id: String, name: String, args: serde_json::Value },
+    ToolCallStart { id, name },
+    ToolCallArgsDelta { id, partial_json },
+    ToolCall { id, name, args },
     Done,
-    Error(ProviderError),   // typed; 401→Unauthorized, 403→Forbidden, 429→RateLimited
+    Error(ProviderError),
 }
 
 pub trait LlmProvider: Send + Sync {
-    fn stream_chat(&self, messages: Vec<Message>) -> LlmStream;
-    fn stream_chat_with_tools(&self, messages: Vec<Message>, tools: Vec<ToolDefinition>) -> LlmStream;
-    fn list_models(&self) -> ModelListFuture;  // Result<Vec<String>, ProviderError>; default: []
+    fn stream(&self, messages: Vec<Message>, tools: Vec<ToolDefinition>) -> LlmStream;
+    fn list_models(&self) -> ModelListFuture;   // default: []
 }
 ```
 
@@ -174,28 +172,25 @@ pub trait LlmProvider: Send + Sync {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
-    fn parameters_schema(&self) -> serde_json::Value; // JSON Schema object
-    fn execute(&self, args: serde_json::Value) -> Pin<Box<dyn Future<Output = ToolResult> + Send + '_>>;
+    fn parameters_schema(&self) -> serde_json::Value;
+    fn streaming_field(&self) -> Option<&'static str> { None }
+    fn run(&self, args, ctx: ToolCallContext) -> Future<Output = ToolResult>;
 }
 
-pub enum AgentEvent {
-    TextToken { text: String, phase: AssistantPhase },
-    ThinkingToken(String),
-    Usage(UsageStats),
-    ToolIntentStart,
-    SteeringConsumed { text: String },
-    ToolCallStart { id, name, args },
-    ToolCallEnd   { id, name, result: ToolResult },
-    TurnEnd,
-    Done,
-    Error(ProviderError),  // typed low-level error; app/main format user-facing text
+pub trait ToolExecutor: Send + Sync {
+    fn execute_tool(&self, id, name, args, tools, log, tx) -> Future<Output = ToolResult>;
 }
 
 pub struct AgentLoopConfig {
     pub tools: ToolRegistry,
     pub file_tracker: Arc<Mutex<FileTracker>>,
-    pub before_tool_call: Option<Box<dyn Fn(&str, &Value) -> bool + Send + Sync>>,
-    pub after_tool_call:  Option<Box<dyn Fn(&str, &ToolResult) -> Option<ToolResult> + Send + Sync>>,
+    pub tool_output_log: Arc<Mutex<ToolOutputLog>>,
+    pub executor: Arc<dyn ToolExecutor>,
+    pub session_events: Vec<SessionEvent>,         // compaction decisions
+    pub current_model: String,
+    pub auto_compaction_enabled: bool,
+    pub manual_compaction_instructions: Option<String>,
+    pub system_prompt: Option<String>,
 }
 ```
 
@@ -216,209 +211,87 @@ responsive during long model responses.
 user steering text into a dedicated channel. The UI renders queued entries at
 the bottom with `🕹️` until the loop consumes them at the next turn boundary.
 On consumption, a `SteeringConsumed` event removes the pinned row and inserts
-the message into normal transcript order after the completed assistant turn and
-before the next assistant turn. Already-emitted tool calls in the current turn
-are allowed to finish; steering does not cancel them.
+the message into normal transcript order. Already-emitted tool calls in the
+current turn are allowed to finish; steering does not cancel them.
 
-**`LlmProvider` trait** — all provider-specific wire formats are contained
-in `llm/*.rs`. Message serialization is centralized in
-`llm/provider_format.rs` (`to_openai_wire`,
-`to_gemini_wire`, `to_ollama_wire`); individual provider
-modules delegate to the appropriate function rather than maintaining their
-own inline conversion logic. `agent/mod.rs`, `app.rs`, and `ui.rs` are
-provider-agnostic. New backends implement the trait and are registered in
-`provider.rs`.
+**Progressive cancellation** — `CancelLevel` (`None < SoftStop < HardAbort <
+ForceKill`) is shared via a `tokio::sync::watch` channel. The agent loop checks
+it at turn boundaries; subprocess tools poll it mid-execution. `SoftStop`
+finishes the current turn (model response + tool batch) then exits; `HardAbort`
+aborts the model request and SIGTERMs the subprocess; `ForceKill` SIGKILLs it.
 
-**`AgentLoopConfig` hooks** — `before_tool_call` and `after_tool_call` are
-optional function pointers passed in at construction time. This keeps the
-agent loop itself free of UI concerns; a future tool-confirmation UI will
-wire a user-approval step through `before_tool_call` without touching the
-loop logic.
-
-**Outer provider loop in `main.rs`** — `run()` returns a `RunResult` enum
-(`Quit | ChangeModel | ChangeProvider`) rather than mutating global state.
-The outer loop in `main` rebuilds the active provider instance's transport and
-re-enters `run()` on every model/provider-instance switch, so `App` and `ui`
-never depend directly on backend transport details.
+**`LlmProvider` trait** — all provider wire formats are contained in
+`llm/rig_provider.rs`. The agent loop, `app.rs`, and `ui` are
+provider-agnostic. `provider.rs` maps a `ProviderInstance` (id, base_url,
+api_key, model, api_type) to a `RigOpenAiProvider` over either the OpenAI
+Responses protocol or the Chat-Completions protocol.
 
 **Typed provider errors** — `LlmEvent::Error`, `AgentEvent::Error`, and
-`ModelListFuture` carry `ProviderError` (with `ProviderErrorKind`) rather
-than a raw string. HTTP status is mapped centrally in `llm/common.rs`:
-401→`Unauthorized`, 403→`Forbidden`, 429→`RateLimited`, 5xx→`ServerError`,
-network failures→`Network`. Lower layers preserve structured error facts
-(`status_code`, low-level `source`, original `message`) without rewriting the
-provider/body text. User-facing wording is composed later in `app.rs` and
-`main.rs` using the active provider/backend label, so OpenAI-compatible
-transports do not surface as `OpenAI` for backends such as Open WebUI. 403
-explicitly does **not** trigger a token refresh.
-
-**Proactive auth refresh** — before submitting a request or starting a model
-fetch, `App::check_token_preflight` inspects the stored `expires_at` via
-`auth::token_state`. If the token is `Expired` or `ExpiringSoon` (within
-`AUTH_REFRESH_LEEWAY_SECS` = 120 s), it triggers a refresh and defers the
-request. A reactive fallback on `Unauthorized` errors handles clock skew and
-server-side revocation. The `auth_retry_budget` is not consumed by the
-preflight, leaving one reactive retry available if the request still gets a
-401 after refresh.
+`ModelListFuture` carry `ProviderError` (with `ProviderErrorKind`). HTTP status
+is mapped in `llm/error.rs`: 401→`Unauthorized`, 403→`Forbidden`, 429→
+`RateLimited`, 5xx→`ServerError`, network failures→`Network`. User-facing
+wording is composed later in `app.rs` using the active provider label, so
+OpenAI-compatible transports do not surface as `OpenAI` for backends such as
+Open WebUI.
 
 **Display-only sanitization** — message content is stored and sent to the
 LLM verbatim. Trailing whitespace per line, leading/trailing newlines, and
 excess blank-line collapsing are applied only at render time inside
 `ui::sanitize_for_display`. This avoids any mutation of LLM context.
 
-**Per-model thinking settings** — `ThinkingLevel` (Off/Minimal/Low/Medium/
-High/XHigh) is resolved at request time from `config.thinking_by_model`
-(per-model override) then `config.thinking` (global default). The `/thinking`
-command updates the active model's entry and is shown only when the active
-provider/model pair reports mapped thinking support. Translation is centralized
-in `thinking.rs`: OpenAI-Responses-style backends use a shared reasoning-effort
-mapping, Gemini native uses a shared Gemini-specific mapping, and unsupported
-routes ignore the setting. For Copilot, support is model-dependent because the
-backend route is chosen per model (`gpt-5`/Codex-style models use Responses;
-chat-completions and Anthropic-routed models do not currently map thinking).
+**Thinking settings** — `ThinkingLevel` (Off/Minimal/Low/Medium/High/XHigh) is
+resolved at request time from `config.thinking_by_model` (per-model override)
+then `config.thinking` (global default). Both OpenAI wire protocols carry it as
+`reasoning.effort`; the test provider ignores it.
 
 **Custom user tools** — at startup (and on `/reload`), `load_custom_tools`
 scans three directories in order: `~/.ri/tools/`, `./.ri/tools/` (project-
-local), and `ProjectDirs::config_dir()/tools/`. Each executable that responds
-to `--describe` with a valid JSON descriptor (`name`, `description`,
-`parameters_schema`) is registered as a `CustomTool`. At invocation, JSON
-args are written to the process stdin; stdout is the result string; non-zero
-exit becomes `ToolResult::err`. Built-in tool names take precedence — a
-custom tool whose name collides with a built-in is silently dropped (logged
-at debug). All three tool directories are shown in `ri --print-dirs`.
+local), and the XDG config `tools/`. Each executable that responds to
+`--describe` with a valid JSON descriptor is registered as a `CustomTool`.
+Built-in tool names take precedence — a colliding custom tool is silently
+dropped (logged at debug). All tool directories are shown by `--print-dirs`.
 
-**Bash tool terminal rendering** — `apply_terminal_render()` in
-`agent/tools/terminal.rs` emulates terminal cursor behavior for carriage
-returns (`\r`). When bash commands output progress bars or spinners that use
-`\r` to overwrite the current line, the function simulates terminal rendering
-to produce clean output: characters overwrite from the cursor position (which
-is reset to 0 on `\r`), and only the final rendered state is passed to the
-model. This avoids cluttering the LLM's context with intermediate progress
-states while preserving multi-line output unchanged.
+**Bash tool terminal rendering** — `apply_terminal_render()`
+(`agent/tools/terminal.rs`) emulates terminal cursor behavior for carriage
+returns (`\r`): characters overwrite from the cursor position (reset to 0 on
+`\r`), and only the final rendered state is passed to the model. This keeps
+progress bars/spinners out of the LLM's context while preserving multi-line
+output unchanged.
 
 **External file change detection** — `FileTracker` (`agent/file_tracker.rs`)
-records a snapshot (mtime + SHA-256 + content) for every file successfully
-touched by `read_file`, `write_file`, or `edit_file`. At the start of each
-LLM turn, `check_modified()` stats every tracked path; if mtime is unchanged
-the file is skipped cheaply. On mtime change, the file is re-read and
-rehashed; content-identical saves (no-op writes) are suppressed. Truly
-changed files produce a `ChangedFile { path, old_content, new_content }`.
-The agent loop composes a single ⚠️ user message: diffs with ≤
-`DIFF_INLINE_MAX_LINES` (50) changed lines are inlined as unified diffs
-(via `similar`); larger diffs get a warn-only note. The message is injected
-into the conversation history and mirrored to the UI via
-`AgentEvent::ExternalFileChange { paths, notification }`. Binary files
-(non-UTF-8) are silently skipped. The tracker is held as
-`Arc<Mutex<FileTracker>>` shared between `AgentLoopConfig` and the three
-file tools.
+records a snapshot (mtime + SHA-256 + content) for every file touched by
+`read_file`, `write_file`, or `edit_file`. At the start of each LLM turn,
+`check_modified()` stats every tracked path; on mtime change the file is
+re-read and rehashed, content-identical saves are suppressed, and truly changed
+files produce a ⚠️ injected user message with a unified diff (or a warn-only
+note for large diffs). Binary files are skipped.
 
-## Context Compaction
+**Durable session event log** — every conversation is an append-only JSONL
+`session_event.rs` event stream (`Sessions` under the XDG data dir, grouped by
+cwd). `SessionState` ingests events and maintains two projections:
+`DisplayProjection` (what the chat log shows) and `LlmProjection` (what gets
+sent to the model). `live_turn.rs` overlays the transient in-flight turn on top
+of the committed display. This is what powers `/resume` (Ctrl-R), `/export`,
+and durable context compaction.
 
-Tau now supports durable context compaction through the session event log.
-When a completed turn crosses the active model's context threshold, or when a
-provider returns a context-overflow-style error, the agent generates a
-structured summary of older history and appends a
-`SessionEvent::CompactionSummary` boundary. The LLM projection injects the
-most recent summary as a synthetic user message and excludes older events,
-while the display projection shows a visible `[compacted: Xk → Yk tokens]`
-marker.
+**Context compaction** — when a completed turn crosses the active model's
+context threshold, or a provider returns a context-overflow error, the agent
+generates a structured summary of older history and appends a
+`SessionEvent::CompactionSummary` boundary. The LLM projection injects the most
+recent summary as a synthetic user message and excludes older events, while the
+display projection shows a visible `[compacted: Xk → Yk tokens]` marker.
+Compaction can also be triggered manually with `/compact [instructions]`.
 
-Compaction uses two token measures:
-- provider-reported turn usage when available for trigger decisions
-- ri-estimated current context size (`chars / 4`) for cut-point selection and
-  before/after reporting
+**User-definable agents** — agent profiles live in `~/.ri/agents/<name>/`
+(global) and `.ri/agents/<name>/` (project-local, shadowing global). Each agent
+has a `SYSTEM.md` (YAML frontmatter + system-prompt body; `AGENT.md` fallback)
+and an optional `AGENTS.md` that replaces the global instructions. Tool/skill
+filtering is applied at prompt-build time via `agents::filter_tools` /
+`filter_skills`. `ask_user` and `read_skill` are always present.
+`/agent <name>` switches agents; `/agent` shows a picker.
 
-The compaction algorithm preserves recent history verbatim, respects
-assistant tool-call/tool-result pairing, derives cumulative `<read-files>` and
-`<modified-files>` sections from persisted file-tool events, and can be
-triggered manually with `/compact [instructions]` to add user guidance to the
-summary prompt.
-
-## User-definable agents
-
-ri-agent supports user-definable agent profiles via filesystem-based
-agent directories. Each agent customises the system prompt, available tools,
-available skills, and can optionally override the global AGENTS.md
-instructions.
-
-### Agent discovery
-
-Agents are discovered from:
-- `~/.ri/agents/<name>/` (global)
-- `.ri/agents/<name>/` (project-local)
-
-Project-local agents shadow global agents with the same name. Discovery is
-recursive — nested subdirectories under an agent root are scanned.
-
-### File format
-
-Each agent directory contains up to two files:
-
-**`SYSTEM.md`** (required) — YAML frontmatter with metadata, followed by
-a markdown body that becomes the system prompt identity:
-
-```markdown
----
-name: explorer
-description: exploratory coding
-mode: primary
-include_tools: ["*"]
-exclude_tools: []
-include_skills: ["*"]
-exclude_skills: []
----
-
-You are an exploratory programmer...
-```
-
-For backwards compatibility, `AGENT.md` is used as a fallback if `SYSTEM.md`
-does not exist.
-
-**`AGENTS.md`** (optional) — raw markdown (no frontmatter). When present,
-its content replaces the global `~/.ri/AGENTS.md` entry in the system prompt.
-Project-local AGENTS.md files (from the cwd→root chain) are still appended
-after the agent's AGENTS.md.
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `name` | yes | — | Unique identifier |
-| `description` | yes | — | Shown in the agent picker |
-| `mode` | no | `primary` | `primary` (user-selectable) or `subagent` (reserved for future) |
-| `include_tools` | no | `["*"]` | Tool name glob patterns to include |
-| `exclude_tools` | no | `[]` | Tool name glob patterns to exclude |
-| `include_skills` | no | `["*"]` | Skill name glob patterns to include |
-| `exclude_skills` | no | `[]` | Skill name glob patterns to exclude |
-
-Filtering is applied in order: include first, then exclude. `globset` is used
-for glob matching. When no filter fields are present, all tools and skills are
-available (backward-compatible default).
-
-### Always-present tools
-
-`ask_user` and `read_skill` are always-present — they survive any filter and
-are always available to every agent. Future subagent infrastructure (e.g.
-`spawn_subagent`) will also be always-present.
-
-### System prompt composition
-
-When an agent is active:
-- The agent's `SYSTEM.md` body replaces the default identity paragraph.
-- The agent's `AGENTS.md` (if present) replaces the global AGENTS.md
-  instructions; project-local AGENTS.md files are still appended.
-- Tools and skills in the prompt are filtered according to the agent's
-  include/exclude rules.
-
-When no agent is explicitly selected, the `"default"` agent is used as a
-fallback (if it exists). This lets the default agent carry policy rules
-(e.g. workflow/fastpath/direct-edit) that other agents can opt out of.
-
-### Runtime
-
-- `/agent <name>` switches agent; `/agent` alone shows a picker of primary agents.
-- Mid-session switch invalidates the LLM prompt cache for the next turn.
-- Active agent name appears in the info bar (`agent: <name>`) when non-default.
-- Active agent is persisted in `config.toml` (`agent` field).
-- `/reload` refreshes agents alongside skills; falls back to default if the
-  active agent was removed.
-- Agent filtering is applied at prompt-build time (Phase 1). Future subagent
-  support (Phase 2) will use the same filter data for execution-level filtering.
+**Outer provider loop in `main.rs`** — `run()` returns a `RunResult` enum
+(`Quit | ChangeModel | ChangeProvider`) rather than mutating global state. The
+outer loop rebuilds the active provider instance's transport and re-enters
+`run()` on every model/provider switch, so `App` and `ui` never depend directly
+on backend transport details.

@@ -10,10 +10,7 @@
 use async_stream::stream;
 use tokio::time::{Duration, sleep};
 
-use super::{
-    AssistantPhase, LlmEvent, LlmRequestContext, LlmStream, Message, ModelListFuture, Role,
-    ToolDefinition,
-};
+use super::{AssistantPhase, LlmEvent, LlmStream, Message, ModelListFuture, Role, ToolDefinition};
 use crate::llm::ProviderError;
 
 /// A hidden test provider with no persistent state.
@@ -78,16 +75,7 @@ fn stream_owned(text: String) -> LlmStream {
 // ── LlmProvider impl ──────────────────────────────────────────────────────────
 
 impl super::LlmProvider for TestProvider {
-    fn stream_chat(&self, messages: Vec<Message>, context: LlmRequestContext) -> LlmStream {
-        self.stream_chat_with_tools(messages, vec![], context)
-    }
-
-    fn stream_chat_with_tools(
-        &self,
-        messages: Vec<Message>,
-        _tools: Vec<ToolDefinition>,
-        _context: LlmRequestContext,
-    ) -> LlmStream {
+    fn stream(&self, messages: Vec<Message>, _tools: Vec<ToolDefinition>) -> LlmStream {
         // If the last message is a tool result, echo it back so the provider
         // keeps working in a multi-turn agent loop.
         if let Some(last) = messages.last()
@@ -181,9 +169,9 @@ mod tests {
     async fn system_command_returns_exact_system_prompt() {
         let provider = TestProvider::new();
         let events: Vec<LlmEvent> = provider
-            .stream_chat(
+            .stream(
                 vec![Message::system("YOU ARE RI."), Message::user("system")],
-                LlmRequestContext::default(),
+                vec![],
             )
             .collect()
             .await;
@@ -207,10 +195,7 @@ mod tests {
     async fn unknown_command_returns_hint() {
         let provider = TestProvider::new();
         let events: Vec<LlmEvent> = provider
-            .stream_chat(
-                vec![Message::user("does-not-exist")],
-                LlmRequestContext::default(),
-            )
+            .stream(vec![Message::user("does-not-exist")], vec![])
             .collect()
             .await;
 

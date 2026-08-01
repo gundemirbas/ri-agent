@@ -7,9 +7,7 @@ use crate::ask_user_state::PendingAsk;
 use crate::completion::CompletionItem;
 use crate::export;
 use crate::llm::Message;
-use crate::provider_instance::{
-    ApiType, AuthMode, BackendPreset, EndpointBehavior, ProviderInstance,
-};
+use crate::provider_instance::{ApiType, BackendPreset, ProviderInstance};
 use crate::provider_manager::{PendingProviderRemoval, PendingProviderSetup, ProviderSetupStep};
 use crate::selection_state::{MAX_SELECTION_VISIBLE, SelectionKind};
 use crate::thinking::ThinkingLevel;
@@ -223,17 +221,10 @@ impl App {
     /// API type has been decided.  For `OpenAiCompatible` this is the endpoint
     /// URL, then the API key, then the instance name.
     fn advance_provider_setup_after_api_type(&mut self) {
-        let Some(instance) = self.pending_provider_instance() else {
+        if self.pending_provider_instance().is_none() {
             return;
-        };
-        let def = instance.backend_preset.def();
-        if matches!(def.endpoint_behavior, EndpointBehavior::UserSupplied) {
-            self.enter_provider_endpoint_input_mode();
-        } else if matches!(def.auth_mode, AuthMode::ApiKey) {
-            self.enter_provider_api_key_input_mode();
-        } else {
-            self.enter_provider_name_input_mode();
         }
+        self.enter_provider_endpoint_input_mode();
     }
 
     /// One-line explanation for an API-type picker option.

@@ -30,7 +30,6 @@ use crate::provider_manager::{
 use crate::selection_state::{SelectionKind, SelectionState};
 use crate::session_event::SessionEvent;
 use crate::session_manager::SessionManager;
-use crate::shell::ShellKind;
 use crate::shell_state::ShellState;
 use crate::step_back_state::StepBackState;
 use crate::tracked::Tracked;
@@ -617,10 +616,6 @@ impl App {
         self.shell.reset_textarea();
     }
 
-    pub fn cycle_shell(&mut self) {
-        self.shell.cycle();
-    }
-
     pub fn submit_shell_command(&mut self) {
         let lines: Vec<String> = self.shell.textarea.lines().to_vec();
         let command = lines.join("\n").trim().to_string();
@@ -636,13 +631,8 @@ impl App {
         } else {
             self.session.current_cwd.clone()
         };
-        let prompt = self.shell.selected.prompt_char();
-
-        let cmd_prefix = if self.shell.available.len() > 1 {
-            format!("[{}] {}{}", self.shell.selected.label(), cwd, prompt)
-        } else {
-            format!("{}{}", cwd, prompt)
-        };
+        let prompt = '$';
+        let cmd_prefix = format!("{cwd}{prompt}");
 
         let call_id = format!("local-shell-{}", self.display_len());
 
@@ -670,8 +660,6 @@ impl App {
         self.exit_shell_mode();
         self.log_view.auto_scroll = true;
 
-        // Spawn the subprocess asynchronously, reusing the same execution
-        // infrastructure as agent tools (SubprocessCommand + ToolCallContext).
         let tx = self.app_event_tx();
         let ctx = crate::agent::types::ToolCallContext {
             id: call_id.clone(),
@@ -679,13 +667,10 @@ impl App {
             cancel_rx: None,
         };
 
-        let selected_shell = self.shell.selected;
         self.runtime.pending_shell_handle = Some(tokio::spawn(async move {
-            let cmd = match selected_shell {
-                ShellKind::Bash => crate::agent::tools::subprocess::SubprocessCommand::new("sh")
-                    .arg("-c")
-                    .arg(&command),
-            };
+            let cmd = crate::agent::tools::subprocess::SubprocessCommand::new("sh")
+                .arg("-c")
+                .arg(&command);
 
             let result = cmd.current_dir(&cwd).run(ctx).await;
             let _ = tx.send(AppEvent::ShellComplete { call_id, result });
@@ -1487,12 +1472,13 @@ mod tests {
         let url = app
             .submit_pending_provider_base_url()
             .expect("normalized endpoint url");
-        assert_eq!(url, "https://test");
+        // A pathless endpoint gets the `/v1` prefix automatically.
+        assert_eq!(url, "https://test/v1");
         assert_eq!(
             app.pending_provider_instance()
                 .as_ref()
                 .and_then(|p| p.base_url.as_deref()),
-            Some("https://test")
+            Some("https://test/v1")
         );
     }
 
