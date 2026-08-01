@@ -464,6 +464,7 @@ impl App {
                         output_tokens: None,
                         total_tokens: Some(*tokens_after),
                         cached_tokens: None,
+                        reasoning_tokens: None,
                     });
                 }
                 _ => {}

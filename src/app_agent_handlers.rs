@@ -239,6 +239,7 @@ impl App {
             output_tokens: None,
             total_tokens: Some(tokens_after),
             cached_tokens: None,
+            reasoning_tokens: None,
         });
         self.log_view.auto_scroll = true;
         self.persist_messages();

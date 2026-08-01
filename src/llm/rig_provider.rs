@@ -60,6 +60,13 @@ pub struct RigOpenAiProvider {
     /// client can be rebuilt with the same headers.
     headers: Vec<(String, String)>,
     reasoning_effort: Option<&'static str>,
+    /// Sampling temperature forwarded to every `CompletionRequest`.
+    temperature: Option<f64>,
+    /// Maximum output tokens forwarded to every `CompletionRequest`.
+    max_tokens: Option<u64>,
+    /// Optional JSON Schema (structured output) forwarded to
+    /// `CompletionRequest::output_schema`.
+    output_schema: Option<rig_core::schemars::Schema>,
 }
 
 impl RigOpenAiProvider {
@@ -106,6 +113,9 @@ impl RigOpenAiProvider {
             api_key,
             headers,
             reasoning_effort: None,
+            temperature: None,
+            max_tokens: None,
+            output_schema: None,
         })
     }
 
@@ -116,6 +126,22 @@ impl RigOpenAiProvider {
     /// `reasoning_effort` parameter.
     pub fn with_reasoning_effort(mut self, effort: Option<&'static str>) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    /// Set per-request completion options forwarded to every
+    /// [`CompletionRequest`]: sampling `temperature`, maximum output tokens,
+    /// and an optional output schema (structured output).  `None` entries omit
+    /// the corresponding field.
+    pub fn with_completion_options(
+        mut self,
+        temperature: Option<f64>,
+        max_tokens: Option<u64>,
+        output_schema: Option<rig_core::schemars::Schema>,
+    ) -> Self {
+        self.temperature = temperature;
+        self.max_tokens = max_tokens;
+        self.output_schema = output_schema;
         self
     }
 }
@@ -330,6 +356,9 @@ fn to_usage_stats(u: &RigUsage) -> UsageStats {
         // `cached_input_tokens`. Keeping the subset relationship intact means
         // `UsageStats::used_tokens` won't double-count (`cached <= input`).
         cached_tokens: (u.cached_input_tokens > 0).then_some(u.cached_input_tokens as usize),
+        // OpenAI o-series reports reasoning ("thinking") output tokens
+        // separately; rig folds them into `reasoning_tokens`.
+        reasoning_tokens: (u.reasoning_tokens > 0).then_some(u.reasoning_tokens as usize),
     }
 }
 
@@ -504,6 +533,9 @@ fn full_completion_request(
     messages: &[RigMessage],
     tools: &[RigToolDefinition],
     additional_params: Option<serde_json::Value>,
+    temperature: Option<f64>,
+    max_tokens: Option<u64>,
+    output_schema: Option<rig_core::schemars::Schema>,
 ) -> CompletionRequest {
     CompletionRequest {
         model: None,
@@ -512,11 +544,11 @@ fn full_completion_request(
             .unwrap_or_else(|| OneOrMany::one(RigMessage::user(""))),
         documents: vec![],
         tools: tools.to_vec(),
-        temperature: None,
-        max_tokens: None,
+        temperature,
+        max_tokens,
         tool_choice: None,
         additional_params,
-        output_schema: None,
+        output_schema,
         record_telemetry_content: false,
     }
 }
@@ -654,6 +686,9 @@ impl super::LlmProvider for RigOpenAiProvider {
         let client = self.client.clone();
         let model_name = self.model.clone();
         let reasoning_effort = self.reasoning_effort;
+        let temperature = self.temperature;
+        let max_tokens = self.max_tokens;
+        let output_schema = self.output_schema.clone();
         let api_key = self.api_key.clone();
         let alternate_base_url = self.alternate_base_url.clone();
         let headers = self.headers.clone();
@@ -669,7 +704,14 @@ impl super::LlmProvider for RigOpenAiProvider {
                     move || {
                         let additional = reasoning_effort
                             .map(|e| serde_json::json!({ "reasoning": { "effort": e } }));
-                        full_completion_request(&messages, &tools, additional)
+                        full_completion_request(
+                            &messages,
+                            &tools,
+                            additional,
+                            temperature,
+                            max_tokens,
+                            output_schema.clone(),
+                        )
                     }
                 };
                 let rebuild = {
@@ -695,7 +737,14 @@ impl super::LlmProvider for RigOpenAiProvider {
                     move || {
                         let additional =
                             reasoning_effort.map(|e| serde_json::json!({ "reasoning_effort": e }));
-                        full_completion_request(&messages, &tools, additional)
+                        full_completion_request(
+                            &messages,
+                            &tools,
+                            additional,
+                            temperature,
+                            max_tokens,
+                            output_schema.clone(),
+                        )
                     }
                 };
                 let rebuild = {
@@ -900,6 +949,29 @@ mod tests {
         assert_eq!(s.output_tokens, None);
         assert_eq!(s.total_tokens, None);
         assert_eq!(s.cached_tokens, None);
+        assert_eq!(s.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn usage_stats_maps_reasoning_tokens() {
+        // OpenAI o-series reports reasoning output tokens separately; they must
+        // flow through rig's generic Usage.reasoning_tokens.
+        let mut u = RigUsage::new();
+        u.input_tokens = 10;
+        u.output_tokens = 20;
+        u.total_tokens = 30;
+        u.reasoning_tokens = 15;
+        let s = to_usage_stats(&u);
+        assert_eq!(s.reasoning_tokens, Some(15));
+        assert_eq!(s.output_tokens, Some(20));
+    }
+
+    #[test]
+    fn usage_stats_omits_zero_reasoning_tokens() {
+        let mut u = RigUsage::new();
+        u.output_tokens = 5;
+        let s = to_usage_stats(&u);
+        assert_eq!(s.reasoning_tokens, None);
     }
 
     #[test]
@@ -1035,7 +1107,7 @@ data: {"type":"response.output_text.delta","sequence_number":3,"output_index":0,
 
 data: {"type":"response.output_text.delta","sequence_number":4,"output_index":0,"content_index":0,"delta":"ba"}
 
-data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_1","object":"response","created_at":1730000000,"status":"completed","model":"main","usage":{"input_tokens":4,"input_tokens_details":{"cached_tokens":2},"output_tokens":2,"total_tokens":6},"output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"merhaba","annotations":[]}]}]}}
+data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_1","object":"response","created_at":1730000000,"status":"completed","model":"main","usage":{"input_tokens":4,"input_tokens_details":{"cached_tokens":2},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":6},"output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"merhaba","annotations":[]}]}]}}
 
 data: [DONE]
 
@@ -1079,6 +1151,8 @@ data: [DONE]
         // through rig's generic Usage into UsageStats (and show as `[N⚡]`).
         assert_eq!(usage.as_ref().and_then(|u| u.cached_tokens), Some(2));
         assert_eq!(usage.map(|u| u.used_tokens()), Some(Some(6))); // no double count
+        // Reasoning output tokens ride the same usage event → `[R…]` suffix.
+        assert_eq!(usage.as_ref().and_then(|u| u.reasoning_tokens), Some(2));
     }
 
     #[tokio::test]
@@ -1133,6 +1207,68 @@ data: [DONE]
         }
         assert!(done, "expected Done");
         assert_eq!(tokens.join(""), "merhaba");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_request_carries_completion_options() {
+        use futures_util::StreamExt;
+        use rig_core::schemars::Schema;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let sse = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"main","choices":[{"index":0,"delta":{"content":"merhaba"},"finish_reason":null}]}
+
+data: [DONE]
+
+"#;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let schema: Schema = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "title": "Answer",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"]
+        }))
+        .unwrap();
+        let provider = RigOpenAiProvider::new(
+            RigOpenAiApi::Completions,
+            format!("{}/v1", server.uri()),
+            "main",
+            "test",
+        )
+        .unwrap()
+        .with_completion_options(Some(0.3), Some(50), Some(schema));
+
+        // Drain the stream so the request is sent.
+        let mut stream = provider.stream(vec![Message::user("naber")], vec![]);
+        while let Some(ev) = stream.next().await {
+            match ev {
+                LlmEvent::Done => break,
+                LlmEvent::Error(e) => eprintln!("EVENT ERROR: {:?} | {}", e.kind, e.message),
+                _ => {}
+            }
+        }
+
+        // temperature / max_tokens ride along directly; output_schema is mapped
+        // to a strict json_schema response_format (no tools in this call).
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert_eq!(body["temperature"], 0.3);
+        assert_eq!(body["max_tokens"], 50);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["name"], "Answer");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
     }
 
     /// A pathless base URL is normalized to `/v1`, so the primary request hits

@@ -30,16 +30,19 @@ pub(crate) enum RunResult {
         prompt_thinking_selection: bool,
     },
     ChangeProvider(String),
-    AddProvider(ProviderInstance),
+    AddProvider(Box<ProviderInstance>),
     UpdateProvider {
         original_id: Option<String>,
-        instance: ProviderInstance,
+        // Boxed so the transient UI event doesn't inflate the RunResult enum
+        // (ProviderInstance now carries temperature/max_tokens/output_schema).
+        instance: Box<ProviderInstance>,
     },
     RemoveProvider(String),
     ChangeThinking(ThinkingLevel),
     /// Switch to (or stay on) a specific provider instance with optional new base URL and API key.
     ConfigureProvider {
-        instance: ProviderInstance,
+        // Boxed — see UpdateProvider.
+        instance: Box<ProviderInstance>,
         url: Option<String>,
         api_key: Option<String>,
     },
@@ -604,7 +607,7 @@ fn handle_chat_submit(
                         .pending_provider_instance()
                         .unwrap_or_else(|| resolve_current_run_instance(app, config));
                     return KeyDispatch::Return(RunResult::ConfigureProvider {
-                        instance,
+                        instance: Box::new(instance),
                         url: Some(url),
                         api_key: Some(token),
                     });
@@ -628,10 +631,10 @@ fn handle_chat_submit(
                 if was_edit {
                     return KeyDispatch::Return(RunResult::UpdateProvider {
                         original_id,
-                        instance,
+                        instance: Box::new(instance),
                     });
                 }
-                return KeyDispatch::Return(RunResult::AddProvider(instance));
+                return KeyDispatch::Return(RunResult::AddProvider(Box::new(instance)));
             }
             return KeyDispatch::Continue;
         }

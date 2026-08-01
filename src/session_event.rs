@@ -229,6 +229,7 @@ mod tests {
                 output_tokens: Some(5),
                 total_tokens: Some(15),
                 cached_tokens: None,
+                reasoning_tokens: None,
             }),
             timestamp: ts(),
         };

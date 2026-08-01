@@ -28,6 +28,33 @@ busy tool loops.
 
 Configure named provider instances in `~/.config/ri/config.toml` and select them with `-P <name>` or `/provider <name>`.
 
+### Per-provider request options
+
+All three are optional; omit them to defer to the endpoint's defaults.
+
+| Config key | Description |
+|---|---|
+| `temperature` | Sampling temperature (0.0–2.0). Higher is more creative. |
+| `max_tokens` | Maximum output tokens the model may emit per turn. |
+| `output_schema` | JSON Schema constraining the model's final answer (structured output). |
+
+```toml
+[providers.my-endpoint]
+service_type = "openai-compatible"
+api_type = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+temperature = 0.7
+max_tokens = 4096
+output_schema = { type = "object", title = "Answer", additionalProperties = false, properties = { answer = { type = "string" } }, required = ["answer"] }
+```
+
+`output_schema` drives rig's structured output (`response_format` / `text.format`).
+It asks the model for JSON-only answers, so only set it when the whole turn should be
+machine-readable; while tools are active (and before any tool result is in history)
+some endpoints suppress tool calls in favour of the schema — **not** recommended for
+general coding work.
+
 ## License
 
 AGPL-3.0-only. See [LICENSE](LICENSE).

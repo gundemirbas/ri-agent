@@ -49,6 +49,12 @@ pub struct UsageStats {
     /// Only populated when the provider reports cache hit information
     /// (e.g. OpenAI `usage.prompt_tokens_details.cached_tokens`).
     pub cached_tokens: Option<usize>,
+    /// Number of output tokens spent on internal reasoning / "thoughts" by
+    /// reasoning-capable models (e.g. OpenAI o-series
+    /// `completion_tokens_details.reasoning_tokens` / Responses
+    /// `output_tokens_details.reasoning_tokens`).
+    #[serde(default)]
+    pub reasoning_tokens: Option<usize>,
 }
 
 impl UsageStats {
@@ -421,6 +427,7 @@ mod tests {
             output_tokens: Some(50),
             total_tokens: Some(150),
             cached_tokens: None,
+            reasoning_tokens: None,
         };
         assert_eq!(stats.used_tokens(), Some(150));
     }
@@ -432,6 +439,7 @@ mod tests {
             output_tokens: Some(50),
             total_tokens: None,
             cached_tokens: None,
+            reasoning_tokens: None,
         };
         assert_eq!(stats.used_tokens(), Some(150));
     }
@@ -443,6 +451,7 @@ mod tests {
             output_tokens: None,
             total_tokens: None,
             cached_tokens: None,
+            reasoning_tokens: None,
         };
         assert_eq!(stats.used_tokens(), Some(100));
     }
@@ -454,6 +463,7 @@ mod tests {
             output_tokens: Some(50),
             total_tokens: None,
             cached_tokens: None,
+            reasoning_tokens: None,
         };
         assert_eq!(stats.used_tokens(), Some(50));
     }
@@ -469,10 +479,11 @@ mod tests {
     #[test]
     fn used_tokens_adds_cached_when_larger_than_input_anthropic_behavior() {
         let stats = UsageStats {
-            input_tokens: Some(800),     // uncached input
-            output_tokens: Some(200),    // output
+            input_tokens: Some(800),       // uncached input
+            output_tokens: Some(200),      // output
             total_tokens: Some(1000), // input + output (unused by used_tokens when cached > input)
             cached_tokens: Some(20_000), // cache read
+            reasoning_tokens: Some(5_000), // reasoning output
         };
         // 1000 (input+output) + 20000 (cached) = 21000
         assert_eq!(stats.used_tokens(), Some(21_000));
@@ -487,6 +498,7 @@ mod tests {
             output_tokens: Some(200),
             total_tokens: Some(20_200),
             cached_tokens: Some(19_000), // subset of input
+            reasoning_tokens: None,
         };
         // cached <= input, so it's not added → returns total_tokens
         assert_eq!(stats.used_tokens(), Some(20_200));
@@ -500,6 +512,7 @@ mod tests {
             output_tokens: Some(100),
             total_tokens: None,
             cached_tokens: Some(5_000),
+            reasoning_tokens: None,
         };
         // None matches the catch-all => returns base (output_only=100)
         assert_eq!(stats.used_tokens(), Some(100));
@@ -513,6 +526,7 @@ mod tests {
             output_tokens: Some(50),
             total_tokens: None,
             cached_tokens: Some(100),
+            reasoning_tokens: None,
         };
         assert_eq!(stats.used_tokens(), Some(150)); // input + output only
     }

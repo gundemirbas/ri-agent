@@ -327,14 +327,14 @@ async fn main() -> io::Result<()> {
             }
 
             Ok(RunResult::AddProvider(instance)) => {
-                handle_add_provider(&mut app, &mut config, instance);
+                handle_add_provider(&mut app, &mut config, *instance);
             }
 
             Ok(RunResult::UpdateProvider {
                 original_id,
                 instance,
             }) => {
-                handle_update_provider(&mut app, &mut config, original_id, instance);
+                handle_update_provider(&mut app, &mut config, original_id, *instance);
             }
 
             Ok(RunResult::RemoveProvider(id)) => {
@@ -350,7 +350,7 @@ async fn main() -> io::Result<()> {
                 url,
                 api_key,
             }) => {
-                handle_configure_provider(&mut app, &mut config, instance, url, api_key);
+                handle_configure_provider(&mut app, &mut config, *instance, url, api_key);
             }
         }
     }

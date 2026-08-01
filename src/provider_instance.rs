@@ -196,6 +196,20 @@ pub struct ProviderInstance {
     pub api_key: Option<String>,
     /// Last-selected model for this instance.
     pub model: Option<String>,
+    /// Sampling temperature (0.0–2.0). `None` defers to the endpoint default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Maximum output tokens the model may emit per turn. `None` defers to the
+    /// endpoint default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Optional JSON Schema constraining the model's final answer
+    /// (structured output). Fed to rig's `CompletionRequest::output_schema`.
+    /// Mutually intended for JSON-only answers — see README caveat: it may
+    /// suppress tool calls on providers that reject output_schema + tools in
+    /// the same request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 impl ProviderInstance {
@@ -210,6 +224,9 @@ impl ProviderInstance {
             base_url: None,
             api_key: None,
             model: None,
+            temperature: None,
+            max_tokens: None,
+            output_schema: None,
         }
     }
 
@@ -294,6 +311,48 @@ mod tests {
         let mut inst = ProviderInstance::new("my-endpoint", BackendPreset::OpenAiCompatible);
         inst.model = Some("gpt-5".to_string());
         assert_eq!(inst.effective_model(), "gpt-5");
+    }
+
+    #[test]
+    fn provider_instance_completion_options_default_to_none() {
+        let inst = ProviderInstance::new("my-endpoint", BackendPreset::OpenAiCompatible);
+        assert_eq!(inst.temperature, None);
+        assert_eq!(inst.max_tokens, None);
+        assert_eq!(inst.output_schema, None);
+    }
+
+    #[test]
+    fn provider_instance_completion_options_round_trip_toml() {
+        let mut inst = ProviderInstance::new("my-endpoint", BackendPreset::OpenAiCompatible);
+        inst.temperature = Some(0.5);
+        inst.max_tokens = Some(128);
+        inst.output_schema = Some(serde_json::json!({
+            "type": "object",
+            "title": "T"
+        }));
+        let toml = toml::to_string(&inst).unwrap();
+        let back: ProviderInstance = toml::from_str(&toml).unwrap();
+        assert_eq!(back.temperature, Some(0.5));
+        assert_eq!(back.max_tokens, Some(128));
+        assert_eq!(
+            back.output_schema,
+            Some(serde_json::json!({"type": "object", "title": "T"}))
+        );
+    }
+
+    #[test]
+    fn provider_instance_deserializes_without_completion_options() {
+        // Old configs without the new keys must keep defaulting to None.
+        let text = r#"id = "x"
+service_type = "openai-compatible"
+api_type = "openai-compatible"
+base_url = "http://localhost:1"
+api_key = "sk"
+"#;
+        let inst: ProviderInstance = toml::from_str(text).unwrap();
+        assert_eq!(inst.temperature, None);
+        assert_eq!(inst.max_tokens, None);
+        assert_eq!(inst.output_schema, None);
     }
 
     #[test]

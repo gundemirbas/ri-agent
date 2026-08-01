@@ -16,6 +16,7 @@ pub(super) fn build_info_line<'a>(
     context_window: Option<usize>,
     used_tokens: Option<usize>,
     cached_tokens: Option<usize>,
+    reasoning_tokens: Option<usize>,
     cache_miss_warning: bool,
     width: usize,
 ) -> Line<'a> {
@@ -39,6 +40,7 @@ pub(super) fn build_info_line<'a>(
         context_window,
         used_tokens,
         cached_tokens,
+        reasoning_tokens,
         cache_miss_warning,
     );
     let mut content_spans: Vec<Span<'a>> = vec![
@@ -99,6 +101,7 @@ pub(super) fn format_context_value(
     context_window: Option<usize>,
     used_tokens: Option<usize>,
     cached_tokens: Option<usize>,
+    reasoning_tokens: Option<usize>,
     cache_miss_warning: bool,
 ) -> String {
     let cached_suffix = match (cached_tokens, cache_miss_warning) {
@@ -110,23 +113,29 @@ pub(super) fn format_context_value(
         // No cache info or no miss — no suffix.
         _ => String::new(),
     };
+    // Reasoned ("thinking") output tokens, e.g. OpenAI o-series.
+    let reasoning_suffix = match reasoning_tokens {
+        Some(n) if n > 0 => format!(" [R{}]", format_context_size(n)),
+        _ => String::new(),
+    };
     match context_window {
         Some(max) => {
             let max_fmt = format_context_size(max);
             if let Some(used) = used_tokens {
                 let pct = ((used.saturating_mul(100)) / max.max(1)).min(999);
                 format!(
-                    "{} / {} ({}%){}",
+                    "{} / {} ({}%){}{}",
                     format_context_size(used),
                     max_fmt,
                     pct,
-                    cached_suffix
+                    cached_suffix,
+                    reasoning_suffix
                 )
             } else {
-                format!("{}{}", max_fmt, cached_suffix)
+                format!("{}{}{}", max_fmt, cached_suffix, reasoning_suffix)
             }
         }
-        None => format!("unknown{}", cached_suffix),
+        None => format!("unknown{}{}", cached_suffix, reasoning_suffix),
     }
 }
 
