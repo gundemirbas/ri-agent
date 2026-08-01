@@ -48,6 +48,8 @@ enum RigClient {
 pub struct RigOpenAiProvider {
     client: RigClient,
     model: String,
+    base_url: String,
+    api_key: String,
     reasoning_effort: Option<&'static str>,
 }
 
@@ -88,6 +90,8 @@ impl RigOpenAiProvider {
         Ok(Self {
             client,
             model: model.into(),
+            base_url,
+            api_key,
             reasoning_effort: None,
         })
     }
@@ -272,6 +276,18 @@ fn to_provider_error(e: CompletionError) -> ProviderError {
             ProviderError::network(source, message)
         }
         None => ProviderError::other(source, message),
+    }
+}
+
+/// Build a [`ProviderError`] from a raw HTTP status code returned by the model
+/// list endpoint.
+fn provider_error_for_status(status: u16, message: String) -> ProviderError {
+    match status {
+        401 => ProviderError::unauthorized("openai", message),
+        403 => ProviderError::forbidden("openai", message),
+        429 => ProviderError::rate_limited("openai", message),
+        500..=599 => ProviderError::server_error("openai", status, message),
+        other => ProviderError::new(ProviderErrorKind::Other, Some(other), "openai", message),
     }
 }
 
@@ -466,7 +482,32 @@ impl super::LlmProvider for RigOpenAiProvider {
     }
 
     fn list_models(&self) -> ModelListFuture {
-        Box::pin(async { Ok(vec![]) })
+        let url = format!("{}/models", self.base_url);
+        let api_key = self.api_key.clone();
+        Box::pin(async move {
+            let client = reqwest::Client::new();
+            let response = match client.get(&url).bearer_auth(api_key).send().await {
+                Ok(r) => r,
+                Err(e) => return Err(ProviderError::network("openai", e.to_string())),
+            };
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            if !(200..300).contains(&status) {
+                return Err(provider_error_for_status(status, body));
+            }
+            let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                ProviderError::other("openai", format!("failed to parse /models: {e}"))
+            })?;
+            let ids = value["data"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m["id"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(ids)
+        })
     }
 }
 
@@ -475,6 +516,7 @@ impl super::LlmProvider for RigOpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::LlmProvider;
 
     fn user_msg(content: &str) -> Message {
         Message::user(content)
@@ -579,5 +621,56 @@ mod tests {
         // Plain provider diagnostic -> other.
         let other = CompletionError::ProviderError("model not found".to_string());
         assert_eq!(to_provider_error(other).kind, ProviderErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn list_models_fetches_ids_from_models_endpoint() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    { "id": "gpt-5", "object": "model" },
+                    { "id": "gpt-4o", "object": "model" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            RigOpenAiProvider::new(RigOpenAiApi::Completions, server.uri(), "gpt-4o", "sk-test")
+                .unwrap();
+
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models, vec!["gpt-5".to_string(), "gpt-4o".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_models_maps_unauthorized_status() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid api key"))
+            .mount(&server)
+            .await;
+
+        let provider =
+            RigOpenAiProvider::new(RigOpenAiApi::Responses, server.uri(), "gpt-5", "bad-token")
+                .unwrap();
+
+        let err = provider.list_models().await.unwrap_err();
+        assert_eq!(err.kind, ProviderErrorKind::Unauthorized);
+        assert_eq!(err.status_code, Some(401));
     }
 }
