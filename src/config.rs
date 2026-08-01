@@ -114,7 +114,33 @@ impl RiConfig {
     }
 
     pub fn from_toml_str(raw: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(raw)?)
+        match toml::from_str(raw) {
+            Ok(cfg) => Ok(cfg),
+            Err(e) => {
+                // Detect the unsupported `[providers.<id>]` table form and
+                // point users at the `[[providers]]` array format before the
+                // generic TOML error scrolls past. `toml` rejects a table for
+                // the `Vec<ProviderInstance>` field, which on its own reads
+                // like "invalid type: map, expected a sequence" — useless
+                // without knowing what to fix.
+                if raw.contains("[providers.") {
+                    Err(anyhow::anyhow!(
+                        "{e}\n\n\
+                         Found the unsupported `[providers.<id>]` table form. Provider instances \
+                         must be declared as a `[[providers]]` array with an `id` field, e.g.:\n\
+                         [[providers]]\n\
+                         id = \"my-endpoint\"\n\
+                         service_type = \"openai-compatible\"\n\
+                         api_type = \"openai-compatible\"\n\
+                         base_url = \"https://...\"\n\
+                         api_key = \"...\"\n\
+                         See docs/PROVIDER-MODEL-SPEC.md for the full format."
+                    ))
+                } else {
+                    Err(anyhow::Error::new(e))
+                }
+            }
+        }
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -183,6 +209,36 @@ model = "llama3.1"
         assert!(cfg.find_provider("openai").is_none());
         assert!(cfg.find_provider("ollama").is_none());
         assert!(cfg.find_provider("open-webui").is_none());
+    }
+
+    #[test]
+    fn legacy_provider_table_format_reports_supportive_hint() {
+        let raw = r#"
+provider = "my-endpoint"
+
+[providers.my-endpoint]
+service_type = "openai-compatible"
+api_key = "sk-test"
+"#;
+        let err = RiConfig::from_toml_str(raw).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("[[providers]]"),
+            "missing format hint: {rendered}"
+        );
+        assert!(
+            rendered.contains("id = \"my-endpoint\""),
+            "missing example id: {rendered}"
+        );
+    }
+
+    #[test]
+    fn other_parse_errors_do_not_mention_providers_array() {
+        // A completely unrelated parse error (unknown table) still surfaces the
+        // raw toml message without the providers-array hint.
+        let raw = "this is not = [valid";
+        let err = RiConfig::from_toml_str(raw).unwrap_err();
+        assert!(!err.to_string().contains("[[providers]]"));
     }
 
     #[test]

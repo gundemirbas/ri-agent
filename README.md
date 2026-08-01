@@ -28,6 +28,17 @@ busy tool loops.
 
 Configure named provider instances in `~/.config/ri/config.toml` and select them with `-P <name>` or `/provider <name>`.
 
+Each provider is a `[[providers]]` array entry (not a `[providers.<id>]` table) with an `id` field:
+
+```toml
+[[providers]]
+id = "my-endpoint"
+service_type = "openai-compatible"
+api_type = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+```
+
 ### Per-provider request options
 
 All three are optional; omit them to defer to the endpoint's defaults.
@@ -39,7 +50,8 @@ All three are optional; omit them to defer to the endpoint's defaults.
 | `output_schema` | JSON Schema constraining the model's final answer (structured output). |
 
 ```toml
-[providers.my-endpoint]
+[[providers]]
+id = "my-endpoint"
 service_type = "openai-compatible"
 api_type = "openai-compatible"
 base_url = "https://api.openai.com/v1"

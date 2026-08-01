@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::agent::types::{Tool, ToolCallContext, ToolResult};
-use crate::skills::SkillMeta;
+use crate::skills::{SkillMeta, strip_frontmatter};
 
 /// A built-in tool that loads a skill's body by name.
 ///
@@ -97,41 +97,6 @@ impl Tool for ReadSkillTool {
             ToolResult::ok_str(body)
         })
     }
-}
-
-/// Strip YAML frontmatter (`---` … `---`) from the start of a skill file.
-/// Returns the body text. Returns the original string unchanged if no
-/// frontmatter fence is found.
-fn strip_frontmatter(content: &str) -> &str {
-    let mut pos: usize = 0;
-    let mut fence_seen = false;
-
-    for line in content.split('\n') {
-        let trimmed = line.trim_end_matches('\r');
-        let advance = line.len() + 1;
-
-        if !fence_seen {
-            if trimmed == "---" {
-                fence_seen = true;
-                pos += advance;
-                continue;
-            } else {
-                return content;
-            }
-        }
-
-        pos += advance;
-
-        if trimmed == "---" {
-            return if pos <= content.len() {
-                &content[pos..]
-            } else {
-                ""
-            };
-        }
-    }
-
-    content
 }
 
 #[cfg(test)]
@@ -234,14 +199,12 @@ mod tests {
     }
 
     #[test]
-    fn strip_frontmatter_removes_fence() {
+    fn strip_frontmatter_is_shared_with_skills_module() {
+        // The frontmatter-stripping logic lives in `skills.rs`; this exercises
+        // the shared implementation through the read_skill path's dependency.
         let content = "---\nname: foo\n---\n\n# Body\n";
-        assert_eq!(strip_frontmatter(content), "\n# Body\n");
-    }
-
-    #[test]
-    fn strip_frontmatter_no_fence_returns_original() {
-        let content = "# Just a doc\nno frontmatter\n";
-        assert_eq!(strip_frontmatter(content), content);
+        assert_eq!(crate::skills::strip_frontmatter(content), "\n# Body\n");
+        let plain = "# Just a doc\nno frontmatter\n";
+        assert_eq!(crate::skills::strip_frontmatter(plain), plain);
     }
 }

@@ -397,7 +397,9 @@ pub fn expand_skill(skill: &SkillMeta, args: &str) -> anyhow::Result<String> {
 /// Strip YAML frontmatter (`---` … `---`) from the start of a file and return
 /// the body text.  Returns the original string unchanged if no frontmatter is
 /// found.
-fn strip_frontmatter(content: &str) -> &str {
+///
+/// Shared by `read_skill.rs` (which used to carry a byte-for-byte duplicate).
+pub(crate) fn strip_frontmatter(content: &str) -> &str {
     let mut pos: usize = 0;
     let mut fence_seen = false;
 

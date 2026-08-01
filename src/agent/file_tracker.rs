@@ -205,7 +205,12 @@ impl FileTracker {
     /// `git rev-parse --show-toplevel` in the file's parent directory.
     /// Returns `false` when git is not installed, the file is not in a
     /// repo, or the path resolves to a gitignored or untracked file.
-    pub fn is_git_tracked(&mut self, path: &Path) -> bool {
+    ///
+    /// Deliberately an associated function that takes NO `self`: it spawns
+    /// blocking `git` subprocesses, and callers must be able to invoke it
+    /// WITHOUT holding a tracker mutex so the agent loop never stalls on
+    /// git I/O while a lock is taken.
+    pub(crate) fn is_git_tracked(path: &Path) -> bool {
         // Ensure the path is absolute so git can resolve it.
         let path = match std::fs::canonicalize(path) {
             Ok(p) => p,

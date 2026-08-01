@@ -358,6 +358,34 @@ fn send_chunk(ctx: &ToolCallContext, chunk: &[u8]) {
     }
 }
 
+/// Enforce an optional wall-clock deadline on a [`SubprocessCommand`].
+///
+/// When `timeout_seconds` is `Some(n)` with `n > 0`, the command is raced
+/// against a timer; on expiry the in-flight future is dropped, which (via
+/// `kill_on_drop`) kills the child, and a timeout error is returned. Zero,
+/// negative, and non-finite values are treated as "no timeout" so callers can
+/// pass a user-controlled number without extra validation.
+pub(crate) async fn run_with_timeout(
+    cmd: SubprocessCommand,
+    timeout_seconds: Option<f64>,
+    ctx: ToolCallContext,
+) -> ToolResult {
+    let future = cmd.run(ctx);
+    match timeout_seconds.filter(|t| *t > 0.0 && t.is_finite()) {
+        Some(seconds) => {
+            let duration = std::time::Duration::from_secs_f64(seconds);
+            match tokio::time::timeout(duration, future).await {
+                Ok(result) => result,
+                Err(_) => ToolResult::err(format!(
+                    "command timed out after {seconds} seconds. \
+                     Increase the timeout or split the work into smaller steps."
+                )),
+            }
+        }
+        None => future.await,
+    }
+}
+
 // ── Unix: concurrent Phase1+Phase2 drain ─────────────────────────────────────
 
 #[cfg(unix)]

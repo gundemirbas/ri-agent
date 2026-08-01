@@ -578,6 +578,12 @@ fn handle_change_model(
 /// Returns `true` if the outer loop should `continue` (skip provider rebuild).
 fn handle_change_provider(app: &mut App, config: &mut RiConfig, id: String) -> bool {
     if let Some(inst) = config.resolve_provider(&id) {
+        // Set the selected flag BEFORE the API-key setup branch: the outer
+        // loop `continue`s (skipping the provider rebuild) while the user
+        // types a key, and we do not want the loop to fall back to the
+        // unselected sentinel provider while that input flow is active. The
+        // actual instance switch happens below once setup is not required, or
+        // via `handle_configure_provider` when it is.
         app.provider.provider_selected = true;
 
         let requires_api_key = provider_setup_requires_api_key(&inst);

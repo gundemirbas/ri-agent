@@ -2,7 +2,7 @@ use std::pin::Pin;
 
 use serde_json::Value;
 
-use super::subprocess::SubprocessCommand;
+use super::subprocess::{SubprocessCommand, run_with_timeout};
 use crate::agent::types::{Tool, ToolCallContext, ToolResult};
 
 pub struct ExecTool;
@@ -24,6 +24,10 @@ struct ExecArgs {
     /// environment).
     #[serde(default)]
     env: std::collections::HashMap<String, String>,
+    /// Optional wall-clock deadline in seconds. The process is killed if it
+    /// still runs after this long. `None` or `<= 0` disables the timeout.
+    #[serde(default)]
+    timeout: Option<f64>,
 }
 
 impl Tool for ExecTool {
@@ -40,7 +44,8 @@ impl Tool for ExecTool {
          a non-zero exit code is appended as `exit N`. \
          Output is truncated to the last 2000 lines or 50 KiB (whichever is hit first); \
          if truncated, full stdout/stderr are saved to temp files and a notice with the \
-         paths is appended."
+         paths is appended. Optional `timeout` (seconds) kills the process if it \
+         still runs after that time."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -64,6 +69,10 @@ impl Tool for ExecTool {
                     "type": "object",
                     "additionalProperties": { "type": "string" },
                     "description": "Optional extra environment variables (merged with current environment)"
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Optional timeout in seconds. The process is killed if it still runs after this long (0 or negative disables)."
                 }
             },
             "required": ["program"]
@@ -85,6 +94,7 @@ impl Tool for ExecTool {
                 args: argv,
                 cwd,
                 env,
+                timeout,
             } = match super::parse_args(args) {
                 Ok(a) => a,
                 Err(e) => return *e,
@@ -97,7 +107,7 @@ impl Tool for ExecTool {
             if let Some(dir) = cwd {
                 cmd = cmd.current_dir(dir);
             }
-            cmd.run(ctx).await
+            run_with_timeout(cmd, timeout, ctx).await
         })
     }
 }
@@ -292,6 +302,44 @@ mod tests {
 
     /// Regression: argument containing a newline must be passed as-is and
     /// survive the round-trip through the exec path.
+    #[tokio::test]
+    async fn exec_timeout_kills_long_process() {
+        let tool = ExecTool;
+        let args = serde_json::json!({
+            "program": "sh",
+            "args": ["-c", "sleep 5"],
+            "timeout": 1
+        });
+
+        let start = std::time::Instant::now();
+        let result = tool.execute(args).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_error, "expected timeout error");
+        assert!(
+            result.content.as_text().contains("timed out"),
+            "missing timeout message: {}",
+            result.content.as_text()
+        );
+        assert!(
+            elapsed.as_secs() < 3,
+            "timeout did not fire promptly ({elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_timeout_zero_disables_timeout() {
+        let tool = ExecTool;
+        let args = serde_json::json!({
+            "program": "sh",
+            "args": ["-c", "sleep 0.1; echo done"],
+            "timeout": 0
+        });
+        let result = tool.execute(args).await;
+        assert!(!result.is_error);
+        assert!(result.content.as_text().contains("done"));
+    }
+
     #[tokio::test]
     async fn exec_argument_with_newline() {
         let tool = ExecTool;

@@ -11,6 +11,13 @@ use crate::llm::{AssistantPhase, DisplayRange, UsageStats};
 use crate::provider_manager::{active_provider_display_name, format_provider_error_for_display};
 use crate::session_event::SessionEvent;
 
+/// Minimum in-request input tokens (and previous-turn total) before a
+/// zero-cached response is treated as a suspicious cache miss. Below this
+/// floor the prompt is too small for caching to be meaningful, so warning
+/// would be pure noise. The chosen value is a heuristic aligned with the
+/// minimum cacheable prompt sizes most providers advertise.
+const CACHE_MISS_MIN_TOKENS: usize = 1024;
+
 /// Current wall-clock time as seconds since UNIX epoch.
 pub(crate) fn now_ts() -> u64 {
     std::time::SystemTime::now()
@@ -106,8 +113,8 @@ impl App {
         if usage.cached_tokens == Some(0) {
             let current_input = usage.input_tokens.unwrap_or(0);
             // Only warn when the current input is large enough that caching
-            // would be meaningful (>= the Sonnet 4.6 minimum threshold).
-            if current_input >= 1024 {
+            // would be meaningful (see [`CACHE_MISS_MIN_TOKENS`]).
+            if current_input >= CACHE_MISS_MIN_TOKENS {
                 // Scan the session event log for a recent previous assistant
                 // turn whose total tokens exceeded the minimum threshold.
                 let now = now_ts();
@@ -120,7 +127,8 @@ impl App {
                         } = ev
                         {
                             let within_ttl = now.saturating_sub(*timestamp) < 300;
-                            let prev_had_enough = prev.total_tokens.unwrap_or(0) >= 1024;
+                            let prev_had_enough =
+                                prev.total_tokens.unwrap_or(0) >= CACHE_MISS_MIN_TOKENS;
                             within_ttl && prev_had_enough
                         } else {
                             false
@@ -302,11 +310,10 @@ impl App {
 
     fn on_tool_call_end(&mut self, id: String, result: crate::agent::types::ToolResult) {
         self.agent_turn.record_output("tool_call_end");
-        let display_range = result.truncation.as_ref().map(|tr| DisplayRange {
-            first_line: tr.first_kept_line,
-            last_line: tr.first_kept_line + tr.output_lines - 1,
-            total_lines: tr.total_lines,
-        });
+        let display_range = result
+            .truncation
+            .as_ref()
+            .map(Self::display_range_from_truncation);
         // Update the matching live tool entry with its result.
         if let Some(entry) = self.session.live_turn.find_tool_entry_mut(&id) {
             entry.running_output.clear();
@@ -365,11 +372,7 @@ impl App {
                 display_range: result
                     .truncation
                     .as_ref()
-                    .map(|tr| crate::llm::DisplayRange {
-                        first_line: tr.first_kept_line,
-                        last_line: tr.first_kept_line + tr.output_lines - 1,
-                        total_lines: tr.total_lines,
-                    }),
+                    .map(Self::display_range_from_truncation),
                 image_data: result.content.image_base64().map(|(mime, b64)| {
                     crate::llm::ImageData {
                         base64: b64,
@@ -403,6 +406,23 @@ impl App {
         // Remove the live entry now that committed events render it.
         self.session.live_turn.remove_tool_entry(&call_id);
         self.runtime.pending_shell_handle = None;
+    }
+
+    /// Convert truncation metadata into a [`DisplayRange`], guarding against
+    /// the `output_lines == 0` edge case (a single huge line truncated away)
+    /// which would otherwise underflow `last_line` below `first_kept_line`.
+    fn display_range_from_truncation(
+        tr: &crate::agent::tools::truncate::TruncationResult,
+    ) -> DisplayRange {
+        let last_line = tr
+            .first_kept_line
+            .saturating_add(tr.output_lines)
+            .saturating_sub(1);
+        DisplayRange {
+            first_line: tr.first_kept_line,
+            last_line,
+            total_lines: tr.total_lines,
+        }
     }
 
     fn on_external_file_change(&mut self, notification: String) {

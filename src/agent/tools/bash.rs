@@ -2,7 +2,7 @@ use std::pin::Pin;
 
 use serde_json::Value;
 
-use super::subprocess::SubprocessCommand;
+use super::subprocess::{SubprocessCommand, run_with_timeout};
 use crate::agent::types::{Tool, ToolCallContext, ToolResult};
 
 pub struct BashTool;
@@ -10,6 +10,10 @@ pub struct BashTool;
 #[derive(serde::Deserialize)]
 struct BashArgs {
     command: String,
+    /// Optional wall-clock deadline in seconds. The shell is killed if it
+    /// still runs after this long. `None` or `<= 0` disables the timeout.
+    #[serde(default)]
+    timeout: Option<f64>,
 }
 
 impl Tool for BashTool {
@@ -21,9 +25,10 @@ impl Tool for BashTool {
         "Run a shell command via `/bin/sh -c` and return compact output. \
          All output (stdout and stderr) is captured and returned; \
          a non-zero exit code is appended as `exit N`. \
-         Output is truncated to the last 2000 lines or 50 KiB (whichever is \
-         hit first); if truncated, full stdout/stderr are saved to temp files \
-         and a notice with the paths is appended."
+         Optional `timeout` (seconds) kills the command if it still runs \
+         after that time. Output is truncated to the last 2000 lines or \
+         50 KiB (whichever is hit first); if truncated, full stdout/stderr \
+         are saved to temp files and a notice with the paths is appended."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -33,6 +38,10 @@ impl Tool for BashTool {
                 "command": {
                     "type": "string",
                     "description": "Shell command to execute"
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Optional timeout in seconds. The shell is killed if it still runs after this long (0 or negative disables)."
                 }
             },
             "required": ["command"]
@@ -49,16 +58,17 @@ impl Tool for BashTool {
         ctx: ToolCallContext,
     ) -> Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + '_>> {
         Box::pin(async move {
-            let BashArgs { command } = match super::parse_args(args) {
+            let BashArgs { command, timeout } = match super::parse_args(args) {
                 Ok(a) => a,
                 Err(e) => return *e,
             };
 
-            SubprocessCommand::new("sh")
-                .arg("-c")
-                .arg(command)
-                .run(ctx)
-                .await
+            run_with_timeout(
+                SubprocessCommand::new("sh").arg("-c").arg(command),
+                timeout,
+                ctx,
+            )
+            .await
         })
     }
 }
@@ -198,6 +208,66 @@ mod tests {
 
     #[tokio::test]
     async fn bash_extra_fields_are_ignored() {
+        let tool = BashTool;
+        let args = serde_json::json!({"command": "echo hi", "unrelated": true});
+        let result = tool.execute(args).await;
+        assert!(!result.is_error);
+        assert!(result.content.as_text().contains("hi"));
+    }
+
+    // ── timeout ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bash_timeout_kills_long_command_and_reports_error() {
+        let tool = BashTool;
+        let args = serde_json::json!({"command": "sleep 5", "timeout": 1});
+
+        let start = std::time::Instant::now();
+        let result = tool.execute(args).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_error, "expected timeout error");
+        assert!(
+            result.content.as_text().contains("timed out"),
+            "missing timeout message: {}",
+            result.content.as_text()
+        );
+        assert!(
+            elapsed.as_secs() < 3,
+            "timeout did not fire promptly ({elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_fractional_timeout_supported() {
+        let tool = BashTool;
+        let args = serde_json::json!({"command": "sleep 5", "timeout": 0.3});
+
+        let start = std::time::Instant::now();
+        let result = tool.execute(args).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_error, "expected timeout error");
+        assert!(
+            elapsed.as_millis() < 3000,
+            "fractional timeout not enforced ({elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_zero_disables_timeout() {
+        let tool = BashTool;
+        // `sleep 0.2` finishes before a 0/negative timeout could ever matter;
+        // the key assertion is that `timeout: 0` is treated as "no timeout"
+        // rather than instantly failing.
+        let args = serde_json::json!({"command": "sleep 0.2; echo done", "timeout": 0});
+        let result = tool.execute(args).await;
+        assert!(!result.is_error);
+        assert!(result.content.as_text().contains("done"));
+    }
+
+    #[tokio::test]
+    async fn bash_completes_before_timeout() {
         let tool = BashTool;
         let args = serde_json::json!({"command": "echo hi", "timeout": 30});
         let result = tool.execute(args).await;

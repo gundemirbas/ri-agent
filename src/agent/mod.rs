@@ -395,19 +395,30 @@ pub async fn run_agent_loop(
 
         // ── Check for external file modifications ─────────────────────────────
         let changes = {
-            let mut tracker = config.file_tracker.lock().unwrap();
-            let all_changes = tracker.check_modified();
             // Only report changes to git-tracked files. Gitignored and
             // untracked files (databases, build artifacts, etc.) are
             // protected by the per-tool staleness guard instead.
+            //
+            // `is_git_tracked` spawns blocking `git` subprocesses per file;
+            // it runs AFTER the tracker lock is released so the agent loop
+            // never stalls on git I/O while holding the mutex.
+            let all_changes = config
+                .file_tracker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .check_modified();
             let (tracked, _untracked): (Vec<_>, Vec<_>) = all_changes
                 .into_iter()
-                .partition(|c| tracker.is_git_tracked(&c.path));
+                .partition(|c| FileTracker::is_git_tracked(&c.path));
             // Absorb only git-tracked changes so they won't re-fire.
             // Untracked changes stay in the old snapshot so the staleness
             // guard in edit/write tools can detect them.
             let paths: Vec<_> = tracked.iter().map(|c| c.path.clone()).collect();
-            tracker.accept_changes(&paths);
+            config
+                .file_tracker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .accept_changes(&paths);
             tracked
         };
         if !changes.is_empty() {
@@ -508,7 +519,11 @@ pub async fn run_agent_loop(
                     timestamp: 0,
                 });
 
-                config.file_tracker.lock().unwrap().refresh_baselines();
+                config
+                    .file_tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .refresh_baselines();
 
                 tx.send_ignore(AppEvent::Agent(AgentEvent::TurnEnd));
 
@@ -566,7 +581,11 @@ pub async fn run_agent_loop(
                 let batch_outcome =
                     execute_tool_batch(&config, &calls, &tx, &cancel_rx, &mut session_events).await;
 
-                config.file_tracker.lock().unwrap().refresh_baselines();
+                config
+                    .file_tracker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .refresh_baselines();
                 tx.send_ignore(AppEvent::Agent(AgentEvent::TurnEnd));
 
                 if let BatchOutcome::Cancelled = batch_outcome {

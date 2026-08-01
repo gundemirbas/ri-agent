@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6.0.3
+    # Cache the cargo registry + target directory across runs so repeated
+    # builds/tests don't recompile the whole dependency tree.
+    - uses: Swatinem/rust-cache@v2
     - name: Check
       run: cargo check --all-targets --all-features
     - name: Run tests
@@ -22,6 +25,17 @@ jobs:
       run: cargo fmt --all -- --check
     - name: Run clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Supply-chain audit: fail the build if any crate in Cargo.lock has a known
+  # vulnerability or has been yanked from crates.io.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6.0.3
+    - uses: Swatinem/rust-cache@v2
+    - uses: rustsec/audit-check@v2
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
 
   # Release build of the static musl binary, uploaded as a build artifact so
   # every push produces a directly runnable single-file executable.
@@ -32,6 +46,7 @@ jobs:
     - uses: actions/checkout@v6.0.3
     - name: Install musl target
       run: rustup target add x86_64-unknown-linux-musl
+    - uses: Swatinem/rust-cache@v2
     - name: Build release binary
       run: cargo build --release --target x86_64-unknown-linux-musl
     - uses: actions/upload-artifact@v4

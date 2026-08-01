@@ -25,9 +25,11 @@ impl Tool for FindTool {
     fn description(&self) -> &str {
         "Search for files matching a glob pattern. Returns file paths relative \
          to the search directory, one per line, sorted alphabetically. \
-         Excludes hidden files and paths ignored by .gitignore. Output is \
-         capped at `limit` results (default 1000); a notice is appended when \
-         the cap is reached."
+         Excludes hidden files and paths ignored by .gitignore. A bare pattern \
+         (no path separator) matches at any depth — e.g. '*.rs' matches every \
+         .rs file under the search directory; 'src/*.rs' restricts to a \
+         subdirectory. Output is capped at `limit` results (default 1000); a \
+         notice is appended when the cap is reached."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -73,9 +75,16 @@ impl Tool for FindTool {
             let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
             // Compile the glob pattern up front so we can report errors early.
-            // We use `**/<pattern>` anchoring so bare patterns like `*.rs`
-            // match anywhere in the tree, consistent with pi-mono behaviour.
-            let matcher = match Glob::new(&pattern) {
+            // Anchor bare patterns (no path separator) with `**/` so `*.rs`
+            // matches anywhere in the tree, not just at the search root —
+            // globset's `*` does not cross `/`, so without anchoring a nested
+            // `src/main.rs` would never match a bare `*.rs` pattern.
+            let anchored_pattern = if pattern.contains('/') || pattern == "**" {
+                pattern.clone()
+            } else {
+                format!("**/{pattern}")
+            };
+            let matcher = match Glob::new(&anchored_pattern) {
                 Ok(g) => g.compile_matcher(),
                 Err(e) => return ToolResult::err(format!("Invalid glob pattern '{pattern}': {e}")),
             };
@@ -223,6 +232,58 @@ mod tests {
             !result.content.as_text().contains("bar.txt"),
             "unexpected bar.txt: {}",
             result.content.as_text()
+        );
+    }
+
+    /// Regression: a bare pattern like `*.rs` must be anchored with `**/` so
+    /// it matches files nested under subdirectories, not only at the search root.
+    #[tokio::test]
+    async fn find_bare_pattern_matches_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("root.rs"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("src").join("deep")).unwrap();
+        std::fs::write(dir.path().join("src").join("deep").join("lib.rs"), "").unwrap();
+        let tool = FindTool;
+
+        // Bare `*.rs` without a path separator must match at any depth.
+        let args = serde_json::json!({
+            "pattern": "*.rs",
+            "path": dir.path().to_str().unwrap()
+        });
+        let result = tool.execute(args).await;
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            result.content.as_text()
+        );
+        let text = result.content.as_text();
+        assert!(text.contains("root.rs"), "root file missing: {text}");
+        assert!(
+            text.contains("src/deep/lib.rs"),
+            "nested file missing (bare pattern must be anchored): {text}"
+        );
+    }
+
+    /// A path-qualified pattern must stay as-is (no `**/` prepended).
+    #[tokio::test]
+    async fn find_path_qualified_pattern_matches_only_under_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("root.rs"), "").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src").join("lib.rs"), "").unwrap();
+        let tool = FindTool;
+
+        let args = serde_json::json!({
+            "pattern": "src/*.rs",
+            "path": dir.path().to_str().unwrap()
+        });
+        let result = tool.execute(args).await;
+        assert!(!result.is_error);
+        let text = result.content.as_text();
+        assert!(text.contains("src/lib.rs"), "expected src/lib.rs: {text}");
+        assert!(
+            !text.contains("root.rs"),
+            "path-qualified pattern matched outside its prefix: {text}"
         );
     }
 }
