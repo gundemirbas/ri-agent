@@ -324,7 +324,12 @@ fn to_usage_stats(u: &RigUsage) -> UsageStats {
         input_tokens: (u.input_tokens > 0).then_some(u.input_tokens as usize),
         output_tokens: (u.output_tokens > 0).then_some(u.output_tokens as usize),
         total_tokens: (u.total_tokens > 0).then_some(u.total_tokens as usize),
-        cached_tokens: None,
+        // OpenAI (both wire protocols) reports cache hits as a subset of the
+        // prompt tokens via `prompt_tokens_details.cached_tokens` /
+        // `input_tokens_details.cached_tokens`; rig folds that into
+        // `cached_input_tokens`. Keeping the subset relationship intact means
+        // `UsageStats::used_tokens` won't double-count (`cached <= input`).
+        cached_tokens: (u.cached_input_tokens > 0).then_some(u.cached_input_tokens as usize),
     }
 }
 
@@ -894,6 +899,30 @@ mod tests {
         assert_eq!(s.input_tokens, None);
         assert_eq!(s.output_tokens, None);
         assert_eq!(s.total_tokens, None);
+        assert_eq!(s.cached_tokens, None);
+    }
+
+    #[test]
+    fn usage_stats_maps_openai_cached_tokens() {
+        // OpenAI reports cache hits as a subset of input tokens; the info bar
+        // renders them as `[N⚡]` without double-counting the context usage.
+        let mut u = RigUsage::new();
+        u.input_tokens = 20_000;
+        u.output_tokens = 200;
+        u.total_tokens = 20_200;
+        u.cached_input_tokens = 19_000;
+        let s = to_usage_stats(&u);
+        assert_eq!(s.cached_tokens, Some(19_000));
+        // cached <= input → used_tokens stays at the total (no double count).
+        assert_eq!(s.used_tokens(), Some(20_200));
+    }
+
+    #[test]
+    fn usage_stats_omits_zero_cached_tokens() {
+        let mut u = RigUsage::new();
+        u.input_tokens = 10;
+        let s = to_usage_stats(&u);
+        assert_eq!(s.cached_tokens, None);
     }
 
     #[test]
@@ -1006,7 +1035,7 @@ data: {"type":"response.output_text.delta","sequence_number":3,"output_index":0,
 
 data: {"type":"response.output_text.delta","sequence_number":4,"output_index":0,"content_index":0,"delta":"ba"}
 
-data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_1","object":"response","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6},"output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"merhaba","annotations":[]}]}]}}
+data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_1","object":"response","created_at":1730000000,"status":"completed","model":"main","usage":{"input_tokens":4,"input_tokens_details":{"cached_tokens":2},"output_tokens":2,"total_tokens":6},"output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"merhaba","annotations":[]}]}]}}
 
 data: [DONE]
 
@@ -1031,9 +1060,11 @@ data: [DONE]
         let mut stream = provider.stream(vec![Message::user("naber")], vec![]);
         let mut tokens = Vec::new();
         let mut done = false;
+        let mut usage = None;
         while let Some(ev) = stream.next().await {
             match ev {
                 LlmEvent::Token { text, .. } => tokens.push(text),
+                LlmEvent::Usage(u) => usage = Some(u),
                 LlmEvent::Done => {
                     done = true;
                     break;
@@ -1044,6 +1075,10 @@ data: [DONE]
         }
         assert!(done, "expected Done");
         assert_eq!(tokens.join(""), "merhaba");
+        // OpenAI's completed-event usage carries cached tokens; they must flow
+        // through rig's generic Usage into UsageStats (and show as `[N⚡]`).
+        assert_eq!(usage.as_ref().and_then(|u| u.cached_tokens), Some(2));
+        assert_eq!(usage.map(|u| u.used_tokens()), Some(Some(6))); // no double count
     }
 
     #[tokio::test]
