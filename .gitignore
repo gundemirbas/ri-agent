@@ -34,3 +34,6 @@ ri-session-*.html
 # Sandbox: provisioned static uutils coreutils (fetched by scripts/fetch-uutils-coreutils.sh)
 rootfs/usr/bin/coreutils
 rootfs/usr/bin/.coreutils-source
+
+# Sandbox: fetched self-owned Rust toolchain (scripts/fetch-rust-toolchain.sh)
+rootfs/toolchain/

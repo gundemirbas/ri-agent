@@ -616,6 +616,7 @@ mod tests {
     async fn sandbox_flag_routes_bash_tool_through_ri_sandbox() {
         use crate::container::rootfs::assemble_image;
 
+        let _g = crate::container::SANDBOX_ENV_LOCK.lock().await;
         if !crate::container::sandbox_bin_path().is_file() {
             eprintln!("SKIP: `ri-sandbox` not built — run `cargo build --bins`");
             return;

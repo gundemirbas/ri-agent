@@ -34,7 +34,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MS_BIND: libc::c_ulong = libc::MS_BIND;
 const MS_RDONLY: libc::c_ulong = libc::MS_RDONLY;
@@ -204,6 +204,32 @@ pub fn run_child(image: &Path, argv: &[String], binds: &[Binds]) -> io::Result<(
         }
     }
 
+    // ── self-owned Rust toolchain (spec §6/§16) ─────────────────────────────
+    // The toolchain is bound read-only at /toolchain plus its two runtime libs
+    // (musl loader + gcc runtime) are bound into the image so the musl-host
+    // `rustc` runs inside the chroot. The toolchain is never copied into the
+    // image (hundreds of MB) — it is the app's own downloaded bundle.
+    let tc_dir = match std::fs::read_to_string(image.join("toolchain-dir")) {
+        Ok(d) if !d.trim().is_empty() => PathBuf::from(d.trim()),
+        _ => std::path::PathBuf::new(),
+    };
+    if !tc_dir.as_os_str().is_empty() && tc_dir.is_dir() {
+        let tc_mount = image.join("toolchain");
+        if tc_mount.is_dir() {
+            let _ = bind_mount(&tc_dir.to_string_lossy(), &tc_mount);
+        }
+        let loader = tc_dir.join("lib").join("ld-musl-x86_64.so.1");
+        let loader_dst = image.join("lib").join("ld-musl-x86_64.so.1");
+        if loader.is_file() && loader_dst.is_file() {
+            let _ = bind_mount(&loader.to_string_lossy(), &loader_dst);
+        }
+        let gcc = tc_dir.join("lib").join("libgcc_s.so.1");
+        let gcc_dst = image.join("usr/lib").join("libgcc_s.so.1");
+        if gcc.is_file() && gcc_dst.is_file() {
+            let _ = bind_mount(&gcc.to_string_lossy(), &gcc_dst);
+        }
+    }
+
     // ── device nodes (best-effort single-file binds over placeholders) ─────
     for dev in ["null", "zero", "random", "urandom", "tty", "full"] {
         let src = Path::new("/dev").join(dev);
@@ -295,6 +321,9 @@ pub fn run_child(image: &Path, argv: &[String], binds: &[Binds]) -> io::Result<(
         std::env::set_var("NO_COLOR", "1");
         // Container-shaped hints some tools grep for.
         std::env::set_var("container", "ri-sandbox");
+        // The musl-host rustc has no \$ORIGIN support in RPATH, so its libs
+        // are found via LD_LIBRARY_PATH (toolchain/lib + the loader dirs).
+        std::env::set_var("LD_LIBRARY_PATH", "/toolchain/lib:/usr/lib:/lib");
     }
 
     // ── resource limits (spec §7): constrain runaway tools ─────────────────

@@ -270,8 +270,13 @@ fn strict_static_shell_drops_host_shell_and_lib_binds() {
     }
     let _g = unlock_poisoned();
     let img = scratch("strict");
-    with_env("RI_SANDBOX_SH", Some(RI_SH_BIN), || {
-        assemble_image(&img).expect("assemble strict image")
+    // A toolchain would place its musl loader in /lib; disable it here so the
+    // strict no-host-libs assertion stays exact (toolchain is tested by the
+    // rustc-bootstrap test instead).
+    with_env("RI_SANDBOX_TOOLCHAIN", Some("/__ri_tc_unset__"), || {
+        with_env("RI_SANDBOX_SH", Some(RI_SH_BIN), || {
+            assemble_image(&img).expect("assemble strict image")
+        })
     });
     let static_sh = std::fs::read_to_string(img.join("has-static-sh"))
         .map(|s| s.trim() == "1")

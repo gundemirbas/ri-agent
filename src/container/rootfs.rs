@@ -137,6 +137,7 @@ const IMAGE_DIRS: &[&str] = &[
     "work",
     "tools",
     "tools-local",
+    "toolchain",
     "home/ri",
     "nix/store",
     "run/current-system/sw",
@@ -155,6 +156,13 @@ const UUTILS_MARKER: &str = "has-uutils";
 const SHELL_MARKER: &str = "has-shell";
 /// Marker written when the shell is a static musl binary (ri-sh, 0/1).
 const STATIC_SH_MARKER: &str = "has-static-sh";
+/// Marker written when a self-owned Rust toolchain is bound at /toolchain.
+const TOOLCHAIN_MARKER: &str = "has-toolchain";
+/// Host path of the bound toolchain (written next to [`TOOLCHAIN_MARKER`]).
+const TOOLCHAIN_DIR_FILE: &str = "toolchain-dir";
+
+/// The (sole) toolchain target ri's sandbox builds custom tools for.
+pub const TOOLCHAIN_TRIPLE: &str = "x86_64-unknown-linux-musl";
 
 /// Result of assembling an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +177,10 @@ pub struct AssembledImage {
     /// POSIX-shell library). When true AND `has_uutils`, the image is fully
     /// self-contained: no host `/bin/sh` copy and no `/lib` binds at all.
     pub has_static_sh: bool,
+    /// A self-owned musl-host Rust toolchain is bound read-only at
+    /// `/toolchain` (see the agent's `rustc` tool and spec §16). Requires the
+    /// loader/gcc-runtime files so rustc itself runs inside the chroot.
+    pub has_toolchain: bool,
 }
 
 /// Candidate locations for a static coreutils binary, in priority order.
@@ -252,36 +264,81 @@ fn install_static_sh(image: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Candidate locations for the self-owned Rust toolchain.
+///
+/// 1. `$RI_SANDBOX_TOOLCHAIN` (explicit; short-circuits detection).
+/// 2. `<repo>/rootfs/toolchain` — populated by
+///    `scripts/fetch-rust-toolchain.sh` (NOT the system rustup).
+/// 3. `~/.cache/ri/sandbox/toolchain` (a relocated copy).
+pub fn toolchain_candidates() -> Vec<PathBuf> {
+    if let Some(p) = std::env::var_os("RI_SANDBOX_TOOLCHAIN") {
+        return vec![PathBuf::from(p)];
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    out.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("rootfs")
+            .join("toolchain"),
+    );
+    let cache = if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
+        PathBuf::from(x).join("ri").join("sandbox")
+    } else {
+        std::env::var("HOME")
+            .ok()
+            .map(PathBuf::from)
+            .map(|h| h.join(".cache").join("ri").join("sandbox"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/ri-sandbox-cache"))
+    };
+    out.push(cache.join("toolchain"));
+    out
+}
+
+/// Whether `dir` looks like a usable toolchain for [`TOOLCHAIN_TRIPLE`]:
+/// a `bin/rustc`, its sysroot `lib/rustlib/<triple>`, and the two runtime
+/// libs the musl-host rustc needs inside the chroot (musl loader + gcc
+/// runtime for `librustc_driver`).
+pub fn toolchain_valid(dir: &Path) -> bool {
+    dir.join("bin").join("rustc").is_file()
+        && dir
+            .join("lib")
+            .join("rustlib")
+            .join(TOOLCHAIN_TRIPLE)
+            .is_dir()
+        && dir.join("lib").join("ld-musl-x86_64.so.1").is_file()
+        && dir.join("lib").join("libgcc_s.so.1").is_file()
+}
+
+/// Record a discovered toolchain for the runtime and prepare bind targets.
+fn install_toolchain(image: &Path) -> io::Result<bool> {
+    let Some(dir) = toolchain_candidates()
+        .into_iter()
+        .find(|d| toolchain_valid(d))
+    else {
+        return Ok(false);
+    };
+    fs::write(image.join(TOOLCHAIN_MARKER), "1")?;
+    fs::write(
+        image.join(TOOLCHAIN_DIR_FILE),
+        dir.to_string_lossy().as_bytes(),
+    )?;
+    // Bind targets inside the image for the two runtime libs (the toolchain
+    // itself is bound read-only at /toolchain by the ri-sandbox child).
+    let lib = image.join("lib").join("ld-musl-x86_64.so.1");
+    if !lib.exists() {
+        fs::write(&lib, "")?;
+    }
+    let gcc = image.join("usr/lib").join("libgcc_s.so.1");
+    if !gcc.exists() {
+        fs::write(&gcc, "")?;
+    }
+    Ok(true)
+}
+
 /// Idempotently assemble the sandbox image at `image`.
 pub fn assemble_image(image: &Path) -> io::Result<AssembledImage> {
-    // Fast path: already assembled.
-    if image.join(READY_MARKER).is_file()
-        && image.join(UUTILS_MARKER).is_file()
-        && image.join(SHELL_MARKER).is_file()
-    {
-        let mut has_uutils = fs::read_to_string(image.join(UUTILS_MARKER))?.trim() == "1";
-        let mut has_shell = fs::read_to_string(image.join(SHELL_MARKER))?.trim() == "1";
-        let mut has_static_sh = fs::read_to_string(image.join(STATIC_SH_MARKER))?.trim() == "1";
-        // Self-heal: a static coreutils (`scripts/fetch-uutils-coreutils.sh`)
-        // or the static `ri-sh` may have become available *after* the image
-        // was first assembled. Upgrade in place so the stricter,
-        // self-contained image takes effect without a manual cache wipe.
-        if !has_uutils && coreutils_candidates().iter().any(|c| c.is_file()) {
-            has_uutils = install_coreutils(image)?;
-            fs::write(image.join(UUTILS_MARKER), "1")?;
-        }
-        if !has_static_sh && sh_candidates().iter().any(|c| c.is_file()) {
-            has_static_sh = install_static_sh(image)?;
-            has_shell = true;
-            fs::write(image.join(STATIC_SH_MARKER), "1")?;
-            fs::write(image.join(SHELL_MARKER), "1")?;
-        }
-        return Ok(AssembledImage {
-            has_uutils,
-            has_shell,
-            has_static_sh,
-        });
-    }
+    // Always (re)build the layout: cheap, and guarantees the image matches the
+    // current ri build + provisioned assets (no stale-cache surprises; the
+    // toolchain is bind-mounted below, never copied into the image).
 
     // Layout.
     for d in IMAGE_DIRS {
@@ -332,6 +389,9 @@ pub fn assemble_image(image: &Path) -> io::Result<AssembledImage> {
     // Static coreutils (file tools) — self-contained, no host binds needed.
     let has_uutils = install_coreutils(image)?;
 
+    // Self-owned Rust toolchain (compiled custom tools; spec §6/§16).
+    let has_toolchain = install_toolchain(image)?;
+
     // Markers.
     fs::write(
         image.join(UUTILS_MARKER),
@@ -342,12 +402,13 @@ pub fn assemble_image(image: &Path) -> io::Result<AssembledImage> {
         image.join(STATIC_SH_MARKER),
         if has_static_sh { "1" } else { "0" },
     )?;
-    fs::write(image.join(".ri-image-ready"), env!("CARGO_PKG_VERSION"))?;
+    fs::write(image.join(READY_MARKER), env!("CARGO_PKG_VERSION"))?;
 
     Ok(AssembledImage {
         has_uutils,
         has_shell,
         has_static_sh,
+        has_toolchain,
     })
 }
 

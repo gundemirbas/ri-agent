@@ -32,8 +32,19 @@ pub mod sys;
 #[cfg(test)]
 mod tests;
 
+/// Serializes shell/environment-mutating sandbox tests (`RI_SANDBOX_*` are
+/// process-global). Async-aware so the guard can be held across awaits; unit
+/// tests in the bin crate that touch these env vars must take it.
+// Only the bin crate's unit tests (subprocess/tools::rustc sandbox tests)
+// take this lock; the library target compiles it too but has no caller, so the
+// dead-code lint cannot see its real use.
+#[allow(dead_code)]
+pub(crate) static SANDBOX_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// Resolve the on-disk sandbox image root.
 ///

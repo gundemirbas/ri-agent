@@ -928,3 +928,51 @@ cargo build --bins && cargo test --all-features
 ayrı bir binary: tokio altında `unshare(CLONE_NEWUSER)` zaten EINVAL verir.
 Tıpkı `--tui-acp`'deki ayrı `ri --serve` süreci gibi, "tek binary ailesi, ayrı
 süreç" deseni: `ri` (ana) ⇒ `ri-sandbox` (her sandbox'ı çalıştırır).
+
+---
+
+## 16. rustc Bootstrapping (Uygulandı)
+
+§6'daki "tool üretimi" akışı çalışıyor; §1 felsefesine uygun **sistem rustup'ı
+KULLANILMAZ**:
+
+### Kendi toolchain'imiz (`scripts/fetch-rust-toolchain.sh`)
+
+- Rust'ın resmî **musl-host toolchain'i** indirilir: `rustc-{ver}-x86_64-unknown-linux-musl`
+  + `rust-std-x86_64-unknown-linux-musl` (static.rust-lang.org/dist). Bu, hem
+  **derleyicinin kendisi** musl üzerinde koşar (glibc yok) hem hedef musl'u.
+- Eksik iki runtime lib'i Alpine resmî paketlerinden alınır ve toolchain'e
+  gömülür: musl loader (`ld-musl-x86_64.so.1`) + gcc runtime (`libgcc_s.so.1`).
+- Staging: `rootfs/toolchain/` (gitignored, ~700MB). `ld` ayrı gerekmez —
+  rustc kendi **bundled `rust-lld`**'sini kullanır.
+
+### Sandbox entegrasyonu
+
+- `ri-sandbox`, `<image>/toolchain-dir` reader'ı ile toolchain'i **RO bind**
+  eder (`/toolchain` — image'a kopyalanmaz) + iki lib'i `/lib`, `/usr/lib`
+  altına bind eder + `LD_LIBRARY_PATH=/toolchain/lib:/usr/lib:/lib` kurar
+  (musl loader `$ORIGIN` açmaz).
+- Image **her init'te yeniden kurulur** (marker fast-path yok) → köhnemiş
+  cache sorunları yok; toolchain bind olduğundan ucuz.
+
+### `rustc` aracı (agent)
+
+- Args: `source` (tam Rust), `name` (ops.). Sandbox içinde
+  `rustc --target x86_64-unknown-linux-musl -C link-self-contained=yes
+  -C linker-flavor=ld.lld -C linker=/toolchain/.../rust-lld
+  -C target-feature=+crt-static -o /tools/{name} /tmp/{src}.rs` çalıştırır.
+- Çıktı **static-pie musl** binary → `/tools/{name}` (host `~/.ri/tools`'a
+  bind) → `load_custom_tools()` bir sonraki yüklemede görür. Custom-tool
+  protokolünü (`--describe`, stdin JSON) didaktik olarak anımsatır.
+- **musl dev kütüphanesi gerektirmez**: saf Rust (std) için
+  `self-contained/libc.a + CRT + libunwind.a` yeterlidir; musl monolitik
+  olduğundan `-lm/-lpthread/-ldl` da tek `libc.a`'da. **C-native crate'ler**
+  (`cc`, openssl-sys vb.) ayrı bir musl C cross toolchain (headers+cc+static
+  libs, ör. musl.cc `x86_64-linux-musl-cross`) gerektirir — ileride
+  provisionable bir asset olarak eklenebilir.
+
+### Doğrulama
+
+`cargo test rustc_tool_bootstraps` — gerçek `rustc` aracı, sandbox içi derleme,
+tools dizinine iniş ve derlenen statik tool'un sandbox içinde çalıştırılması.
+Gerçek CLI smoke: `ri --print --provider test --sandbox 'tool rustc {…}'`.

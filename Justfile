@@ -12,6 +12,11 @@ preflight:
 sandbox-provision:
 	./scripts/fetch-uutils-coreutils.sh
 
+# Provision ri's own musl-host Rust toolchain (NOT the system rustup) so the
+# sandbox can compile custom tools (the agent's `rustc` tool, spec §16).
+sandbox-toolchain:
+	./scripts/fetch-rust-toolchain.sh
+
 # Build both binaries and run just the sandbox tests (runtime + tool path).
 sandbox-test:
 	cargo build --bins --quiet

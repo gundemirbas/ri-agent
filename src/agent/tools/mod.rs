@@ -174,6 +174,7 @@ pub mod find;
 pub mod invoke_subagent;
 pub mod read;
 pub mod read_skill;
+pub mod rustc;
 pub mod subprocess;
 pub mod terminal;
 pub mod truncate;
@@ -218,6 +219,7 @@ pub async fn register_builtin_tools(
 
     tools.push(Arc::new(BashTool));
     tools.push(Arc::new(ExecTool));
+    tools.push(Arc::new(rustc::RustcTool));
     tools.push(Arc::new(InvokeSubagentTool));
 
     for tool in tools {

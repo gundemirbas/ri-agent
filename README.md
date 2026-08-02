@@ -125,6 +125,13 @@ podman/docker, no root:
 - Resource limits are applied by default
   (`cpu=30s, nproc=64, nofile=2048, as=512MiB, fsize=1GiB, core=0`) and can be
   tuned via `$RI_SANDBOX_RLIMITS` (`none` disables).
+- **Tool bootstrapping**: a `rustc` agent tool compiles Rust source **inside
+  the sandbox** into a static musl custom tool (`~/.ri/tools`), using ri's own
+  downloaded musl-host toolchain — never your system rustup. Pure-Rust (std)
+  sources need no musl dev libraries (`-C link-self-contained=yes` ships
+  `libc.a`+CRT; musl is monolithic). Provision the compiler with
+  `just sandbox-toolchain` / `scripts/fetch-rust-toolchain.sh` (see
+  `docs/CONTAINER-RUNTIME-SPEC.md` §16).
 - Linux-only; user namespaces must be enabled in the kernel.
 
 See `docs/CONTAINER-RUNTIME-SPEC.md` for the full design spec and its
@@ -135,6 +142,7 @@ are unavailable.
 
 ```sh
 scripts/fetch-uutils-coreutils.sh    # optional: static file tools
+scripts/fetch-rust-toolchain.sh      # optional: in-sandbox rustc (bootstrap)
 cargo build --bins                   # produces `ri` + `ri-sandbox` + `ri-sh`
 ri --sandbox                         # TUI with sandboxed tools
 ri --serve --sandbox                 # headless ACP agent, same sandbox

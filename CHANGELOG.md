@@ -14,6 +14,20 @@
   before exec (`RI_SANDBOX_RLIMITS` or `cpu=30,nproc=64,nofile=2048,as=512m,
   fsize=1g,core=0`; `none` disables). New integration tests cover strict mode
   (empty `/lib`, symlinked static shell), compat mode, and observable limits.
+- **In-sandbox `rustc` bootstrapping (spec §6/§16)**: a new `rustc` agent tool
+  compiles a single-file Rust source **inside the sandbox** into a static musl
+  custom tool and installs it into `~/.ri/tools`. The compiler is ri's **own
+  downloaded musl-host toolchain** (`scripts/fetch-rust-toolchain.sh` →
+  `rootfs/toolchain`, gitignored; rustc + rust-std musl from rust-lang dist +
+  musl loader + `libgcc_s` from Alpine), bound read-only at `/toolchain` — the
+  system rustup is never used. `-C link-self-contained=yes` + bundled
+  `rust-lld` produce a static-pie binary without any musl dev libraries for
+  std-only sources; C-native crates remain a documented future step. The
+  sandbox image is now **rebuilt on every init** (no stale-cache fast path);
+  the toolchain is bind-mounted, so rebuilds stay cheap. `ri-sandbox` sets
+  `LD_LIBRARY_PATH` for the musl loader (`$ORIGIN` is unsupported there).
+  Verified by an end-to-end test: `rustc` tool compiles in the sandbox → the
+  static binary lands in `~/.ri/tools` → runs sandboxed.
 - **Rootless tool sandbox (`--sandbox`, spec §15)**: agent tool subprocesses
   (`bash`, `exec`, custom tools) can run inside a rootless user-namespace +
   chroot container built entirely in Rust — no OCI/podman/docker, no root.
