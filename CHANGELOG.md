@@ -4,17 +4,19 @@
 
 ### Added
 
-- **Protocol v2 serving (deferred, T2-4)**: `unstable_protocol_v2` is NOT yet
-  enabled. ACP v2 is a materially different protocol in the SDK's unstable
-  schema (permission round-trips reply with a `ToolCallUpdate` rather than an
-  outcome enum, session `cwd`/roots use `AbsolutePath` newtypes, and
-  `SessionUpdate` has ~19 variants with builder-only constructors), so serving
-  it faithfully means porting the whole session surface to v2 types. Planned
-  increment: enable the feature, register an `AgentProtocolRouter` (`.with_v1`
-  + `.with_v2`), and add a v2 implementation reusing the version-agnostic core
-  (session state, turn driver, `_ri/*` custom methods) with v1/v2 translation
-  at the boundary — starting with `initialize` + `session/new` +
-  `session/prompt` + `session/cancel`.
+- **Protocol v2 serving (T2-4, partial)**: `unstable_protocol_v2` is enabled
+  and every connection's `initialize` is routed through an
+  `AgentProtocolRouter`. Protocol v1 keeps the full surface; protocol v2
+  (unstable) is served over the same version-agnostic per-turn core with a
+  bounded surface: `initialize` (v2 capabilities), `session/new`,
+  `session/prompt` (streams v2 `UpdateSessionNotification` chunks carrying a
+  per-turn `MessageId`, plus `ToolCallUpdate`/`UsageUpdate`), `session/cancel`
+  (`CancelSessionNotification`), and `ask_user` →
+  `session/request_permission` (v2 title+options+outcome). Verified with an
+  in-process v2 client test (negotiate V2 → new → echo stream → ask → cancel).
+  Remaining v2 work: `session/load`/`resume`/`close`/`list`/`fork`, the `_ri/*`
+  custom methods, and v2 resource-read synthesis (currently text-only
+  prompt rendering).
 
 
 - **ACP headless server**: `ri --serve` exposes the agent loop over the

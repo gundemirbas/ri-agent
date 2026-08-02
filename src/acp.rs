@@ -35,6 +35,16 @@
 //! optionally TLS via `--serve-ws-cert`/`--serve-ws-key`). The WebSocket server
 //! multiplexes multiple client connections; stdio serves exactly one.
 //!
+//! Protocol negotiations: each connection's `initialize` is routed through an
+//! `AgentProtocolRouter`. Protocol v1 serves the full surface (load/close/
+//! list/fork + `_ri/*`); protocol **v2** (unstable) is served over the same
+//! per-turn core with a bounded surface — `initialize`, `session/new`,
+//! `session/prompt` (streamed v2 `UpdateSessionNotification` chunks with
+//! per-turn `MessageId`), `session/cancel`, and `ask_user` →
+//! `session/request_permission` (v2 title+options). v1-only conveniences
+//! (`session/load`/`resume`/`close`/`list`/`fork`, `_ri/*`) are not served
+//! over v2 yet.
+//!
 //! Event loop: `session/prompt` handlers return immediately and run the whole
 //! turn (event forwarding, the `request_permission` ask bridge, the final
 //! response) as a concurrent task with the `Responder` moved in. That keeps the
@@ -63,6 +73,7 @@ use agent_client_protocol::schema::v1::{
     StopReason, TextContent, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, Usage as AcpUsage, UsageUpdate,
 };
+use agent_client_protocol::schema::v2 as acp_v2;
 use agent_client_protocol::{
     Agent, Client, ConnectTo, ConnectionTo, JsonRpcRequest, JsonRpcResponse, Responder,
     Result as AcpResult, Stdio, on_receive_notification, on_receive_request,
@@ -1463,6 +1474,317 @@ fn build_agent(
         )
 }
 
+// ── ACP protocol v2 (unstable) ───────────────────────────────────────────────
+
+/// Minimal v2 → user-text renderer. v2 clients typically send `Text` blocks;
+/// resource/other blocks are preserved as a short placeholder (resource reads
+/// are not yet synthesized for v2 prompts).
+fn render_v2_prompt_blocks(blocks: &[acp_v2::ContentBlock]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        match block {
+            acp_v2::ContentBlock::Text(t) => out.push_str(&t.text),
+            other => out.push_str(&format!("[{other:?}]")),
+        }
+    }
+    out
+}
+
+/// v2 transport of the shared turn driver. Because v2's `session/update`
+/// notifications attach a per-message `MessageId`, the emitter owns one for
+/// the turn and threads it through every chunk.
+struct V2Emitter {
+    connection: ConnectionTo<Client>,
+    responder: Responder<acp_v2::PromptResponse>,
+    message_id: acp_v2::MessageId,
+}
+
+impl V2Emitter {
+    fn new(connection: ConnectionTo<Client>, responder: Responder<acp_v2::PromptResponse>) -> Self {
+        Self {
+            connection,
+            responder,
+            message_id: acp_v2::MessageId::new(format!("msg-{}", now_ts())),
+        }
+    }
+
+    fn send_update(&self, sid: &str, update: acp_v2::SessionUpdate) {
+        let _ = self
+            .connection
+            .send_notification(acp_v2::UpdateSessionNotification::new(
+                acp_v2::SessionId::new(sid.to_string()),
+                update,
+            ));
+    }
+}
+
+impl TurnEmitter for V2Emitter {
+    fn emit_agent_text(&self, sid: &str, text: &str) {
+        self.send_update(
+            sid,
+            acp_v2::SessionUpdate::AgentMessageChunk(acp_v2::ContentChunk::new(
+                acp_v2::ContentBlock::Text(acp_v2::TextContent::new(text)),
+                self.message_id.clone(),
+            )),
+        );
+    }
+
+    fn emit_agent_thought(&self, sid: &str, text: &str) {
+        self.send_update(
+            sid,
+            acp_v2::SessionUpdate::AgentThoughtChunk(acp_v2::ContentChunk::new(
+                acp_v2::ContentBlock::Text(acp_v2::TextContent::new(text)),
+                self.message_id.clone(),
+            )),
+        );
+    }
+
+    fn emit_usage(&self, sid: &str, u: &UsageStats, context_size: usize) {
+        if let Some(used) = u.used_tokens() {
+            self.send_update(
+                sid,
+                acp_v2::SessionUpdate::UsageUpdate(acp_v2::UsageUpdate::new(
+                    (used as u64).min(context_size as u64),
+                    context_size as u64,
+                )),
+            );
+        }
+    }
+
+    fn emit_tool_pending(&self, sid: &str, id: &str, name: &str) {
+        self.send_update(
+            sid,
+            acp_v2::SessionUpdate::ToolCallUpdate(
+                acp_v2::ToolCallUpdate::new(acp_v2::ToolCallId::new(id.to_string()))
+                    .title(name.to_string())
+                    .kind(tool_kind_v2(name))
+                    .status(acp_v2::ToolCallStatus::Pending),
+            ),
+        );
+    }
+
+    fn emit_tool_completed(&self, sid: &str, id: &str, content: &str) {
+        self.send_update(
+            sid,
+            acp_v2::SessionUpdate::ToolCallUpdate(
+                acp_v2::ToolCallUpdate::new(acp_v2::ToolCallId::new(id.to_string()))
+                    .status(acp_v2::ToolCallStatus::Completed)
+                    .content(vec![v2_tool_text(content)]),
+            ),
+        );
+    }
+
+    fn emit_tool_output_chunk(&self, sid: &str, id: &str, chunk: &str) {
+        // Live tool output: stream each chunk as an in-progress tool-call
+        // update; the final `Completed` update arrives on `ToolCallEnd`.
+        self.send_update(
+            sid,
+            acp_v2::SessionUpdate::ToolCallUpdate(
+                acp_v2::ToolCallUpdate::new(acp_v2::ToolCallId::new(id.to_string()))
+                    .status(acp_v2::ToolCallStatus::InProgress)
+                    .content(vec![v2_tool_text(chunk)]),
+            ),
+        );
+    }
+
+    async fn ask(
+        &mut self,
+        sid: &str,
+        request: &AskRequest,
+        cancel_rx: &mut tokio::sync::watch::Receiver<CancelLevel>,
+    ) -> AskUserResponse {
+        let rows = permission_option_rows(request);
+        let mut title = request.question.clone();
+        if let Some(ctx_text) = request.context.as_deref() {
+            title = format!("{title}\n\n{ctx_text}");
+        }
+        let options: Vec<acp_v2::PermissionOption> = rows
+            .iter()
+            .map(|(id, t)| {
+                acp_v2::PermissionOption::new(
+                    acp_v2::PermissionOptionId::new(id.clone()),
+                    t.clone(),
+                    acp_v2::PermissionOptionKind::AllowOnce,
+                )
+            })
+            .collect();
+        let outcome = tokio::select! {
+            o = self.connection.send_request(acp_v2::RequestPermissionRequest::new(
+                acp_v2::SessionId::new(sid.to_string()),
+                title,
+                options,
+            ))
+            .block_task() => Some(o),
+            _ = cancel_rx.wait_for(|l| *l >= CancelLevel::HardAbort) => None,
+        };
+        match outcome {
+            Some(Ok(r)) => match &r.outcome {
+                acp_v2::RequestPermissionOutcome::Selected(sel) => {
+                    answer_from_selected(Some(sel.option_id.0.as_ref()), &rows)
+                }
+                _ => AskUserResponse::Cancelled,
+            },
+            _ => AskUserResponse::Cancelled,
+        }
+    }
+
+    fn finish(self, _sid: &str, outcome: TurnOutcome) {
+        let _ = match outcome.error {
+            Some(msg) => self
+                .responder
+                .respond_with_error(agent_client_protocol::Error::internal_error().data(msg)),
+            None => self.responder.respond(acp_v2::PromptResponse::new()),
+        };
+    }
+}
+
+/// Map a builtin tool name to the v2 `ToolKind`.
+fn tool_kind_v2(name: &str) -> acp_v2::ToolKind {
+    match name {
+        "read_file" | "read_skill" => acp_v2::ToolKind::Read,
+        "edit_file" | "write_file" => acp_v2::ToolKind::Edit,
+        "find_files" => acp_v2::ToolKind::Search,
+        "bash" | "exec" => acp_v2::ToolKind::Execute,
+        "invoke_subagent" => acp_v2::ToolKind::Think,
+        _ => acp_v2::ToolKind::Other,
+    }
+}
+
+/// Wrap tool output text as a v2 tool-call content item.
+fn v2_tool_text(text: &str) -> acp_v2::ToolCallContent {
+    acp_v2::ToolCallContent::from(acp_v2::ContentBlock::Text(acp_v2::TextContent::new(text)))
+}
+
+/// Build the ACP protocol-v2 agent component (unstable): a bounded session
+/// surface reusing the shared per-turn core. v2 coverage: `initialize`,
+/// `session/new`, `session/prompt`, `session/cancel`, and `ask_user` →
+/// `session/request_permission`. `_ri/*` custom methods and the v1-only
+/// session conveniences (`session/load` etc.) are not served over v2 yet.
+fn build_v2_agent(
+    ctx: Arc<AcpContext>,
+    sessions: Sessions,
+) -> impl agent_client_protocol::ConnectTo<Client> {
+    let s_new = Arc::clone(&sessions);
+    let s_prompt = Arc::clone(&sessions);
+    let s_cancel = Arc::clone(&sessions);
+    let ctx_new = Arc::clone(&ctx);
+    let ctx_cancel = Arc::clone(&ctx);
+
+    agent_client_protocol::Agent
+        .v2()
+        // ── initialize ─────────────────────────────────────────────────────
+        .on_receive_request(
+            async move |req: acp_v2::InitializeRequest, responder, _connection| {
+                let resp = acp_v2::InitializeResponse::new(
+                    req.protocol_version,
+                    acp_v2::Implementation::new("ri-agent", env!("CARGO_PKG_VERSION")),
+                )
+                .capabilities(
+                    acp_v2::AgentCapabilities::new().session(acp_v2::SessionCapabilities::new()),
+                );
+                responder.respond(resp)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ── session/new ────────────────────────────────────────────────────
+        .on_receive_request(
+            async move |req: acp_v2::NewSessionRequest, responder, _connection| {
+                let id = acp_v2::SessionId::new(format!("sess-{}", new_session_suffix()));
+                // Store under the shared (v1-keyed) session map so both
+                // protocol versions see the same sessions.
+                let key = SessionId::new(id.0.as_ref().to_string());
+                s_new
+                    .lock()
+                    .unwrap()
+                    .insert(key, AcpSession::new(req.cwd.0.clone()));
+                ctx_new.log(
+                    "info",
+                    Some(&id.to_string()),
+                    format!("v2 session/new cwd={}", req.cwd.0.display()),
+                );
+                responder.respond(acp_v2::NewSessionResponse::new(id))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ── session/prompt ─────────────────────────────────────────────────
+        .on_receive_request(
+            async move |req: acp_v2::PromptRequest, responder, connection| {
+                let session_id = SessionId::new(req.session_id.0.as_ref().to_string());
+                let prompt_text = render_v2_prompt_blocks(&req.prompt);
+                ctx.log(
+                    "info",
+                    Some(&session_id.to_string()),
+                    format!(
+                        "v2 session/prompt start ({})",
+                        prompt_text.chars().take(60).collect::<String>()
+                    ),
+                );
+                let tokio_handle = ctx
+                    .tokio_handle
+                    .clone()
+                    .unwrap_or_else(tokio::runtime::Handle::current);
+                // v2 resource reads are not synthesized yet.
+                let setup =
+                    match prepare_turn(&ctx, &s_prompt, &session_id, prompt_text, Vec::new()).await
+                    {
+                        Ok(s) => s,
+                        Err(msg) => {
+                            responder
+                                .respond_with_error(
+                                    agent_client_protocol::Error::invalid_params().data(msg),
+                                )
+                                .ok();
+                            return Ok(());
+                        }
+                    };
+                // Same event-loop discipline as v1: run the turn on its own
+                // task so the connection keeps reading client responses.
+                let s_prompt_task = Arc::clone(&s_prompt);
+                let ctx_task = Arc::clone(&ctx);
+                let session_id_task = session_id.clone();
+                let emitter = V2Emitter::new(connection, responder);
+                tokio_handle.spawn(async move {
+                    run_turn(ctx_task, s_prompt_task, session_id_task, setup, emitter).await;
+                });
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ── session/cancel ─────────────────────────────────────────────────
+        .on_receive_notification(
+            async move |notif: acp_v2::CancelSessionNotification, _connection| {
+                let key = SessionId::new(notif.session_id.0.as_ref().to_string());
+                let mut map = s_cancel.lock().unwrap();
+                if let Some(s) = map.get_mut(&key)
+                    && let Some(tx) = s.cancel_tx.as_ref()
+                {
+                    let _ = tx.send(CancelLevel::HardAbort);
+                }
+                drop(map);
+                ctx_cancel.log(
+                    "info",
+                    Some(&notif.session_id.to_string()),
+                    "v2 session/cancel (hard abort)",
+                );
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+}
+
+/// Build the agent component, negotiating protocol v1 or v2 from each
+/// connection's `initialize`. v1 serves the full surface; v2 serves the
+/// bounded v2 surface reusing the same per-turn core.
+fn build_agent_router(
+    ctx: Arc<AcpContext>,
+    sessions: Sessions,
+) -> impl agent_client_protocol::ConnectTo<Client> {
+    agent_client_protocol::Agent
+        .protocol_router()
+        .with_v1(build_agent(Arc::clone(&ctx), sessions.clone()))
+        .with_v2(build_v2_agent(ctx, sessions))
+}
+
 // ── Transport entry points ────────────────────────────────────────────────────
 
 /// Run the ACP server on stdio. Blocks until the connection closes.
@@ -1475,7 +1797,9 @@ pub async fn run_acp_server(
     _tokio_handle: tokio::runtime::Handle,
 ) -> AcpResult<()> {
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    build_agent(ctx, sessions).connect_to(Stdio::new()).await
+    build_agent_router(ctx, sessions)
+        .connect_to(Stdio::new())
+        .await
 }
 
 /// Run the ACP over HTTP + WebSocket on `addr` (axum).
@@ -1488,7 +1812,7 @@ pub async fn run_acp_ws(
     let factory = {
         let ctx = Arc::clone(&ctx);
         let sessions = sessions.clone();
-        move || build_agent(ctx.clone(), sessions.clone())
+        move || build_agent_router(ctx.clone(), sessions.clone())
     };
     let server = agent_client_protocol_http::AcpHttpServer::new(factory);
     let router = server.into_router();
@@ -2631,9 +2955,113 @@ mod acp_e2e {
                     cleanup_session(&sid);
                     Ok(())
                 });
+
         tokio::time::timeout(Duration::from_secs(30), client)
             .await
             .expect("set_provider e2e timed out")
             .expect("client connection failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_inproc_protocol_v2_prompt_echo_negotiates_v2() {
+        let ctx = test_ctx();
+        let agent = build_agent_router(ctx, sessions());
+        let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let chunks2 = Arc::clone(&chunks);
+        let client = agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                async move |n: acp_v2::UpdateSessionNotification, _cx| {
+                    if let acp_v2::SessionUpdate::AgentMessageChunk(c) = &n.update
+                        && let acp_v2::ContentBlock::Text(t) = &c.content
+                    {
+                        chunks2.lock().unwrap().push(t.text.to_string());
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |r: acp_v2::RequestPermissionRequest, responder, _cx| {
+                    let option_id = r
+                        .options
+                        .first()
+                        .map(|o| o.option_id.clone())
+                        .unwrap_or_else(|| acp_v2::PermissionOptionId::new("continue"));
+                    responder.respond(acp_v2::RequestPermissionResponse::new(
+                        acp_v2::RequestPermissionOutcome::Selected(
+                            acp_v2::SelectedPermissionOutcome::new(option_id),
+                        ),
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(agent, |cx: ConnectionTo<AcpRoleAgent>| async move {
+                // Negotiate protocol v2 explicitly.
+                let init = cx
+                    .send_request(acp_v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        acp_v2::Implementation::new("ri-e2e-v2", "1.0"),
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(init.protocol_version, ProtocolVersion::V2);
+
+                let ns = cx
+                    .send_request(acp_v2::NewSessionRequest::new(acp_v2::AbsolutePath::new(
+                        "/tmp",
+                    )))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id;
+
+                let pr = cx
+                    .send_request(acp_v2::PromptRequest::new(
+                        sid.clone(),
+                        vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                            "echo v2-merhaba-inproc",
+                        ))],
+                    ))
+                    .block_task()
+                    .await?;
+                // v2 PromptResponse is minimal (no stop_reason); its presence
+                // means the turn completed through the v2 surface.
+                let _ = &pr;
+
+                // Ask over v2: the server emits a v2 request_permission; our
+                // registered handler auto-selects the first option.
+                let pr2 = cx
+                    .send_request(acp_v2::PromptRequest::new(
+                        sid.clone(),
+                        vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                            "tool ask_user {\"question\":\"v2 onay?\",\"options\":[\"evet\"]}",
+                        ))],
+                    ))
+                    .block_task()
+                    .await?;
+                let _ = &pr2;
+
+                // Cancel over v2: fires a CancelSessionNotification; the turn
+                // machinery (already covered by v1) resolves any pending ask.
+                let _ = cx.send_notification(acp_v2::CancelSessionNotification::new(sid.clone()));
+
+                cleanup_v1_session(&sid);
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(30), client)
+            .await
+            .expect("v2 e2e timed out")
+            .expect("client connection failed");
+        let text = chunks.lock().unwrap().join("");
+        assert!(
+            text.contains("v2-merhaba-inproc"),
+            "v2 streamed text missing; got {text:?}"
+        );
+    }
+
+    /// Remove the shared persistence file for a v2 session id (wrapped into the
+    /// shared v1-keyed map).
+    fn cleanup_v1_session(sid: &acp_v2::SessionId) {
+        cleanup_session(&SessionId::new(sid.0.as_ref().to_string()));
     }
 }

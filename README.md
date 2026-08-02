@@ -249,7 +249,11 @@ Implemented surface:
   `token` field enforced by `--serve-ws-token`
 - Transport: stdio (`--serve`) or HTTP+WebSocket at `/acp` (`--serve-ws`,
   optionally TLS via `--serve-ws-cert`/`--serve-ws-key`); the WS server
-  multiplexes many clients, stdio serves one
+  multiplexes many clients, stdio serves one. `initialize` is negotiated
+  per-connection: protocol v1 serves the full surface, and protocol v2
+  (unstable) is served over the shared per-turn core for `session/new`,
+  `session/prompt` (streamed updates), `session/cancel` and `ask_user` →
+  `session/request_permission`
 
 Current limitations: one prompt at a time per session; `_ri/steering` applies
 at the next turn boundary (mid-turn injection is not implemented); and
