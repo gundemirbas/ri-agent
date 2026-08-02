@@ -21,6 +21,13 @@
   checkpoint). Previously the serial handler blocked the loop, so a client's
   permission reply could never be read back (hang) and `_ri/get_state` only
   reflected state between turns.
+- **In-process ACP integration tests**: the ACP smoke flows are now locked in
+  as cargo tests that run under plain `cargo test` (no subprocess / JSON-RPC
+  over stdio) using the SDK's in-memory `connect_with` wiring: echo turn with
+  streamed chunks, the full `ask_user` → `request_permission` round-trip,
+  `_ri/get_state` reporting a live streaming session mid-turn,
+  `session/list`/`close`/`resume` with follow-up turns, and `session/cancel`
+  resolving a pending permission request.
 - **Per-session tool cwd + auto-compaction**: every `session/prompt` roots its
   tools at the session `cwd` — `bash`/`exec` run with that working directory
   and `read`/`write`/`edit`/`find` resolve relative paths against it — and ACP

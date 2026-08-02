@@ -1997,3 +1997,395 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod acp_e2e {
+    use super::*;
+    use agent_client_protocol::schema::ProtocolVersion;
+    use agent_client_protocol::schema::v1::{
+        CancelNotification, CloseSessionRequest, ContentBlock, InitializeRequest,
+        NewSessionRequest, PermissionOptionId, PromptRequest, RequestPermissionOutcome,
+        RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+        SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
+        TextContent,
+    };
+    use agent_client_protocol::{
+        Agent as AcpRoleAgent, Client, ConnectionTo, on_receive_notification, on_receive_request,
+    };
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    fn test_ctx() -> Arc<AcpContext> {
+        let provider: Arc<dyn LlmProvider + Send + Sync + 'static> =
+            Arc::new(crate::llm::test_provider::TestProvider::new());
+        let rebuild: ProviderRebuild = Arc::new(|_, _| {
+            Ok(Arc::new(crate::llm::test_provider::TestProvider::new())
+                as Arc<dyn LlmProvider + Send + Sync>)
+        });
+        Arc::new(AcpContext {
+            provider: RwLock::new(provider),
+            model: RwLock::new("test".to_string()),
+            thinking: RwLock::new(ThinkingLevel::High),
+            rebuild,
+            tokio_handle: Some(tokio::runtime::Handle::current()),
+            file_tracker: Arc::new(Mutex::new(FileTracker::new())),
+            skills: Arc::new(Vec::new()),
+            logs: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            admin_token: None,
+        })
+    }
+
+    fn sessions() -> Sessions {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn text_block(s: &str) -> ContentBlock {
+        ContentBlock::Text(TextContent::new(s))
+    }
+
+    /// Best-effort cleanup of the disk-persisted session file this test created.
+    fn cleanup_session(id: &SessionId) {
+        if let Some(dir) = acp_sessions_dir() {
+            let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_inproc_echo_turn_streams_text() {
+        let ctx = test_ctx();
+        let s = sessions();
+        let agent = build_agent(ctx, s);
+        let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let chunks2 = Arc::clone(&chunks);
+        let client = Client
+            .builder()
+            .on_receive_notification(
+                async move |n: SessionNotification, _cx| {
+                    if let SessionUpdate::AgentMessageChunk(c) = n.update
+                        && let ContentBlock::Text(t) = c.content
+                    {
+                        chunks2.lock().unwrap().push(t.text.to_string());
+                    }
+                    Ok(())
+                },
+                on_receive_notification!(),
+            )
+            .connect_with(agent, |cx: ConnectionTo<AcpRoleAgent>| async move {
+                let init = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                assert_eq!(init.protocol_version, ProtocolVersion::V1);
+                assert!(init.agent_capabilities.load_session);
+                let ns = cx
+                    .send_request(NewSessionRequest::new(
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
+                    ))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id;
+                let pr = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![text_block("echo merhaba-acp-inproc")],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(pr.stop_reason, StopReason::EndTurn);
+                cleanup_session(&sid);
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(30), client)
+            .await
+            .expect("e2e timed out")
+            .expect("client connection failed");
+        let text = chunks.lock().unwrap().join("");
+        assert!(
+            text.contains("merhaba-acp-inproc"),
+            "echo text missing; got {text:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_inproc_ask_user_round_trip() {
+        let ctx = test_ctx();
+        let s = sessions();
+        let agent = build_agent(ctx, s.clone());
+        let perm_titles: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let perm_titles2 = Arc::clone(&perm_titles);
+        let client = Client
+            .builder()
+            .on_receive_request(
+                async move |r: RequestPermissionRequest, responder, _cx| {
+                    for o in &r.options {
+                        perm_titles2.lock().unwrap().push(o.name.clone());
+                    }
+                    let option_id = r
+                        .options
+                        .first()
+                        .map(|o| o.option_id.clone())
+                        .unwrap_or_else(|| PermissionOptionId::new("continue"));
+                    responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                            option_id,
+                        )),
+                    ))
+                },
+                on_receive_request!(),
+            )
+            .connect_with(agent, |cx: ConnectionTo<AcpRoleAgent>| async move {
+                let _ = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id;
+                let pr = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![text_block(
+                            "tool ask_user {\"question\":\"devam edeyim mi?\",\"options\":[\"evet\",\"hayir\"]}",
+                        )],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(pr.stop_reason, StopReason::EndTurn);
+
+                // The chosen answer must have been routed back into the agent
+                // and committed into the in-memory session history.
+                let ev = { s.lock().unwrap().get(&sid).map(|x| x.events.clone()) };
+                assert!(
+                    ev.is_some_and(|events| events.iter().any(|e| matches!(
+                        e,
+                        SessionEvent::ToolResult { content, .. } if content.contains("evet")
+                    ))),
+                    "ask answer not recorded in session history"
+                );
+                cleanup_session(&sid);
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(30), client)
+            .await
+            .expect("ask e2e timed out")
+            .expect("client connection failed");
+        let opts = perm_titles.lock().unwrap().clone();
+        assert_eq!(
+            opts.as_slice(),
+            &["evet", "hayir", "Continue"],
+            "request_permission options differ: {opts:?}"
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_inproc_midturn_getstate_reports_streaming() {
+        let ctx = test_ctx();
+        let agent = build_agent(ctx, sessions());
+        let client =
+            Client
+                .builder()
+                .connect_with(agent, |cx: ConnectionTo<AcpRoleAgent>| async move {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id;
+
+                    // Query get_state from a concurrent task while the prompt
+                    // streams, then assert it reported the live streaming session.
+                    let cx2 = cx.clone();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    cx2.spawn({
+                        let cx_in = cx2.clone();
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            let r = cx_in.send_request(RiGetStateRequest).block_task().await;
+                            let _ = tx.send(r.map(|x| x.streaming_sessions).unwrap_or(0));
+                            Ok(())
+                        }
+                    })?;
+
+                    let words = (0..30)
+                        .map(|i| format!("w{i}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let pr = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![text_block(&format!("slow {words}"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(pr.stop_reason, StopReason::EndTurn);
+                    let streaming = rx.await.unwrap_or(0);
+                    assert!(
+                        streaming > 0,
+                        "mid-turn _ri/get_state should report a streaming session"
+                    );
+                    cleanup_session(&sid);
+                    Ok(())
+                });
+        tokio::time::timeout(Duration::from_secs(30), client)
+            .await
+            .expect("mid-turn e2e timed out")
+            .expect("client connection failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_inproc_sessions_list_close_resume() {
+        let ctx = test_ctx();
+        let agent = build_agent(ctx, sessions());
+        let replay: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let replay2 = Arc::clone(&replay);
+        let client = Client
+            .builder()
+            .on_receive_notification(
+                async move |n: SessionNotification, _cx| {
+                    if let SessionUpdate::AgentMessageChunk(c) = n.update
+                        && let ContentBlock::Text(t) = c.content
+                    {
+                        replay2.lock().unwrap().push_str(&t.text);
+                    }
+                    Ok(())
+                },
+                on_receive_notification!(),
+            )
+            .connect_with(agent, |cx: ConnectionTo<AcpRoleAgent>| async move {
+                let _ = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id;
+                let _ = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![text_block("echo otokrat-marker")],
+                    ))
+                    .block_task()
+                    .await?;
+
+                // The finished session is persisted and listed.
+                let list = cx.send_request(RiListSessionsRequest).block_task().await?;
+                assert!(
+                    list.sessions.iter().any(|m| m.id == sid.to_string()),
+                    "persisted session not listed in _ri/list_sessions"
+                );
+
+                // Close drops the in-memory session (idempotent), then resume
+                // re-registers it from disk and replay streams the old turn.
+                let _ = cx
+                    .send_request(CloseSessionRequest::new(sid.clone()))
+                    .block_task()
+                    .await?;
+                let _ = cx
+                    .send_request(CloseSessionRequest::new(sid.clone()))
+                    .block_task()
+                    .await?;
+                let _ = cx
+                    .send_request(ResumeSessionRequest::new(
+                        sid.clone(),
+                        std::path::PathBuf::from("/tmp"),
+                    ))
+                    .block_task()
+                    .await?;
+                // The resumed session is usable again.
+                let pr = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![text_block("echo after-resume")],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(pr.stop_reason, StopReason::EndTurn);
+                cleanup_session(&sid);
+                Ok(())
+            });
+        tokio::time::timeout(Duration::from_secs(30), client)
+            .await
+            .expect("sessions e2e timed out")
+            .expect("client connection failed");
+        assert!(
+            replay.lock().unwrap().contains("otokrat-marker"),
+            "resume did not replay the earlier turn: {:?}",
+            replay.lock().unwrap()
+        );
+        assert!(
+            replay.lock().unwrap().contains("after-resume"),
+            "resumed session did not stream its follow-up turn: {:?}",
+            replay.lock().unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_inproc_cancel_resolves_pending_ask() {
+        let ctx = test_ctx();
+        let agent = build_agent(ctx, sessions());
+        let client =
+            Client
+                .builder()
+                .connect_with(agent, |cx: ConnectionTo<AcpRoleAgent>| async move {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id;
+
+                    // Fire a session/cancel while the ask is still pending.
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cx2 = cx.clone();
+                    let sid2 = sid.clone();
+                    cx2.spawn({
+                        let cx_in = cx2.clone();
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            let _ = cx_in.send_notification(CancelNotification::new(sid2.clone()));
+                            let _ = tx.send(());
+                            Ok(())
+                        }
+                    })?;
+
+                    // The ask prompt completes (end_turn, not a hang) even though
+                    // no permission answer was ever sent.
+                    let pr = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![text_block(
+                                "tool ask_user {\"question\":\"cevap?\",\"options\":[\"evet\"]}",
+                            )],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(pr.stop_reason, StopReason::EndTurn);
+                    rx.await.expect("cancel task did not finish");
+
+                    // The session is still usable after the cancelled ask.
+                    let pr2 = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![text_block("echo bitti")],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(pr2.stop_reason, StopReason::EndTurn);
+                    cleanup_session(&sid);
+                    Ok(())
+                });
+        tokio::time::timeout(Duration::from_secs(30), client)
+            .await
+            .expect("cancel e2e timed out")
+            .expect("client connection failed");
+    }
+}
