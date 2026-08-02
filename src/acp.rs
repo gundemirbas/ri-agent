@@ -2202,6 +2202,18 @@ pub async fn run_acp_ws(
         move || build_agent_router(ctx.clone(), sessions.clone())
     };
     let server = agent_client_protocol_http::AcpHttpServer::new(factory);
+    // Allow ANY browser Origin on the WebSocket upgrade (`/acp`). The crate's
+    // default CorsOptions::Disabled rejects any request carrying an Origin
+    // header — and browsers ALWAYS send one on the WS handshake — so without
+    // this the web UI would sit at "reconnecting…" while raw clients (no
+    // Origin) connect fine. The UI and WS are same-origin anyway; the server
+    // is meant for LAN use (deployment hardening is the operator's job via
+    // token/reverse-proxy).
+    use agent_client_protocol_http::{CorsOptions, ServerOptions};
+    let server = server.with_options(ServerOptions {
+        cors: CorsOptions::allow_any_origin(),
+        ..Default::default()
+    });
     let router = with_web_ui(server.into_router());
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -2241,16 +2253,25 @@ fn with_web_ui(router: axum::Router) -> axum::Router {
 
     async fn web_index() -> impl axum::response::IntoResponse {
         (
-            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            [
+                (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
             WEB_INDEX,
         )
     }
     async fn web_app_js() -> impl axum::response::IntoResponse {
         (
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "text/javascript; charset=utf-8",
-            )],
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "text/javascript; charset=utf-8",
+                ),
+                // no-store: assets are embedded in the binary, so the browser
+                // must always fetch the current UI (a stale cached app.js
+                // would serve old code).
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
             WEB_APP_JS,
         )
     }
@@ -3073,6 +3094,89 @@ mod acp_e2e {
             health.contains("200") && health.trim_end().ends_with("ok"),
             "health endpoint: {health}"
         );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// Raw RFC-6455 WebSocket handshake against `/acp`, optionally carrying a
+    /// browser-style `Origin` header. Returns the HTTP status line.
+    async fn ws_upgrade_status(
+        addr: std::net::SocketAddr,
+        origin: Option<&str>,
+    ) -> std::io::Result<String> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        // Each header on its own contiguous literal — a `\<newline>`
+        // continuation would keep the indentation as literal spaces and the
+        // handshake would get 400.
+        let mut req = String::from("GET /acp HTTP/1.1\r\n")
+            + "Host: x\r\n"
+            + "Connection: Upgrade\r\n"
+            + "Upgrade: websocket\r\n"
+            + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            + "Sec-WebSocket-Version: 13\r\n";
+        if let Some(origin) = origin {
+            req.push_str(&format!("Origin: {origin}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).await?;
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            head.extend_from_slice(&buf[..n]);
+        }
+        Ok(String::from_utf8_lossy(&head)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// Browsers ALWAYS send an `Origin` header on the WebSocket handshake; the
+    /// ACP crate refuses cross-origin upgrades by default, which would leave the
+    /// web UI stuck at "reconnecting…". The server must therefore accept WS
+    /// upgrades from the same origin AND from arbitrary LAN origins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn web_ws_accepts_browser_origin_headers() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let addr = probe.local_addr().expect("probe addr");
+        drop(probe);
+
+        let ctx = test_ctx();
+        let server = tokio::spawn(crate::acp::run_acp_ws(ctx, addr, None));
+
+        // Wait for the listener.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ws_upgrade_status(addr, None).await {
+                    Ok(_) => break,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(60)).await,
+                }
+            }
+        })
+        .await
+        .expect("ws server never came up");
+
+        // Same-origin (the browser opening http://<host>:<port>/).
+        let same = ws_upgrade_status(addr, Some(&format!("http://127.0.0.1:{}", addr.port())))
+            .await
+            .unwrap();
+        assert!(same.contains("101"), "same-origin WS must upgrade: {same}");
+
+        // Arbitrary LAN origin (another PC on the network).
+        let lan = ws_upgrade_status(addr, Some("http://192.168.1.50:8990"))
+            .await
+            .unwrap();
+        assert!(lan.contains("101"), "LAN-origin WS must upgrade: {lan}");
+
+        // Origin-less raw client must keep working too.
+        let raw = ws_upgrade_status(addr, None).await.unwrap();
+        assert!(raw.contains("101"), "origin-less WS must upgrade: {raw}");
 
         server.abort();
         let _ = server.await;

@@ -24,6 +24,7 @@
     background: var(--bg); color: var(--text);
     font: 14px/1.5 system-ui, "Segoe UI", Roboto, sans-serif;
     display: flex; flex-direction: column;
+    height: 100%; overflow: hidden; /* the chat pane (#log) is the scroller */
   }
   header {
     display: flex; align-items: center; gap: 12px;
@@ -47,6 +48,7 @@
   main {
     flex: 1; overflow-y: auto; padding: 18px 16px 8px;
     display: flex; flex-direction: column; gap: 10px;
+    min-height: 0; /* allow the pane to shrink so IT scrolls, not the body */
   }
   .msg { max-width: 78%; display: flex; flex-direction: column; gap: 2px; }
   .msg.user  { align-self: flex-end; }
@@ -61,8 +63,9 @@
   .meta { font-size: 11px; color: var(--muted); padding: 0 4px; }
   .meta .model-badge { color: var(--accent); }
   details.tool {
-    margin-top: 6px; align-self: flex-start; min-width: 260px; max-width: 86%;
-    background: var(--tool); border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    margin-top: 6px; align-self: stretch; min-width: 0; max-width: none;
+    background: #20262f; border: 1px solid #3a4252; border-left: 3px solid var(--accent);
+    border-radius: 10px; overflow: hidden;
   }
   details.tool summary {
     cursor: pointer; padding: 7px 10px; font-size: 12px; list-style: none;
@@ -75,6 +78,15 @@
   details.tool summary .dot.completed   { background: var(--accent); }
   details.tool summary .dot.error       { background: var(--error); }
   details.tool summary .name { font-family: ui-monospace, monospace; color: var(--text); }
+  details.tool summary .tag {
+    background: var(--accent); color: #06281a; border-radius: 4px;
+    font-size: 10px; font-weight: 700; padding: 1px 6px;
+  }
+  details.tool summary .chip { margin-left: auto; font-size: 11px; }
+  details.tool summary .chip.pending     { color: var(--warn); }
+  details.tool summary .chip.in_progress { color: var(--accent); }
+  details.tool summary .chip.completed   { color: var(--muted); }
+  details.tool summary .chip.error       { color: var(--error); }
   details.tool pre {
     margin: 0; padding: 8px 12px; border-top: 1px solid var(--border);
     white-space: pre-wrap; word-break: break-word; font-size: 12px; color: #cdd6e3;

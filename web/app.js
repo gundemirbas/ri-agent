@@ -22,9 +22,7 @@ let turn = {
   assistant: null,      // last assistant bubble Node
   assistantId: null,
   thought: null,
-  thoughtId: null,
-  tools: new Map(),     // toolCallId → elements {card, pre, dot}
-  usageTotal: null,
+  usageTotal: null,     // usage tokens of the in-flight turn
   promptId: null,       // JSON-RPC id of the in-flight prompt request
 };
 
@@ -42,7 +40,21 @@ function bubbleNode() {
   b.className = "bubble";
   return b;
 }
+// Auto-stick to the bottom only while the user is already near the bottom;
+// the moment they scroll up (to read a tool card / earlier message) we stop
+// yanking them back down.
+let stickToBottom = true;
+log.addEventListener("scroll", () => {
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  if (atBottom) stickToBottom = true;
+  else if (log.scrollTop < log.scrollHeight - log.clientHeight - 160) stickToBottom = false;
+}, { passive: true });
+
 function scrollBottom() {
+  if (stickToBottom) log.scrollTop = log.scrollHeight;
+}
+function forceScrollBottom() {
+  stickToBottom = true;
   log.scrollTop = log.scrollHeight;
 }
 function setStatus(text, good) {
@@ -101,15 +113,24 @@ function connect() {
   };
   ws.onmessage = (ev) => {
     let m;
-    try { m = JSON.parse(ev.data); } catch { return; }
-    if (m.id !== undefined && m.id !== null && pending.has(m.id)) {
-      const h = pending.get(m.id);
-      pending.delete(m.id);
-      h(m.result !== undefined ? { ok: true, result: m.result } : { ok: false, error: m.error || {} });
-      return;
+    try {
+      m = JSON.parse(ev.data);
+      if (m.id !== undefined && m.id !== null && pending.has(m.id)) {
+        const h = pending.get(m.id);
+        pending.delete(m.id);
+        h(m.result !== undefined ? { ok: true, result: m.result } : { ok: false, error: m.error || {} });
+        return;
+      }
+      if (m.method === "session/update") { onSessionUpdate(m.params); return; }
+      if (m.method === "session/request_permission") { onPermission(m.params, m.id); return; }
+    } catch (e) {
+      // Never let a UI bug swallow transport messages silently: surface it.
+      const d = document.createElement("div");
+      d.className = "error-line";
+      d.textContent = "[ui] " + (e && e.message ? e.message : String(e));
+      log.appendChild(d);
+      scrollBottom();
     }
-    if (m.method === "session/update") { onSessionUpdate(m.params); return; }
-    if (m.method === "session/request_permission") { onPermission(m.params, m.id); return; }
   };
   ws.onclose = () => {
     setStatus("disconnected", false);
@@ -158,6 +179,7 @@ function sendPrompt() {
   ub.textContent = text;
   appendQuery("user", ub);
 
+  forceScrollBottom();
   beginTurn();
   send("session/prompt", { sessionId, prompt: [{ type: "text", text }] }, (res, err) => {
     if (err) {
@@ -174,8 +196,9 @@ function sendPrompt() {
 
 function beginTurn() {
   running = true;
-  turn = { assistant: null, assistantId: null, thought: null, thoughtId: null,
+  turn = { assistant: null, assistantId: null, thought: null,
            tools: new Map(), usageTotal: null, promptId: rpcId };
+  forceScrollBottom();
   $("send").disabled = true;
   $("stop").style.display = "";
 }
@@ -238,17 +261,27 @@ function textOf(contentBlock) {
   return "";
 }
 
+// A turn shares ONE messageId across all its agent text/thoughts (the server
+// emits them under a single turn-scoped message), so bursts cannot be told
+// apart by id. Heuristic: when thinking arrives and the current thought block
+// is NOT the last element anymore (a tool card / text came in between), open a
+// fresh thought block right below — otherwise append to the running one. This
+// keeps a thinking burst after tool calls BELOW the tool cards.
+function currentThought() {
+  if (!turn.thought || log.lastElementChild !== turn.thought) {
+    const t = document.createElement("div");
+    t.className = "thought";
+    turn.thought = t;
+    log.appendChild(t);
+  }
+  return turn.thought;
+}
+
 function streamText(u, isThought) {
   const text = textOf(u.content);
   if (isThought) {
-    if (!turn.thoughtId || u.messageId !== turn.thoughtId) {
-      const t = document.createElement("div");
-      t.className = "thought";
-      turn.thought = t;
-      turn.thoughtId = u.messageId;
-      log.appendChild(t);
-    }
-    turn.thought.textContent += text;
+    currentThought().textContent += text;
+    scrollBottom();
     return;
   }
   if (!turn.assistant || u.messageId !== turn.assistantId) {
@@ -260,8 +293,13 @@ function streamText(u, isThought) {
   }
   turn.assistant.textContent += text;
   if (!running) turn.assistant.classList.remove("streaming");
+  scrollBottom();
 }
 
+const TOOL_STATUS = {
+  pending: "hazırlanıyor…", in_progress: "çalışıyor…", completed: "tamam",
+  error: "hata",
+};
 function streamTool(u) {
   const id = u.toolCallId;
   let t = turn.tools.get(id);
@@ -271,28 +309,37 @@ function streamTool(u) {
     const sum = document.createElement("summary");
     const dot = document.createElement("span");
     dot.className = "dot";
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = "tool";
     const name = document.createElement("span");
     name.className = "name";
-    sum.appendChild(dot);
-    sum.appendChild(name);
+    const chip = document.createElement("span");
+    chip.className = "chip";
     const pre = document.createElement("pre");
+    sum.appendChild(dot);
+    sum.appendChild(tag);
+    sum.appendChild(name);
+    sum.appendChild(chip);
     card.appendChild(sum);
     card.appendChild(pre);
     log.appendChild(card);
-    t = { card, pre, dot, name, status: "" };
+    t = { card, pre, dot, chip, name, status: "" };
     turn.tools.set(id, t);
-    t.card.open = true; // auto-open streaming tool cards
+    // Keep tool cards OPEN so tool work is always visible; the user may
+    // collapse them manually.
+    t.card.open = true;
   }
   if (u.title) t.name.textContent = u.title;
   t.status = u.status || t.status;
   t.dot.className = "dot " + (t.status || "pending");
+  t.chip.textContent = TOOL_STATUS[t.status] || t.status;
+  t.chip.className = "chip " + (t.status || "pending");
   if (u.content && u.content.length) {
     const text = u.content.map((c) => textOf(c)).join("");
     t.pre.textContent = text;
   }
-  if (u.status === "completed" || u.status === "error") {
-    if (t.pre.textContent.trim().length > 0) t.card.open = false;
-  }
+  scrollBottom();
 }
 
 function renderUsage() {
@@ -374,13 +421,17 @@ input.addEventListener("input", () => {
 $("send").addEventListener("click", sendPrompt);
 $("stop").addEventListener("click", stopTurn);
 $("cwd").addEventListener("change", () => {
-  // A cwd change applies to the NEXT session; close the current one so a
-  // fresh session starts in the new workspace on the following prompt.
+  // The workspace applies to the (next) session: close the current one and
+  // immediately open a fresh session in the new workspace so the input never
+  // gets stuck in a session-less state.
   if (sessionId) {
     send("session/close", { sessionId }, () => {});
     sessionId = null;
-    $("session").textContent = "(workspace will change)";
+    $("session").textContent = "(workspace değişiyor)";
     $("send").disabled = true;
+    setTimeout(newSession, 150);
+  } else {
+    newSession();
   }
 });
 
