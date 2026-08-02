@@ -14,6 +14,18 @@
   before exec (`RI_SANDBOX_RLIMITS` or `cpu=30,nproc=64,nofile=2048,as=512m,
   fsize=1g,core=0`; `none` disables). New integration tests cover strict mode
   (empty `/lib`, symlinked static shell), compat mode, and observable limits.
+- **Web UI over ACP v2 (spec §18)**: `ri --serve` now also serves a minimal
+  browser chat — the web counterpart of the TUI — at **`0.0.0.0:8990`**
+  (LAN-reachable; `web/index.html` + `web/app.js`, both embedded). The client
+  speaks **ACP v2 only** (`initialize(2)` → `session/new` → `session/prompt`),
+  streaming `session/update` notifications (assistant/thought text, tool call
+  cards, usage), answering `session/request_permission` prompts, and stopping
+  via `session/cancel`. Port override: `$RI_WEB_PORT` or `--serve-ws <ADDR>`;
+  disable for the `--tui-acp` child via `RI_SERVE_WEB=0`. Because the server
+  binds 0.0.0.0, README documents the token/reverse-proxy guidance.
+- **Sandbox is always on**: the `--sandbox` flag AND the `sandbox` config key
+  are removed — tool subprocesses always run inside the rootless container
+  (`ri-sandbox`, user namespace + chroot); config has no sandbox knob any more.
 - **`muslcc`, seccomp denylist and custom-tool hot-reload (spec §7, §16–17)**:
   a second bootstrap tool `muslcc` compiles **C** inside the sandbox with a
   bundled relocatable musl.cc `x86_64-linux-musl-cross` (a fully static i386

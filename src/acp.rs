@@ -2187,7 +2187,9 @@ pub async fn run_acp_server(
         .await
 }
 
-/// Run the ACP over HTTP + WebSocket on `addr` (axum).
+/// Run the ACP over HTTP + WebSocket on `addr` (axum), including the web UI
+/// (the browser "simple TUI" speaking ACP v2 at `/acp`; page served at `/`,
+/// client JS at `/app.js`).
 pub async fn run_acp_ws(
     ctx: Arc<AcpContext>,
     addr: std::net::SocketAddr,
@@ -2200,8 +2202,14 @@ pub async fn run_acp_ws(
         move || build_agent_router(ctx.clone(), sessions.clone())
     };
     let server = agent_client_protocol_http::AcpHttpServer::new(factory);
-    let router = server.into_router();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let router = with_web_ui(server.into_router());
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ri ACP/web: cannot bind {addr}: {e}");
+            return Err(anyhow::anyhow!("cannot bind {addr}: {e}"));
+        }
+    };
     match tls {
         Some((cert, key)) => {
             let acceptor = build_tls_acceptor(&cert, &key)?;
@@ -2217,6 +2225,39 @@ pub async fn run_acp_ws(
         None => axum::serve(listener, router).await?,
     }
     Ok(())
+}
+
+/// The browser "simple TUI": a self-contained chat client over the WebSocket
+/// ACP endpoint. ACP **v2 only** (no v1 fallback) — `web/app.js`. The page is
+/// served at `/` and the client script at `/app.js`, both embedded so the
+/// binary serves the interface without any external assets.
+const WEB_INDEX: &str = include_str!("../web/index.html");
+const WEB_APP_JS: &str = include_str!("../web/app.js");
+
+/// Attach the served web UI routes to the ACP router (which already exposes
+/// `/acp` for the WebSocket and `/health`).
+fn with_web_ui(router: axum::Router) -> axum::Router {
+    use axum::routing::get;
+
+    async fn web_index() -> impl axum::response::IntoResponse {
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            WEB_INDEX,
+        )
+    }
+    async fn web_app_js() -> impl axum::response::IntoResponse {
+        (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/javascript; charset=utf-8",
+            )],
+            WEB_APP_JS,
+        )
+    }
+
+    router
+        .route("/", get(web_index))
+        .route("/app.js", get(web_app_js))
 }
 
 /// Minimal axum [`axum::serve::Listener`] that upgrades each accepted TCP
@@ -2966,6 +3007,75 @@ mod acp_e2e {
         if let Some(dir) = acp_sessions_dir() {
             let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
         }
+    }
+
+    /// Raw minimal HTTP GET over a plain TCP stream (no HTTP client dep).
+    async fn raw_get(addr: std::net::SocketAddr, path: &str) -> std::io::Result<String> {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: ri\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// The ACP web server serves the browser UI (`/`), its client script
+    /// (`/app.js`) and a health probe (`/health`) alongside the `/acp`
+    /// WebSocket endpoint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn web_ui_is_served_over_http() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let addr = probe.local_addr().expect("probe addr");
+        drop(probe); // release so run_acp_ws can bind it
+
+        let ctx = test_ctx();
+        let server = tokio::spawn(crate::acp::run_acp_ws(ctx, addr, None));
+
+        // Retry until the server accepts (bind happens in the spawned task).
+        let (index, appjs, health) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match raw_get(addr, "/").await {
+                    Ok(body) => {
+                        let js = raw_get(addr, "/app.js").await.unwrap_or_default();
+                        let h = raw_get(addr, "/health")
+                            .await
+                            .unwrap_or_else(|e| format!("ERR {e}"));
+                        break (body, js, h);
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(80)).await,
+                }
+            }
+        })
+        .await
+        .expect("web server never came up");
+
+        let (status, _rest) = index.split_once("\r\n").unwrap_or(("", ""));
+        assert!(status.contains("200"), "GET / status: {status}");
+        assert!(
+            index.to_lowercase().contains("<!doctype html>"),
+            "GET / must serve the web UI page"
+        );
+        assert!(
+            index.contains("/app.js"),
+            "page must reference the client script"
+        );
+        let (js_status, _) = appjs.split_once("\r\n").unwrap_or(("", ""));
+        assert!(js_status.contains("200"), "GET /app.js status: {js_status}");
+        assert!(
+            appjs.contains("session/update") && appjs.contains("protocolVersion"),
+            "client script must speak ACP v2"
+        );
+        assert!(
+            health.contains("200") && health.trim_end().ends_with("ok"),
+            "health endpoint: {health}"
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

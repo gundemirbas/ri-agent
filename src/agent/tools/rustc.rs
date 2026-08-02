@@ -73,7 +73,7 @@ impl Tool for RustcTool {
          inside the sandbox and install it in the custom-tools directory \
          (~/.ri/tools). The tool then follows the custom-tool protocol: \
          `--describe` prints a JSON descriptor; JSON on stdin returns a result \
-         on stdout. Requires the sandbox (--sandbox) and the provisioned Rust \
+         on stdout. Requires the (always-on) sandbox and the provisioned Rust \
          toolchain."
     }
 
@@ -106,8 +106,8 @@ impl Tool for RustcTool {
         Box::pin(async move {
             if !ctx.sandbox {
                 return ToolResult::err(
-                    "the `rustc` bootstrap tool compiles inside the sandbox; \
-                     start ri with --sandbox (or sandbox = true in config.toml)",
+                    "the `rustc` bootstrap tool compiles inside the sandbox; the sandbox \
+                     is always on (there is no way to disable it)",
                 );
             }
             let parsed: RustcArgs = match serde_json::from_value(args) {

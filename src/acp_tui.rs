@@ -77,6 +77,9 @@ pub async fn spawn(
     let exe = std::env::current_exe()?;
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("--serve").args(&child_args).current_dir(&cwd);
+    // The detached child is driven over stdio (v1); don't let it also squat on
+    // the web UI's default port when the parent is itself using it.
+    cmd.env("RI_SERVE_WEB", "0");
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

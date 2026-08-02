@@ -831,7 +831,7 @@ ri-agent update
 
 Bu belge, özellikle §2 (gömülü rootfs) ve §5/§6 (bootstrapping) kısımlarıyla
 birlikte *hedef mimariyi* çizer. Aşağıda, ri-agent içinde **şu an kodlanan ve
-test edilen** sürüm (`--sandbox`, `ri-sandbox` binary'si) açıklanıyor; fiili
+test edilen** sürüm (araçlar her zaman `ri-sandbox` içinde) açıklanıyor; fiili
 tasarım spek'ten şu noktalarda üstünlük/güvenilirlik için ayrışıyor:
 
 ### Çalışanlar ✅
@@ -899,10 +899,10 @@ scripts/fetch-uutils-coreutils.sh     # rootfs/usr/bin/coreutils (gitignored)
 
 cargo build --bins                    # hem `ri` hem `ri-sandbox`'ı üretir
 
-# Başlat: --sandbox bayrağı (veya config.toml'da `sandbox = true`)
-ri --sandbox                          # TUI, araçlar sandbox içinde
-ri --serve --sandbox                  # ACP headless aynı sandbox'la
-ri --print --provider test --sandbox "run: pwd && id"
+# Başlat: sandbox HER ZAMAN açıktır (`--sandbox` bayrağı ve config anahtarı yok)
+ri                                     # TUI, araçlar sandbox içinde
+ri --serve                             # ACP headless + web UI http://0.0.0.0:8990 (LAN'a açık)
+ri --print --provider test "run: pwd && id"
 ```
 
 Image'i elle önceden kurmak istersen:
@@ -976,7 +976,7 @@ KULLANILMAZ**:
 
 `cargo test rustc_tool_bootstraps` — gerçek `rustc` aracı, sandbox içi derleme,
 tools dizinine iniş ve derlenen statik tool'un sandbox içinde çalıştırılması.
-Gerçek CLI smoke: `ri --print --provider test --sandbox 'tool rustc {…}'`.
+Gerçek CLI smoke: `ri --print --provider test 'tool rustc {…}'`.
 
 ---
 
@@ -1030,3 +1030,34 @@ kurarınız:
 `cargo test muslcc_tool_bootstraps` (C e2e: derle → tools'a iniş → sandbox'ta
 çalıştır → hot-reload), `cargo test seccomp_denylist` (bütünleşik diferansiyel),
 `cargo test hot_reload` (birim), `cargo test rustc_tool_bootstraps`.
+
+---
+
+## 18. Web UI (Tarayıcı istemcisi · ACP v2) (Uygulandı)
+
+TUI'nin basit çevrimiçi karşılığı: `ri --serve`'ün (ve `--serve-ws <ADDR>`'in)
+sunduğu, varsayılan **`0.0.0.0:8990`** adresindeki sayfa (`http://<makine-ip>:8990/`)
++ `web/app.js` (ikisi de `include_str!` ile gömülü). LAN'dan erişilebilir;
+portu `$RI_WEB_PORT` (veya `--serve-ws <ADDR>`), kapatmak için `RI_SERVE_WEB=0`
+(`--tui-acp` çocuğu bunu ayarlar).
+
+- **Sadece ACP v2**: tarayıcı istemcisi v1'e düşmez. `initialize(protocolVersion:2)`
+  → `session/new` → `session/prompt`; akış `session/update` notification'larıyla
+  (assistant/thought metni, tool call kartları, usage), izinler
+  `session/request_permission` request'lerine `{outcome}` cevabıyla, kesme
+  `session/cancel` ile.
+- Sunucu tarafında dual-versiyon router korunur (stdio/`--tui-acp` v1 kullanır),
+  web istemcisi tarafında v2 sabittir.
+- Güvenlik: `0.0.0.0`'a açık → ağdan ulaşabilen herkes ajanı sürebilir;
+  güvenilmeyen ağlarda `--serve-ws-token` / `--serve-ws 127.0.0.1:8990` önerilir.
+
+### Kullanım
+
+```sh
+ri --serve                       # stdio ACP + web UI 0.0.0.0:8990
+ri --serve-ws 0.0.0.0:8990       # sadece web+WS
+RI_WEB_PORT=9999 ri --serve      # port override
+```
+
+Sanity check (Rust testi `web_ui_is_served_over_http`): `/` → index (v2 sayfası),
+`/app.js` → istemci script, `/health` → `ok`; `/acp` WebSocket aynı sunucuda.

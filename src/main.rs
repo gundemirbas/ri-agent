@@ -118,7 +118,9 @@ struct Cli {
     serve: bool,
 
     /// Run as a headless ACP server over HTTP + WebSocket at ADDR (e.g.
-    /// 127.0.0.1:8080) instead of the TUI.
+    /// 0.0.0.0:8990) instead of the TUI. The web UI + WebSocket serve on ALL
+    /// interfaces so other machines on the LAN can connect; use
+    /// `--serve-ws-token` when the network is not trusted.
     #[arg(long, value_name = "ADDR")]
     serve_ws: Option<std::net::SocketAddr>,
 
@@ -142,12 +144,6 @@ struct Cli {
     /// in-process agent loop.
     #[arg(long)]
     tui_acp: bool,
-
-    /// Run agent tool subprocesses inside the rootless container sandbox
-    /// (user namespace + chroot; see docs/CONTAINER-RUNTIME-SPEC.md).
-    /// Linux-only. Default is off: tools run directly on the host.
-    #[arg(long)]
-    sandbox: bool,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -208,16 +204,18 @@ async fn main() -> io::Result<()> {
     // Built-in hosted providers are always available from the static catalog.
     // Config only stores user-configured instances and overrides.
 
-    // ── Sandbox: route tool subprocesses through the rootless container ────
-    // `--sandbox` beats config.toml; initializing the image up front fails
-    // fast (and loudly on non-Linux) instead of breaking mid-session.
-    let sandbox = cli.sandbox || config.sandbox;
+    // ── Sandbox: tool subprocesses ALWAYS route through the rootless
+    // container (user namespace + chroot) — there is no `--sandbox` flag and
+    // no config knob; this is the only execution mode. Initializing the image
+    // up front fails fast (and loudly on non-Linux) instead of breaking
+    // mid-session.
+    let sandbox = true;
     if sandbox {
         container::ensure_initialized().map_err(|e| {
             eprintln!(
                 "error: could not prepare the sandbox image: {e}\n\
-                       (the rootless sandbox is Linux-only and needs user\n\
-                       namespaces enabled in the kernel)"
+                       (the rootless sandbox is always on, is Linux-only and\n\
+                       needs user namespaces enabled in the kernel)"
             );
             io::Error::other("sandbox initialization failed")
         })?;
@@ -343,6 +341,35 @@ async fn main() -> io::Result<()> {
                 .map_err(|e| io::Error::other(e.to_string()));
         }
 
+        // `--serve` (stdio) additionally serves the web UI + WebSocket on the
+        // default address unless the environment disables it (the decoupled
+        // `--tui-acp` child sets RI_SERVE_WEB=0 so it does not squat on the
+        // port). `--serve-ws <ADDR>` overrides the address and is the only
+        // server.
+        if !std::env::var("RI_SERVE_WEB")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
+            // Bind 0.0.0.0 so the browser UI is reachable from other machines
+            // on the LAN; override the port with `$RI_WEB_PORT` (or move the
+            // whole address with `--serve-ws <ADDR>`).
+            let default_addr: std::net::SocketAddr = std::env::var("RI_WEB_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(|p| std::net::SocketAddr::from(([0, 0, 0, 0], p)))
+                .unwrap_or_else(|| "0.0.0.0:8990".parse().expect("static web addr"));
+            let web_ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                if let Err(e) = acp::run_acp_ws(web_ctx, default_addr, None).await {
+                    eprintln!("ri: web UI could not start on {default_addr}: {e}");
+                }
+            });
+            eprintln!(
+                "ri ACP (stdio) + web UI at http://{default_addr} — ACP v2, reachable \
+                 from the LAN; --serve-ws <ADDR> to change the bind address"
+            );
+        }
+
         let server = std::thread::spawn(move || {
             futures_lite::future::block_on(acp::run_acp_server(ctx, handle))
         });
@@ -402,15 +429,6 @@ async fn main() -> io::Result<()> {
             "--model".to_string(),
             initial_model.clone(),
         ];
-        let child_args = {
-            let mut v = child_args;
-            // Keep the detached ACP agent inside the same sandbox when the
-            // parent runs with it enabled.
-            if sandbox {
-                v.push("--sandbox".to_string());
-            }
-            v
-        };
         let controls = acp_tui::spawn(child_args, cwd.clone(), app_event_tx.clone())
             .await
             .map_err(|e| {

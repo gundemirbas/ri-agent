@@ -86,22 +86,21 @@ cargo install --path .
 | `-P` | `--provider <PROVIDER>` | Configured provider instance id to use |
 | `-m` | `--model <MODEL>` | Model name to use (e.g. gpt-4o) |
 | `-p` | `--print <PROMPT>...` | Run in non-interactive mode: send PROMPT, stream the response to stdout, and exit. Accepts multiple words without shell quoting |
-| | `--serve` | Run as a headless ACP (Agent Client Protocol) server on stdio instead of the TUI |
-| | `--serve-ws <ADDR>` | Run as a headless ACP server over HTTP + WebSocket (`ws://ADDR/acp`) instead of the TUI |
+| | `--serve` | Headless ACP server on stdio — and serves the **web UI** (browser chat over ACP v2) at `http://0.0.0.0:8990` (LAN-reachable; override with `--serve-ws <ADDR>` or `$RI_WEB_PORT`) |
+| | `--serve-ws <ADDR>` | Serve the ACP v2 WebSocket (`ws://ADDR/acp`) + web UI at `ADDR` instead of the TUI |
 | | `--serve-ws-token <TOKEN>` | Require this admin token on mutating `_ri/*` methods |
 | | `--serve-ws-cert <CERT>` / `--serve-ws-key <KEY>` | Serve `--serve-ws` over TLS (`wss://`) |
 | | `--tui-acp` | Keep the interactive TUI but run the agent as a detached child `ri --serve` over ACP (decoupled UI ↔ agent) |
-| | `--sandbox` | Route agent tool subprocesses through the rootless container sandbox (`ri-sandbox`, user namespace + chroot). Linux-only; also settable via `sandbox = true` in config.toml |
 | | `--print-dirs` | Print the file-system paths ri uses and exit |
 | `-h` | `--help` | Print help |
 | `-V` | `--version` | Print version |
 
-## Rootless tool sandbox (`--sandbox`)
+## Rootless tool sandbox (always on)
 
-Agent tool subprocesses (`bash`, `exec`, custom tools) normally run directly on
-the host. With `--sandbox` (or `sandbox = true` in config.toml) each one runs
-inside a **rootless container** built from raw Linux syscalls — no OCI, no
-podman/docker, no root:
+Agent tool subprocesses (`bash`, `exec`, custom tools) **always** run inside a
+**rootless container** built from raw Linux syscalls — no OCI, no
+podman/docker, no root. There is no `--sandbox` flag and no `sandbox` config
+key: this is the only execution mode:
 
 - `ri-sandbox` (a second bin target, spawned per tool call) creates a
   **user namespace** (`unshare(CLONE_NEWUSER|CLONE_NEWNS)`), maps your uid to
@@ -146,9 +145,27 @@ are unavailable.
 scripts/fetch-uutils-coreutils.sh    # optional: static file tools
 scripts/fetch-rust-toolchain.sh      # optional: in-sandbox rustc (bootstrap)
 cargo build --bins                   # produces `ri` + `ri-sandbox` + `ri-sh`
-ri --sandbox                         # TUI with sandboxed tools
-ri --serve --sandbox                 # headless ACP agent, same sandbox
+ri                                   # TUI (tools already sandboxed)
+ri --serve                           # ACP server + web UI at http://0.0.0.0:8990
 ```
+
+## Web UI (browser client · ACP v2)
+
+`ri --serve` (or `ri --serve-ws 0.0.0.0:8990`) serves a minimal browser chat —
+the web counterpart of the TUI — at `http://<this-machine-ip>:8990/` (bound to
+**0.0.0.0**, so any machine on the LAN can open it; override the port with
+`$RI_WEB_PORT` or the whole address with `--serve-ws <ADDR>`). It is **ACP v2
+only** (no v1 fallback): the page connects to `ws://<host>/acp`,
+negotiates `session/new` + `session/prompt`, and renders the streaming
+`session/update` notifications (assistant/thought text, tool call cards,
+usage), answers `session/request_permission` prompts, and stops a run with
+`session/cancel`. Set `--serve-ws-token` to protect the mutating `_ri/*`
+methods.
+
+Assets are embedded (`web/index.html`, `web/app.js`); the workspace the agent
+operates in is the `cwd` of the `ri --serve` process — the browser only owns
+the chat surface.
+
 
 ## Keybindings
 
@@ -267,13 +284,18 @@ manually, optionally with custom summary instructions.
 vendor-neutral [Agent Client Protocol](https://agentclientprotocol.com/) —
 JSON-RPC 2.0 over stdio, one message per newline — so any ACP-capable client
 (editors, desktop/web UIs, `acpx`, …) can drive ri as a subprocess. A WebSocket
-variant is available via `ri --serve-ws 127.0.0.1:8080` (route `/acp`, with
+variant is available via `ri --serve-ws 0.0.0.0:8990` (route `/acp`, with
 streamable HTTP on the same server for non-WebSocket clients):
 
 ```sh
-ri --serve --provider test         # stdio
-ri --serve-ws 127.0.0.1:8080 --provider test   # WebSocket + HTTP
+ri --serve --provider test                    # stdio + web UI on all interfaces
+ri --serve-ws 0.0.0.0:8990 --provider test    # WebSocket + HTTP, LAN-reachable
 ```
+
+> **Security:** the server binds to `0.0.0.0`, so anyone who can reach the port
+> can drive the agent (create sessions, run prompts/tools). Prefer a
+> `--serve-ws-token`, run it behind a reverse-proxy/SSH tunnel, or bind only
+> loopback with `--serve-ws 127.0.0.1:8990` on untrusted networks.
 
 Implemented surface:
 
