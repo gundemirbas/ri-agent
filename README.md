@@ -253,8 +253,8 @@ Implemented surface:
   per-connection: protocol v1 serves the full surface, and protocol v2
   (unstable) is served over the shared per-turn core with the standard v2
   session surface (`session/new`/`resume`/`list`/`close`/`fork`/`delete`/
-  `prompt`/`cancel` + `ask_user` → `session/request_permission`); only the
-  ri-specific `_ri/*` methods stay v1-only
+  `prompt`/`cancel` + `ask_user` → `session/request_permission`, plus the
+  ri-specific `_ri/*` methods via shared version-neutral implementations)
 
 Current limitations: one prompt at a time per session; `_ri/steering` applies
 at the next turn boundary (mid-turn injection is not implemented); and

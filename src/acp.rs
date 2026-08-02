@@ -43,8 +43,9 @@
 //! `session/fork`, `session/delete`, `session/prompt` (streamed v2
 //! `UpdateSessionNotification` chunks with per-turn `MessageId`, plus embedded
 //! resource reads), `session/cancel`, and `ask_user` →
-//! `session/request_permission` (v2 title+options). Only the ri-specific
-//! `_ri/*` custom methods remain v1-only.
+//! `session/request_permission` (v2 title+options), and the ri-specific
+//! `_ri/*` custom methods (shared version-neutral implementations registered
+//! on both the v1 and v2 agents).
 //!
 //! Event loop: `session/prompt` handlers return immediately and run the whole
 //! turn (event forwarding, the `request_permission` ask bridge, the final
@@ -848,6 +849,272 @@ macro_rules! unauthorized {
     }};
 }
 
+// ── Shared `_ri/*` implementations ────────────────────────────────────────────
+// The ri-specific admin surface is protocol-version-neutral: the same logic is
+// registered on both the v1 and the v2 agents (auth is enforced in the thin
+// transport closures via the shared `unauthorized!` macro).
+
+fn ri_get_state(ctx: &AcpContext, sessions: &Sessions) -> RiGetStateResponse {
+    let model = ctx.model.read().unwrap().clone();
+    let thinking = ctx.thinking.read().unwrap().as_str().to_string();
+    let map = sessions.lock().unwrap();
+    let session_ids = map.keys().map(|s| s.to_string()).collect::<Vec<_>>();
+    let streaming = map.values().filter(|s| s.running).count();
+    RiGetStateResponse {
+        model,
+        thinking,
+        sessions: session_ids,
+        streaming_sessions: streaming,
+    }
+}
+
+fn ri_list_sessions() -> RiListSessionsResponse {
+    let sessions = persisted_session_list()
+        .into_iter()
+        .map(|p| RiSessionMeta {
+            id: p.id,
+            cwd: p.cwd.to_string_lossy().into_owned(),
+            updated: p.updated,
+        })
+        .collect();
+    RiListSessionsResponse { sessions }
+}
+
+fn ri_steering(
+    sessions: &Sessions,
+    session_id: &str,
+    text: &str,
+    ctx: &AcpContext,
+) -> RiSteeringResponse {
+    if session_id.trim().is_empty() || text.trim().is_empty() {
+        return RiSteeringResponse {
+            ok: false,
+            error: Some("sessionId and text are required".to_string()),
+            forwarded: false,
+        };
+    }
+    let forwarded = {
+        let mut map = sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(&SessionId::new(session_id.to_string())) {
+            s.queued_steering.push(text.to_string());
+            true
+        } else {
+            false
+        }
+    };
+    ctx.log(
+        if forwarded { "info" } else { "warn" },
+        Some(session_id),
+        if forwarded {
+            "_ri/steering queued for next turn".to_string()
+        } else {
+            "unknown session for _ri/steering".to_string()
+        },
+    );
+    RiSteeringResponse {
+        ok: forwarded,
+        error: if forwarded {
+            None
+        } else {
+            Some("unknown session".to_string())
+        },
+        forwarded,
+    }
+}
+
+fn ri_delete_session(
+    sessions: &Sessions,
+    session_id: String,
+    ctx: &AcpContext,
+) -> RiDeleteSessionResponse {
+    if session_id.trim().is_empty() {
+        return RiDeleteSessionResponse {
+            ok: false,
+            error: Some("sessionId must not be empty".to_string()),
+            deleted_in_memory: false,
+            deleted_on_disk: false,
+        };
+    }
+    let id = SessionId::new(session_id.clone());
+    let mut deleted_in_memory = false;
+    let mut error: Option<String> = None;
+    {
+        let mut map = sessions.lock().unwrap();
+        if let Some(s) = map.get(&id) {
+            if s.running {
+                error = Some("session is busy; cancel the active prompt first".to_string());
+            } else {
+                map.remove(&id);
+                deleted_in_memory = true;
+            }
+        }
+    }
+    if error.is_some() {
+        return RiDeleteSessionResponse {
+            ok: false,
+            error,
+            deleted_in_memory,
+            deleted_on_disk: false,
+        };
+    }
+    let deleted_on_disk = delete_persisted_session(&id);
+    ctx.log(
+        "info",
+        Some(&session_id),
+        format!("_ri/delete_session (memory={deleted_in_memory}, disk={deleted_on_disk})"),
+    );
+    RiDeleteSessionResponse {
+        ok: true,
+        error: None,
+        deleted_in_memory,
+        deleted_on_disk,
+    }
+}
+
+fn ri_prune_sessions(ctx: &AcpContext, older_than: u64) -> RiPruneSessionsResponse {
+    let cutoff = now_ts().saturating_sub(older_than);
+    let mut deleted = 0usize;
+    if let Some(dir) = acp_sessions_dir() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return RiPruneSessionsResponse { ok: true, deleted };
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(data) = fs::read_to_string(&path)
+                && let Ok(p) = serde_json::from_str::<PersistedSession>(&data)
+                && p.updated <= cutoff
+            {
+                let _ = fs::remove_file(&path);
+                deleted += 1;
+            }
+        }
+    }
+    ctx.log(
+        "info",
+        None,
+        format!("_ri/prune_sessions deleted {deleted}"),
+    );
+    RiPruneSessionsResponse { ok: true, deleted }
+}
+
+fn ri_set_model(ctx: &AcpContext, model: String) -> RiSetModelResponse {
+    if model.trim().is_empty() {
+        return RiSetModelResponse {
+            ok: false,
+            error: Some("model must not be empty".to_string()),
+            model,
+        };
+    }
+    let thinking = *ctx.thinking.read().unwrap();
+    match (ctx.rebuild)(None, &model, thinking) {
+        Ok((provider, _model)) => {
+            *ctx.model.write().unwrap() = model.clone();
+            *ctx.provider.write().unwrap() = provider;
+            ctx.log("info", None, format!("_ri/set_model -> {model}"));
+            RiSetModelResponse {
+                ok: true,
+                error: None,
+                model,
+            }
+        }
+        Err(e) => {
+            ctx.log("error", None, format!("_ri/set_model failed: {e}"));
+            RiSetModelResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                model,
+            }
+        }
+    }
+}
+
+fn ri_set_thinking(ctx: &AcpContext, level: String) -> RiSetThinkingResponse {
+    let Some(level) = ThinkingLevel::parse(&level) else {
+        return RiSetThinkingResponse {
+            ok: false,
+            error: Some(format!("unknown thinking level '{level}'")),
+            level,
+        };
+    };
+    let model = ctx.model.read().unwrap().clone();
+    match (ctx.rebuild)(None, &model, level) {
+        Ok((provider, _model)) => {
+            *ctx.thinking.write().unwrap() = level;
+            *ctx.provider.write().unwrap() = provider;
+            ctx.log(
+                "info",
+                None,
+                format!("_ri/set_thinking -> {}", level.as_str()),
+            );
+            RiSetThinkingResponse {
+                ok: true,
+                error: None,
+                level: level.as_str().to_string(),
+            }
+        }
+        Err(e) => {
+            ctx.log("error", None, format!("_ri/set_thinking failed: {e}"));
+            RiSetThinkingResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                level: level.as_str().to_string(),
+            }
+        }
+    }
+}
+
+fn ri_set_provider(ctx: &AcpContext, provider: String) -> RiSetProviderResponse {
+    if provider.trim().is_empty() {
+        return RiSetProviderResponse {
+            ok: false,
+            error: Some("provider must not be empty".to_string()),
+            model: ctx.model.read().unwrap().clone(),
+            thinking: ctx.thinking.read().unwrap().as_str().to_string(),
+        };
+    }
+    let thinking = *ctx.thinking.read().unwrap();
+    let current_model = ctx.model.read().unwrap().clone();
+    match (ctx.rebuild)(Some(&provider), &current_model, thinking) {
+        Ok((new_provider, model)) => {
+            *ctx.model.write().unwrap() = model.clone();
+            *ctx.provider.write().unwrap() = new_provider;
+            ctx.log(
+                "info",
+                None,
+                format!("_ri/set_provider -> {provider} (model {model})"),
+            );
+            RiSetProviderResponse {
+                ok: true,
+                error: None,
+                model,
+                thinking: thinking.as_str().to_string(),
+            }
+        }
+        Err(e) => {
+            ctx.log("error", None, format!("_ri/set_provider failed: {e}"));
+            RiSetProviderResponse {
+                ok: false,
+                error: Some(e.to_string()),
+                model: current_model,
+                thinking: thinking.as_str().to_string(),
+            }
+        }
+    }
+}
+
+fn ri_logs(ctx: &AcpContext, limit: Option<usize>) -> RiLogsResponse {
+    let limit = limit.unwrap_or(200).min(1000);
+    let most_recent_first: Vec<AcpLogEntry> = {
+        let all = ctx.logs.lock().unwrap();
+        all.iter().rev().take(limit).cloned().collect()
+    };
+    let logs = most_recent_first.into_iter().rev().collect();
+    RiLogsResponse { logs }
+}
+
 /// Build the agent component (handlers registered) shared by the stdio and
 /// WebSocket transports. Returns a builder that implements `ConnectTo<Client>`.
 fn build_agent(
@@ -1155,37 +1422,17 @@ fn build_agent(
             },
             on_receive_notification!(),
         )
-        // ── _ri/get_state ───────────────────────────────────────────────────
+        // ── _ri/get_state (live mid-turn snapshot) ─────────────────────────
         .on_receive_request(
             async move |_req: RiGetStateRequest, responder, _connection| {
-                let model = ctx_state.model.read().unwrap().clone();
-                let thinking = ctx_state.thinking.read().unwrap().as_str().to_string();
-                {
-                    let map = s_state.lock().unwrap();
-                    let sessions = map.keys().map(|s| s.to_string()).collect::<Vec<_>>();
-                    let streaming = map.values().filter(|s| s.running).count();
-                    responder.respond(RiGetStateResponse {
-                        model,
-                        thinking,
-                        sessions,
-                        streaming_sessions: streaming,
-                    })
-                }
+                responder.respond(ri_get_state(&ctx_state, &s_state))
             },
             on_receive_request!(),
         )
         // ── _ri/list_sessions (persisted, newest first) ──────────────────────
         .on_receive_request(
             async move |_req: RiListSessionsRequest, responder, _connection| {
-                let sessions = persisted_session_list()
-                    .into_iter()
-                    .map(|p| RiSessionMeta {
-                        id: p.id,
-                        cwd: p.cwd.to_string_lossy().into_owned(),
-                        updated: p.updated,
-                    })
-                    .collect();
-                responder.respond(RiListSessionsResponse { sessions })
+                responder.respond(ri_list_sessions())
             },
             on_receive_request!(),
         )
@@ -1195,40 +1442,12 @@ fn build_agent(
                 if !ctx_steer.authorize(req.token.as_deref()) {
                     unauthorized!(responder, "_ri/steering");
                 }
-                if req.session_id.trim().is_empty() || req.text.trim().is_empty() {
-                    return responder.respond(RiSteeringResponse {
-                        ok: false,
-                        error: Some("sessionId and text are required".to_string()),
-                        forwarded: false,
-                    });
-                }
-                let forwarded = {
-                    let mut map = s_steer.lock().unwrap();
-                    if let Some(s) = map.get_mut(&SessionId::new(req.session_id.clone())) {
-                        s.queued_steering.push(req.text.clone());
-                        true
-                    } else {
-                        false
-                    }
-                };
-                ctx_steer.log(
-                    if forwarded { "info" } else { "warn" },
-                    Some(&req.session_id),
-                    if forwarded {
-                        "_ri/steering queued for next turn".to_string()
-                    } else {
-                        "unknown session for _ri/steering".to_string()
-                    },
-                );
-                responder.respond(RiSteeringResponse {
-                    ok: forwarded,
-                    error: if forwarded {
-                        None
-                    } else {
-                        Some("unknown session".to_string())
-                    },
-                    forwarded,
-                })
+                responder.respond(ri_steering(
+                    &s_steer,
+                    &req.session_id,
+                    &req.text,
+                    &ctx_steer,
+                ))
             },
             on_receive_request!(),
         )
@@ -1238,54 +1457,7 @@ fn build_agent(
                 if !ctx_del.authorize(req.token.as_deref()) {
                     unauthorized!(responder, "_ri/delete_session");
                 }
-                if req.session_id.trim().is_empty() {
-                    return responder.respond(RiDeleteSessionResponse {
-                        ok: false,
-                        error: Some("sessionId must not be empty".to_string()),
-                        deleted_in_memory: false,
-                        deleted_on_disk: false,
-                    });
-                }
-                let id = SessionId::new(req.session_id.clone());
-
-                // Remember whether a disk file existed so we can report it.
-                let mut deleted_in_memory = false;
-                let mut error: Option<String> = None;
-                {
-                    let mut map = s_del.lock().unwrap();
-                    if let Some(s) = map.get(&id) {
-                        if s.running {
-                            error =
-                                Some("session is busy; cancel the active prompt first".to_string());
-                        } else {
-                            map.remove(&id);
-                            deleted_in_memory = true;
-                        }
-                    }
-                }
-                if error.is_some() {
-                    return responder.respond(RiDeleteSessionResponse {
-                        ok: false,
-                        error,
-                        deleted_in_memory,
-                        deleted_on_disk: false,
-                    });
-                }
-
-                let deleted_on_disk = delete_persisted_session(&id);
-                ctx_del.log(
-                    "info",
-                    Some(&req.session_id),
-                    format!(
-                        "_ri/delete_session (memory={deleted_in_memory}, disk={deleted_on_disk})"
-                    ),
-                );
-                responder.respond(RiDeleteSessionResponse {
-                    ok: true,
-                    error: None,
-                    deleted_in_memory,
-                    deleted_on_disk,
-                })
+                responder.respond(ri_delete_session(&s_del, req.session_id.clone(), &ctx_del))
             },
             on_receive_request!(),
         )
@@ -1295,32 +1467,7 @@ fn build_agent(
                 if !ctx_prune.authorize(req.token.as_deref()) {
                     unauthorized!(responder, "_ri/prune_sessions");
                 }
-                let cutoff = now_ts().saturating_sub(req.older_than_seconds);
-                let mut deleted = 0usize;
-                if let Some(dir) = acp_sessions_dir() {
-                    let Ok(entries) = fs::read_dir(&dir) else {
-                        return responder.respond(RiPruneSessionsResponse { ok: true, deleted });
-                    };
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().and_then(|x| x.to_str()) != Some("json") {
-                            continue;
-                        }
-                        if let Ok(data) = fs::read_to_string(&path)
-                            && let Ok(p) = serde_json::from_str::<PersistedSession>(&data)
-                            && p.updated <= cutoff
-                        {
-                            let _ = fs::remove_file(&path);
-                            deleted += 1;
-                        }
-                    }
-                }
-                ctx_prune.log(
-                    "info",
-                    None,
-                    format!("_ri/prune_sessions deleted {deleted}"),
-                );
-                responder.respond(RiPruneSessionsResponse { ok: true, deleted })
+                responder.respond(ri_prune_sessions(&ctx_prune, req.older_than_seconds))
             },
             on_receive_request!(),
         )
@@ -1330,34 +1477,7 @@ fn build_agent(
                 if !ctx_set_model.authorize(req.token.as_deref()) {
                     unauthorized!(responder, "_ri/set_model");
                 }
-                if req.model.trim().is_empty() {
-                    return responder.respond(RiSetModelResponse {
-                        ok: false,
-                        error: Some("model must not be empty".to_string()),
-                        model: req.model,
-                    });
-                }
-                let thinking = *ctx_set_model.thinking.read().unwrap();
-                match (ctx_set_model.rebuild)(None, &req.model, thinking) {
-                    Ok((provider, _model)) => {
-                        *ctx_set_model.model.write().unwrap() = req.model.clone();
-                        *ctx_set_model.provider.write().unwrap() = provider;
-                        ctx_set_model.log("info", None, format!("_ri/set_model -> {}", req.model));
-                        responder.respond(RiSetModelResponse {
-                            ok: true,
-                            error: None,
-                            model: req.model,
-                        })
-                    }
-                    Err(e) => {
-                        ctx_set_model.log("error", None, format!("_ri/set_model failed: {e}"));
-                        responder.respond(RiSetModelResponse {
-                            ok: false,
-                            error: Some(e.to_string()),
-                            model: req.model,
-                        })
-                    }
-                }
+                responder.respond(ri_set_model(&ctx_set_model, req.model))
             },
             on_receive_request!(),
         )
@@ -1367,42 +1487,7 @@ fn build_agent(
                 if !ctx_set_thinking.authorize(req.token.as_deref()) {
                     unauthorized!(responder, "_ri/set_thinking");
                 }
-                let Some(level) = ThinkingLevel::parse(&req.level) else {
-                    return responder.respond(RiSetThinkingResponse {
-                        ok: false,
-                        error: Some(format!("unknown thinking level '{}'", req.level)),
-                        level: req.level,
-                    });
-                };
-                let model = ctx_set_thinking.model.read().unwrap().clone();
-                match (ctx_set_thinking.rebuild)(None, &model, level) {
-                    Ok((provider, _model)) => {
-                        *ctx_set_thinking.thinking.write().unwrap() = level;
-                        *ctx_set_thinking.provider.write().unwrap() = provider;
-                        ctx_set_thinking.log(
-                            "info",
-                            None,
-                            format!("_ri/set_thinking -> {}", level.as_str()),
-                        );
-                        responder.respond(RiSetThinkingResponse {
-                            ok: true,
-                            error: None,
-                            level: level.as_str().to_string(),
-                        })
-                    }
-                    Err(e) => {
-                        ctx_set_thinking.log(
-                            "error",
-                            None,
-                            format!("_ri/set_thinking failed: {e}"),
-                        );
-                        responder.respond(RiSetThinkingResponse {
-                            ok: false,
-                            error: Some(e.to_string()),
-                            level: req.level,
-                        })
-                    }
-                }
+                responder.respond(ri_set_thinking(&ctx_set_thinking, req.level))
             },
             on_receive_request!(),
         )
@@ -1412,64 +1497,14 @@ fn build_agent(
                 if !ctx_set_provider.authorize(req.token.as_deref()) {
                     unauthorized!(responder, "_ri/set_provider");
                 }
-                if req.provider.trim().is_empty() {
-                    return responder.respond(RiSetProviderResponse {
-                        ok: false,
-                        error: Some("provider must not be empty".to_string()),
-                        model: ctx_set_provider.model.read().unwrap().clone(),
-                        thinking: ctx_set_provider
-                            .thinking
-                            .read()
-                            .unwrap()
-                            .as_str()
-                            .to_string(),
-                    });
-                }
-                let thinking = *ctx_set_provider.thinking.read().unwrap();
-                let current_model = ctx_set_provider.model.read().unwrap().clone();
-                match (ctx_set_provider.rebuild)(Some(&req.provider), &current_model, thinking) {
-                    Ok((provider, model)) => {
-                        *ctx_set_provider.model.write().unwrap() = model.clone();
-                        *ctx_set_provider.provider.write().unwrap() = provider;
-                        ctx_set_provider.log(
-                            "info",
-                            None,
-                            format!("_ri/set_provider -> {} (model {model})", req.provider),
-                        );
-                        responder.respond(RiSetProviderResponse {
-                            ok: true,
-                            error: None,
-                            model,
-                            thinking: thinking.as_str().to_string(),
-                        })
-                    }
-                    Err(e) => {
-                        ctx_set_provider.log(
-                            "error",
-                            None,
-                            format!("_ri/set_provider failed: {e}"),
-                        );
-                        responder.respond(RiSetProviderResponse {
-                            ok: false,
-                            error: Some(e.to_string()),
-                            model: current_model,
-                            thinking: thinking.as_str().to_string(),
-                        })
-                    }
-                }
+                responder.respond(ri_set_provider(&ctx_set_provider, req.provider))
             },
             on_receive_request!(),
         )
         // ── _ri/logs ────────────────────────────────────────────────────────
         .on_receive_request(
             async move |req: RiLogsRequest, responder, _connection| {
-                let limit = req.limit.unwrap_or(200).min(1000);
-                let most_recent_first: Vec<AcpLogEntry> = {
-                    let all = ctx_logs.logs.lock().unwrap();
-                    all.iter().rev().take(limit).cloned().collect()
-                };
-                let logs = most_recent_first.into_iter().rev().collect();
-                responder.respond(RiLogsResponse { logs })
+                responder.respond(ri_logs(&ctx_logs, req.limit))
             },
             on_receive_request!(),
         )
@@ -1739,12 +1774,23 @@ fn build_v2_agent(
     let s_fork = Arc::clone(&sessions);
     let s_delete = Arc::clone(&sessions);
     let s_cancel = Arc::clone(&sessions);
+    let s_state = Arc::clone(&sessions);
+    let s_steer = Arc::clone(&sessions);
+    let s_del = Arc::clone(&sessions);
     let ctx_new = Arc::clone(&ctx);
     let ctx_resume = Arc::clone(&ctx);
     let ctx_close = Arc::clone(&ctx);
     let ctx_fork = Arc::clone(&ctx);
     let ctx_delete = Arc::clone(&ctx);
     let ctx_cancel = Arc::clone(&ctx);
+    let ctx_state = Arc::clone(&ctx);
+    let ctx_steer = Arc::clone(&ctx);
+    let ctx_del = Arc::clone(&ctx);
+    let ctx_prune = Arc::clone(&ctx);
+    let ctx_set_model = Arc::clone(&ctx);
+    let ctx_set_thinking = Arc::clone(&ctx);
+    let ctx_set_provider = Arc::clone(&ctx);
+    let ctx_logs = Arc::clone(&ctx);
 
     agent_client_protocol::Agent
         .v2()
@@ -2005,6 +2051,84 @@ fn build_v2_agent(
                     ),
                 );
                 responder.respond(acp_v2::DeleteSessionResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ── ri-specific `_ri/*` (version-neutral, shared implementations) ────
+        .on_receive_request(
+            async move |_req: RiGetStateRequest, responder, _connection| {
+                responder.respond(ri_get_state(&ctx_state, &s_state))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: RiListSessionsRequest, responder, _connection| {
+                responder.respond(ri_list_sessions())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: RiSteeringRequest, responder, _connection| {
+                if !ctx_steer.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/steering");
+                }
+                responder.respond(ri_steering(
+                    &s_steer,
+                    &req.session_id,
+                    &req.text,
+                    &ctx_steer,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: RiDeleteSessionRequest, responder, _connection| {
+                if !ctx_del.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/delete_session");
+                }
+                responder.respond(ri_delete_session(&s_del, req.session_id.clone(), &ctx_del))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: RiPruneSessionsRequest, responder, _connection| {
+                if !ctx_prune.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/prune_sessions");
+                }
+                responder.respond(ri_prune_sessions(&ctx_prune, req.older_than_seconds))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: RiSetModelRequest, responder, _connection| {
+                if !ctx_set_model.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/set_model");
+                }
+                responder.respond(ri_set_model(&ctx_set_model, req.model))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: RiSetThinkingRequest, responder, _connection| {
+                if !ctx_set_thinking.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/set_thinking");
+                }
+                responder.respond(ri_set_thinking(&ctx_set_thinking, req.level))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: RiSetProviderRequest, responder, _connection| {
+                if !ctx_set_provider.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/set_provider");
+                }
+                responder.respond(ri_set_provider(&ctx_set_provider, req.provider))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: RiLogsRequest, responder, _connection| {
+                responder.respond(ri_logs(&ctx_logs, req.limit))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -3372,10 +3496,11 @@ mod acp_e2e {
                 cleanup_v1_session(&fork_id);
                 cleanup_v1_session(&sid);
 
-                // list after delete: neither the (closed+deleted) sid nor fork
-                // necessarily remains; the persisted fork could exist, but the
-                // key assertions above (new/prompt/ask/list/fork/resume/close/
-                // delete all round-tripped) are what we're checking here.
+                // ri-specific `_ri/*` methods are also served over v2 (shared
+                // implementations registered on both agents).
+                let st = cx.send_request(RiGetStateRequest).block_task().await?;
+                assert_eq!(st.model, "test");
+
                 Ok(())
             });
         tokio::time::timeout(Duration::from_secs(30), client)

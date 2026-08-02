@@ -16,7 +16,10 @@
   `ask_user` → `session/request_permission` (v2 title+options+outcome).
   Verified with an in-process v2 client test covering the whole lifecycle
   (negotiate V2 → new → echo stream → ask → cancel → list → fork → resume →
-  close → delete). The ri-specific `_ri/*` custom methods remain v1-only.
+  close → delete). The ri-specific `_ri/*` custom methods are served over BOTH
+  protocol versions via shared version-neutral implementations (`ri_get_state`,
+  `ri_set_model`, …), extracted once and registered as thin closures on each
+  agent.
 
 
 - **ACP headless server**: `ri --serve` exposes the agent loop over the
