@@ -249,10 +249,11 @@ Implemented surface:
   optionally TLS via `--serve-ws-cert`/`--serve-ws-key`); the WS server
   multiplexes many clients, stdio serves one
 
-Current limitations: one prompt at a time per session; requests are served
-serially per connection, so `_ri/get_state` is a live snapshot only between
-turns and `_ri/steering` applies at the next turn boundary. Requires Rust
-1.88 (ACP dependency baseline).
+Current limitations: one prompt at a time per session; `_ri/steering` applies
+at the next turn boundary (mid-turn injection is not implemented); and
+`session/cancel` maps to ri's `HardAbort`, which the agent loop honours at its
+next checkpoint (turn/tool boundary) rather than chopping a mid-flight stream.
+Requires Rust 1.88 (ACP dependency baseline).
 
 ## Decoupled TUI (`--tui-acp`)
 
@@ -268,9 +269,8 @@ vocabulary, tool-permission asks surface through the TUI ask dialog
 ri --tui-acp --provider test   # interactive TUI driving a detached --serve
 ```
 
-Limitations: steering applies at the next turn boundary (the SDK serves
-requests serially, so mid-turn injection is impossible), live `_ri/get_state`
-is only observable between turns, and provider *instance* (preset/API-key)
-changes inside the TUI are not hot-swapped in the child — model/thinking
-changes are pushed automatically via `_ri/set_model`/`_ri/set_thinking`. The
-plain in-process TUI remains the default.
+Limitations: steering applies at the next turn boundary (mid-turn injection is
+not implemented) and provider *instance* (preset/API-key) changes inside the
+TUI are not hot-swapped in the child — model/thinking changes are pushed
+automatically via `_ri/set_model`/`_ri/set_thinking`, and `_ri/get_state` now
+reflects live mid-turn state too. The plain in-process TUI remains the default.

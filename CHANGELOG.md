@@ -11,6 +11,16 @@
   `usage_update`), and `session/cancel`. The existing agent loop is reused
   unchanged; the ACP connection runs on a dedicated thread. Now requires
   Rust 1.88 (ACP dependency baseline).
+- **ACP event-loop refactor**: `session/prompt` handlers now return immediately
+  and run the whole turn (event forwarding, the `session/request_permission`
+  ask bridge, the final response) as a concurrent task with the `Responder`
+  moved in — this keeps the SDK event loop free during a run. As a result the
+  full `ask_user` → `request_permission` round-trip works (verified e2e),
+  `_ri/get_state` reports **live** mid-turn state, and `session/cancel` is
+  dispatched while a turn is streaming (honoured at the agent loop's next
+  checkpoint). Previously the serial handler blocked the loop, so a client's
+  permission reply could never be read back (hang) and `_ri/get_state` only
+  reflected state between turns.
 - **Per-session tool cwd + auto-compaction**: every `session/prompt` roots its
   tools at the session `cwd` — `bash`/`exec` run with that working directory
   and `read`/`write`/`edit`/`find` resolve relative paths against it — and ACP

@@ -34,12 +34,16 @@
 //! optionally TLS via `--serve-ws-cert`/`--serve-ws-key`). The WebSocket server
 //! multiplexes multiple client connections; stdio serves exactly one.
 //!
-//! Known limitations: one prompt at a time per session; the SDK dispatches
-//! incoming requests serially per connection, so a second incoming request is
-//! served only after an in-flight `session/prompt` turn finishes (this means
-//! `_ri/get_state` reports live state only between turns, and `_ri/steering`
-//! applies at the next turn boundary rather than mid-turn). The agent loop
-//! itself is reused unchanged.
+//! Event loop: `session/prompt` handlers return immediately and run the whole
+//! turn (event forwarding, the `request_permission` ask bridge, the final
+//! response) as a concurrent task with the `Responder` moved in. That keeps the
+//! SDK event loop free during a run, so `_ri/get_state` gives a **live** mid-turn
+//! snapshot and `session/cancel` is dispatched while streaming. Known
+//! limitations: one prompt at a time per session; `_ri/steering` still applies
+//! at the next turn boundary rather than mid-turn; and the agent loop's
+//! `stream_assistant_turn` does not yet observe `HardAbort` between tokens, so
+//! cancel takes effect at the next checkpoint (turn/tool boundary) rather than
+//! chopping a stream in flight. The agent loop itself is reused unchanged.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -47,14 +51,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::{fs, path::Path};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, ForkSessionRequest,
-    ForkSessionResponse, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SessionCapabilities, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
-    StopReason, TextContent, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, Usage as AcpUsage, UsageUpdate,
+    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
+    ContentChunk, ForkSessionRequest, ForkSessionResponse, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
+    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities, SessionForkCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent,
+    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage as AcpUsage, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectTo, JsonRpcRequest, JsonRpcResponse, Result as AcpResult, Stdio,
@@ -330,6 +336,9 @@ fn build_agent(
 ) -> impl agent_client_protocol::ConnectTo<Client> {
     let s_new = Arc::clone(&sessions);
     let s_load = Arc::clone(&sessions);
+    let s_resume = Arc::clone(&sessions);
+    let s_close = Arc::clone(&sessions);
+    let s_list = Arc::clone(&sessions);
     let s_prompt = Arc::clone(&sessions);
     let s_cancel = Arc::clone(&sessions);
     let s_state = Arc::clone(&sessions);
@@ -339,6 +348,8 @@ fn build_agent(
     let ctx_new = Arc::clone(&ctx);
     let ctx_fork = Arc::clone(&ctx);
     let ctx_steer = Arc::clone(&ctx);
+    let ctx_resume = Arc::clone(&ctx);
+    let ctx_close = Arc::clone(&ctx);
     let ctx_cancel = Arc::clone(&ctx);
     let ctx_state = Arc::clone(&ctx);
     let ctx_set_model = Arc::clone(&ctx);
@@ -358,7 +369,11 @@ fn build_agent(
                         AgentCapabilities::new()
                             .mcp_capabilities(McpCapabilities::new())
                             .session_capabilities(
-                                SessionCapabilities::new().fork(SessionForkCapabilities::new()),
+                                SessionCapabilities::new()
+                                    .list(SessionListCapabilities::new())
+                                    .resume(SessionResumeCapabilities::new())
+                                    .close(SessionCloseCapabilities::new())
+                                    .fork(SessionForkCapabilities::new()),
                             )
                             .prompt_capabilities(PromptCapabilities::new().image(true))
                             .load_session(true),
@@ -383,15 +398,9 @@ fn build_agent(
         // ── session/load (in-memory or disk resume) ───────────────────────
         .on_receive_request(
             async move |req: LoadSessionRequest, responder, connection| {
-                // Prefer a live in-memory session; fall back to a persisted
-                // session from a previous run (disk resume).
-                let in_memory = {
-                    let map = s_load.lock().unwrap();
-                    map.get(&req.session_id)
-                        .map(|s| (s.running, s.events.clone(), s.cwd.clone()))
-                };
-                let (events, _cwd) = match in_memory {
-                    Some((true, _, _)) => {
+                let (events, _cwd) = match resolve_session_for_load(&s_load, &req.session_id) {
+                    SessionLoadResult::Ready { events, cwd } => (events, cwd),
+                    SessionLoadResult::Busy => {
                         responder
                             .respond_with_error(
                                 agent_client_protocol::Error::invalid_params()
@@ -400,31 +409,112 @@ fn build_agent(
                             .ok();
                         return Ok(());
                     }
-                    Some((false, events, cwd)) => (events, cwd),
-                    None => {
-                        let Some(persisted) = read_persisted_session(&req.session_id) else {
-                            responder
-                                .respond_with_error(
-                                    agent_client_protocol::Error::invalid_params()
-                                        .data("unknown session"),
-                                )
-                                .ok();
-                            return Ok(());
-                        };
-                        // Register in memory so subsequent prompts resume from
-                        // the restored history.
-                        let mut map = s_load.lock().unwrap();
-                        let slot = map
-                            .entry(req.session_id.clone())
-                            .or_insert_with(|| AcpSession::new(persisted.cwd.clone()));
-                        slot.events = persisted.events.clone();
-                        (persisted.events.clone(), persisted.cwd)
+                    SessionLoadResult::Unknown => {
+                        responder
+                            .respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("unknown session"),
+                            )
+                            .ok();
+                        return Ok(());
                     }
                 };
                 for update in session_replay_updates(&events) {
                     send_update!(connection, req.session_id, update);
                 }
                 responder.respond(LoadSessionResponse::new())
+            },
+            on_receive_request!(),
+        )
+        // ── session/resume (register + replay, sets the session as current) ─
+        .on_receive_request(
+            async move |req: ResumeSessionRequest, responder, connection| {
+                let (events, _cwd) = match resolve_session_for_load(&s_resume, &req.session_id) {
+                    SessionLoadResult::Ready { events, cwd } => (events, cwd),
+                    SessionLoadResult::Busy => {
+                        responder
+                            .respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("session is busy; cannot resume while a prompt runs"),
+                            )
+                            .ok();
+                        return Ok(());
+                    }
+                    SessionLoadResult::Unknown => {
+                        responder
+                            .respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("unknown session"),
+                            )
+                            .ok();
+                        return Ok(());
+                    }
+                };
+                ctx_resume.log("info", Some(&req.session_id.to_string()), "session/resume");
+                for update in session_replay_updates(&events) {
+                    send_update!(connection, req.session_id, update);
+                }
+                responder.respond(ResumeSessionResponse::new())
+            },
+            on_receive_request!(),
+        )
+        // ── session/close (end a session; history stays resumable on disk) ─
+        .on_receive_request(
+            async move |req: CloseSessionRequest, responder, _connection| {
+                let mut map = s_close.lock().unwrap();
+                if let Some(s) = map.get(&req.session_id)
+                    && s.running
+                {
+                    drop(map);
+                    responder
+                        .respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data("session is busy; cannot close while a prompt runs"),
+                        )
+                        .ok();
+                    return Ok(());
+                }
+                let removed = map.remove(&req.session_id).is_some();
+                drop(map);
+                ctx_close.log(
+                    "info",
+                    Some(&req.session_id.to_string()),
+                    if removed {
+                        "session/close".to_string()
+                    } else {
+                        "session/close (already closed)".to_string()
+                    },
+                );
+                responder.respond(CloseSessionResponse::new())
+            },
+            on_receive_request!(),
+        )
+        // ── session/list (vs persisted sessions, newest first) ─────────────
+        .on_receive_request(
+            async move |_req: ListSessionsRequest, responder, _connection| {
+                let mut sessions: Vec<SessionInfo> = Vec::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                // Persisted first (they carry a recency timestamp).
+                for p in persisted_session_list() {
+                    seen.insert(p.id.clone());
+                    sessions.push(
+                        SessionInfo::new(p.id, p.cwd).updated_at(Some(unix_to_rfc3339(p.updated))),
+                    );
+                }
+                // Then live in-memory sessions not yet listed.
+                {
+                    let map = s_list.lock().unwrap();
+                    let mut live: Vec<(String, std::path::PathBuf)> = map
+                        .iter()
+                        .filter(|(id, _)| !seen.contains(&id.to_string()))
+                        .map(|(id, s)| (id.to_string(), s.cwd.clone()))
+                        .collect();
+                    live.sort();
+                    for (id, cwd) in live {
+                        sessions.push(SessionInfo::new(SessionId::new(id), cwd));
+                    }
+                }
+                responder.respond(ListSessionsResponse::new(sessions))
             },
             on_receive_request!(),
         )
@@ -569,240 +659,291 @@ fn build_agent(
                 };
                 let provider_loop = Arc::clone(&provider);
                 let task_tx = tx.clone();
-                let join = tokio_handle.spawn(async move {
+                // Cancel can arrive mid-turn (it used to be queued behind the
+                // serialised prompt handler); the turn task observes it so a
+                // pending request_permission is also resolved on cancel.
+                let cancel_rx_task = cancel_rx.clone();
+                let join = tokio_handle.clone().spawn(async move {
                     run_agent_loop(config, provider_loop, task_tx, steering_rx, cancel_rx).await;
                 });
 
-                // Forward agent events + answer ask_user via request_permission.
-                let mut error: Option<String> = None;
-                let mut assistant_text = String::new();
-                let mut assistant_thinking: Option<String> = None;
-                let mut phase = AssistantPhase::Unknown;
-                let mut usage: Option<UsageStats> = None;
-                // Usage survives TurnEnd's `usage = None` reset so the final
-                // end_turn response can include the last turn's tokens.
-                let mut final_usage: Option<UsageStats> = None;
-                let mut pending_tool: Vec<SessionEvent> = Vec::new();
+                // SDK event-loop constraint: handler callbacks run on a single
+                // event loop, so the connection cannot read client responses
+                // (including the reply to our session/request_permission)
+                // while THIS handler is still executing. Run the whole turn
+                // (event forwarding, the ask bridge, the final session/prompt
+                // response) as a concurrent task and return immediately. That
+                // keeps the event loop free: the request_permission
+                // round-trip works, and other requests (session/cancel, _ri/*)
+                // get served mid-turn.
+                let s_prompt_task = Arc::clone(&s_prompt);
+                let ctx_task = Arc::clone(&ctx);
+                let connection_task = connection.clone();
+                let session_id_task = session_id.clone();
+                let context_size_task = context_size;
+                let handle_task = tokio_handle.clone();
+                handle_task.spawn(async move {
+                    let connection = connection_task;
+                    let session_id = session_id_task;
+                    let s_prompt = s_prompt_task;
+                    let ctx = ctx_task;
+                    let context_size = context_size_task;
+                    let mut cancel_rx = cancel_rx_task;
 
-                while let Some(ev) = rx.recv().await {
-                    match ev {
-                        AppEvent::AskUser(request) => {
-                            let (options, option_titles) = permission_options(&request);
-                            let mut title = request.question.clone();
-                            if let Some(ctx_text) = request.context.as_deref() {
-                                title = format!("{title}\n\n{ctx_text}");
-                            }
-                            let tool_call = ToolCallUpdate::new(
-                                format!("ask-{}", now_ts()),
-                                ToolCallUpdateFields::new()
-                                    .title(title.clone())
-                                    .kind(ToolKind::Other)
-                                    .status(ToolCallStatus::InProgress),
-                            );
-                            let outcome = connection
-                                .send_request(RequestPermissionRequest::new(
-                                    session_id.clone(),
-                                    tool_call,
-                                    options,
-                                ))
-                                .block_task()
-                                .await;
-                            let answer = ask_reply_from_outcome(&outcome, &option_titles);
-                            match &answer {
-                                AskUserResponse::Answer(a) => ctx.log(
-                                    "info",
-                                    Some(&session_id.to_string()),
-                                    format!("ask_user answered: {a}"),
-                                ),
-                                AskUserResponse::Cancelled => ctx.log(
-                                    "warn",
-                                    Some(&session_id.to_string()),
-                                    "ask_user cancelled",
-                                ),
-                            }
-                            let _ = request.reply.send(answer);
-                        }
-                        AppEvent::Agent(agent_ev) => match agent_ev {
-                            AgentEvent::Done => break,
-                            AgentEvent::Error(e) => {
-                                error = Some(e.message.clone());
-                                break;
-                            }
-                            AgentEvent::TextToken { text, phase: ph } => {
-                                assistant_text.push_str(&text);
-                                if ph != AssistantPhase::Unknown {
-                                    phase = ph;
+                    // Forward agent events + answer ask_user via request_permission.
+                    let mut error: Option<String> = None;
+                    let mut assistant_text = String::new();
+                    let mut assistant_thinking: Option<String> = None;
+                    let mut phase = AssistantPhase::Unknown;
+                    let mut usage: Option<UsageStats> = None;
+                    // Usage survives TurnEnd's `usage = None` reset so the final
+                    // end_turn response can include the last turn's tokens.
+                    let mut final_usage: Option<UsageStats> = None;
+                    let mut pending_tool: Vec<SessionEvent> = Vec::new();
+
+                    while let Some(ev) = rx.recv().await {
+                        match ev {
+                            AppEvent::AskUser(request) => {
+                                let (options, option_titles) = permission_options(&request);
+                                let mut title = request.question.clone();
+                                if let Some(ctx_text) = request.context.as_deref() {
+                                    title = format!("{title}\n\n{ctx_text}");
                                 }
-                                send_update!(
-                                    connection,
-                                    session_id,
-                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                        ContentBlock::Text(TextContent::new(text)),
-                                    ))
+                                let tool_call = ToolCallUpdate::new(
+                                    format!("ask-{}", now_ts()),
+                                    ToolCallUpdateFields::new()
+                                        .title(title)
+                                        .kind(ToolKind::Other)
+                                        .status(ToolCallStatus::InProgress),
                                 );
+                                // Safe to await block_task here: this task runs
+                                // concurrently with the (free) event loop, so
+                                // the client's response is routed to us. A
+                                // mid-turn session/cancel also resolves the
+                                // ask (as cancelled) instead of hanging.
+                                let outcome = tokio::select! {
+                                    o = connection
+                                        .send_request(RequestPermissionRequest::new(
+                                            session_id.clone(),
+                                            tool_call,
+                                            options,
+                                        ))
+                                        .block_task() => Some(o),
+                                    _ = cancel_rx.wait_for(|l| *l >= CancelLevel::HardAbort) => None,
+                                };
+                                let answer = match outcome {
+                                    Some(outcome) => {
+                                        ask_reply_from_outcome(&outcome, &option_titles)
+                                    }
+                                    None => {
+                                        ctx.log(
+                                            "info",
+                                            Some(&session_id.to_string()),
+                                            "ask_user resolved by session/cancel",
+                                        );
+                                        AskUserResponse::Cancelled
+                                    }
+                                };
+                                match &answer {
+                                    AskUserResponse::Answer(a) => ctx.log(
+                                        "info",
+                                        Some(&session_id.to_string()),
+                                        format!("ask_user answered: {a}"),
+                                    ),
+                                    AskUserResponse::Cancelled => ctx.log(
+                                        "warn",
+                                        Some(&session_id.to_string()),
+                                        "ask_user cancelled",
+                                    ),
+                                }
+                                let _ = request.reply.send(answer);
                             }
-                            AgentEvent::ThinkingToken(t) => {
-                                assistant_thinking
-                                    .get_or_insert_with(String::new)
-                                    .push_str(&t);
-                                send_update!(
-                                    connection,
-                                    session_id,
-                                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                                        ContentBlock::Text(TextContent::new(t.clone())),
-                                    ))
-                                );
-                            }
-                            AgentEvent::Usage(u) => {
-                                usage = Some(u);
-                                final_usage = Some(u);
-                                if let Some(uu) = usage_update_value(&u, context_size as u64) {
+                            AppEvent::Agent(agent_ev) => match agent_ev {
+                                AgentEvent::Done => break,
+                                AgentEvent::Error(e) => {
+                                    error = Some(e.message.clone());
+                                    break;
+                                }
+                                AgentEvent::TextToken { text, phase: ph } => {
+                                    assistant_text.push_str(&text);
+                                    if ph != AssistantPhase::Unknown {
+                                        phase = ph;
+                                    }
                                     send_update!(
                                         connection,
                                         session_id,
-                                        SessionUpdate::UsageUpdate(uu)
+                                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                            ContentBlock::Text(TextContent::new(text)),
+                                        ))
                                     );
                                 }
-                            }
-                            AgentEvent::ToolCallStart { id, name, args } => {
-                                pending_tool.push(SessionEvent::ToolCall {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                    args,
-                                    include_in_llm: true,
-                                    timestamp: now_ts(),
-                                });
-                                let kind = tool_kind(&name);
-                                send_update!(
-                                    connection,
-                                    session_id,
-                                    SessionUpdate::ToolCall(
-                                        ToolCall::new(id, name.clone())
-                                            .kind(kind)
-                                            .status(ToolCallStatus::Pending)
-                                    )
-                                );
-                            }
-                            AgentEvent::ToolCallEnd { id, result } => {
-                                pending_tool.push(SessionEvent::ToolResult {
-                                    id: id.clone(),
-                                    name: String::new(),
-                                    content: result.content.as_text().to_string(),
-                                    is_error: result.is_error,
-                                    display_range: None,
-                                    include_in_llm: true,
-                                    timestamp: now_ts(),
-                                });
-                                let content = result.content.as_text().to_string();
-                                send_update!(
-                                    connection,
-                                    session_id,
-                                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                                        id,
-                                        ToolCallUpdateFields::new()
-                                            .status(ToolCallStatus::Completed)
-                                            .content(vec![ToolCallContent::from(
-                                                ContentBlock::Text(TextContent::new(content)),
-                                            )]),
-                                    ))
-                                );
-                            }
-                            AgentEvent::TurnEnd => {
-                                commit_turn(
-                                    &s_prompt,
-                                    &session_id,
-                                    &mut assistant_text,
-                                    &mut assistant_thinking,
-                                    phase,
-                                    usage,
-                                    &pending_tool,
-                                );
-                                pending_tool.clear();
-                                assistant_text.clear();
-                                assistant_thinking = None;
-                                phase = AssistantPhase::Unknown;
-                                usage = None;
-                            }
-                            AgentEvent::ToolOutputChunk { id, chunk } => {
-                                // Live tool output: stream each chunk as an
-                                // in-progress `tool_call_update` so headless
-                                // clients render bash/exec output as it runs
-                                // (the final `Completed` update arrives on
-                                // `ToolCallEnd`).
-                                send_update!(
-                                    connection,
-                                    session_id,
-                                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                                        id,
-                                        ToolCallUpdateFields::new()
-                                            .status(ToolCallStatus::InProgress)
-                                            .content(vec![ToolCallContent::from(
-                                                ContentBlock::Text(TextContent::new(chunk)),
-                                            )]),
-                                    ))
-                                );
-                            }
-                            AgentEvent::ToolCallIntent { .. }
-                            | AgentEvent::ToolCallArgsDelta { .. }
-                            | AgentEvent::SteeringConsumed { .. }
-                            | AgentEvent::StatusUpdate(_)
-                            | AgentEvent::Compacting
-                            | AgentEvent::CompactionDone(_)
-                            | AgentEvent::ExternalFileChange { .. } => {}
-                        },
-                        _ => {}
-                    }
-                }
-
-                {
-                    let mut map = s_prompt.lock().unwrap();
-                    if let Some(s) = map.get_mut(&session_id) {
-                        s.running = false;
-                        s.cancel_tx = None;
-                    }
-                }
-                let _ = join.await;
-
-                // Persist the committed history + cwd so the session can be
-                // resumed from disk by a later process (session/load).
-                {
-                    let map = s_prompt.lock().unwrap();
-                    if let Some(s) = map.get(&session_id)
-                        && !s.events.is_empty()
-                    {
-                        persist_session(&session_id, &s.events, &s.cwd);
-                    }
-                }
-
-                match &error {
-                    Some(msg) => {
-                        ctx.log(
-                            "error",
-                            Some(&session_id.to_string()),
-                            format!("session/prompt failed: {msg}"),
-                        );
-                    }
-                    None => ctx.log("info", Some(&session_id.to_string()), "session/prompt end"),
-                }
-
-                match error {
-                    Some(msg) => responder.respond_with_error(
-                        agent_client_protocol::Error::internal_error().data(msg),
-                    ),
-                    None => {
-                        let mut resp = PromptResponse::new(StopReason::EndTurn);
-                        // ACP end_turn_token_usage: fold the turn's usage into
-                        // the response in addition to the streamed usage_update.
-                        if let Some(u) = &final_usage {
-                            resp = resp.usage(AcpUsage::new(
-                                u.total_tokens.unwrap_or_default() as u64,
-                                u.input_tokens.unwrap_or_default() as u64,
-                                u.output_tokens.unwrap_or_default() as u64,
-                            ));
+                                AgentEvent::ThinkingToken(t) => {
+                                    assistant_thinking
+                                        .get_or_insert_with(String::new)
+                                        .push_str(&t);
+                                    send_update!(
+                                        connection,
+                                        session_id,
+                                        SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                                            ContentBlock::Text(TextContent::new(t.clone())),
+                                        ))
+                                    );
+                                }
+                                AgentEvent::Usage(u) => {
+                                    usage = Some(u);
+                                    final_usage = Some(u);
+                                    if let Some(uu) = usage_update_value(&u, context_size as u64) {
+                                        send_update!(
+                                            connection,
+                                            session_id,
+                                            SessionUpdate::UsageUpdate(uu)
+                                        );
+                                    }
+                                }
+                                AgentEvent::ToolCallStart { id, name, args } => {
+                                    pending_tool.push(SessionEvent::ToolCall {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        args,
+                                        include_in_llm: true,
+                                        timestamp: now_ts(),
+                                    });
+                                    let kind = tool_kind(&name);
+                                    send_update!(
+                                        connection,
+                                        session_id,
+                                        SessionUpdate::ToolCall(
+                                            ToolCall::new(id, name.clone())
+                                                .kind(kind)
+                                                .status(ToolCallStatus::Pending)
+                                        )
+                                    );
+                                }
+                                AgentEvent::ToolCallEnd { id, result } => {
+                                    pending_tool.push(SessionEvent::ToolResult {
+                                        id: id.clone(),
+                                        name: String::new(),
+                                        content: result.content.as_text().to_string(),
+                                        is_error: result.is_error,
+                                        display_range: None,
+                                        include_in_llm: true,
+                                        timestamp: now_ts(),
+                                    });
+                                    let content = result.content.as_text().to_string();
+                                    send_update!(
+                                        connection,
+                                        session_id,
+                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                            id,
+                                            ToolCallUpdateFields::new()
+                                                .status(ToolCallStatus::Completed)
+                                                .content(vec![ToolCallContent::from(
+                                                    ContentBlock::Text(TextContent::new(content)),
+                                                )]),
+                                        ))
+                                    );
+                                }
+                                AgentEvent::TurnEnd => {
+                                    commit_turn(
+                                        &s_prompt,
+                                        &session_id,
+                                        &mut assistant_text,
+                                        &mut assistant_thinking,
+                                        phase,
+                                        usage,
+                                        &pending_tool,
+                                    );
+                                    pending_tool.clear();
+                                    assistant_text.clear();
+                                    assistant_thinking = None;
+                                    phase = AssistantPhase::Unknown;
+                                    usage = None;
+                                }
+                                AgentEvent::ToolOutputChunk { id, chunk } => {
+                                    // Live tool output: stream each chunk as an
+                                    // in-progress `tool_call_update` so headless
+                                    // clients render bash/exec output as it runs
+                                    // (the final `Completed` update arrives on
+                                    // `ToolCallEnd`).
+                                    send_update!(
+                                        connection,
+                                        session_id,
+                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                            id,
+                                            ToolCallUpdateFields::new()
+                                                .status(ToolCallStatus::InProgress)
+                                                .content(vec![ToolCallContent::from(
+                                                    ContentBlock::Text(TextContent::new(chunk)),
+                                                )]),
+                                        ))
+                                    );
+                                }
+                                AgentEvent::ToolCallIntent { .. }
+                                | AgentEvent::ToolCallArgsDelta { .. }
+                                | AgentEvent::SteeringConsumed { .. }
+                                | AgentEvent::StatusUpdate(_)
+                                | AgentEvent::Compacting
+                                | AgentEvent::CompactionDone(_)
+                                | AgentEvent::ExternalFileChange { .. } => {}
+                            },
+                            _ => {}
                         }
-                        responder.respond(resp)
                     }
-                }
+
+                    {
+                        let mut map = s_prompt.lock().unwrap();
+                        if let Some(s) = map.get_mut(&session_id) {
+                            s.running = false;
+                            s.cancel_tx = None;
+                        }
+                    }
+                    let _ = join.await;
+
+                    // Persist the committed history + cwd so the session can be
+                    // resumed from disk by a later process (session/load).
+                    {
+                        let map = s_prompt.lock().unwrap();
+                        if let Some(s) = map.get(&session_id)
+                            && !s.events.is_empty()
+                        {
+                            persist_session(&session_id, &s.events, &s.cwd);
+                        }
+                    }
+
+                    match &error {
+                        Some(msg) => {
+                            ctx.log(
+                                "error",
+                                Some(&session_id.to_string()),
+                                format!("session/prompt failed: {msg}"),
+                            );
+                        }
+                        None => {
+                            ctx.log("info", Some(&session_id.to_string()), "session/prompt end")
+                        }
+                    }
+
+                    let _ = match error {
+                        Some(msg) => responder.respond_with_error(
+                            agent_client_protocol::Error::internal_error().data(msg),
+                        ),
+                        None => {
+                            let mut resp = PromptResponse::new(StopReason::EndTurn);
+                            // ACP end_turn_token_usage: fold the turn's usage into
+                            // the response in addition to the streamed usage_update.
+                            if let Some(u) = &final_usage {
+                                resp = resp.usage(AcpUsage::new(
+                                    u.total_tokens.unwrap_or_default() as u64,
+                                    u.input_tokens.unwrap_or_default() as u64,
+                                    u.output_tokens.unwrap_or_default() as u64,
+                                ));
+                            }
+                            responder.respond(resp)
+                        }
+                    };
+                });
+                // Detach the JoinHandle: the turn task completes on its own.
+                Ok(())
             },
             on_receive_request!(),
         )
@@ -1203,6 +1344,66 @@ fn build_tls_acceptor(
         .with_single_cert(certs, key)
         .map_err(anyhow::Error::msg)?;
     Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+/// Result of resolving a session's history for `session/load` / `session/resume`.
+enum SessionLoadResult {
+    Ready {
+        events: Vec<SessionEvent>,
+        cwd: PathBuf,
+    },
+    Busy,
+    Unknown,
+}
+
+/// Live in-memory session first (must not be running), else a persisted one
+/// (registered in memory so subsequent prompts continue from it).
+fn resolve_session_for_load(sessions: &Sessions, id: &SessionId) -> SessionLoadResult {
+    let in_memory = {
+        let map = sessions.lock().unwrap();
+        map.get(id)
+            .map(|s| (s.running, s.events.clone(), s.cwd.clone()))
+    };
+    match in_memory {
+        Some((true, _, _)) => SessionLoadResult::Busy,
+        Some((false, events, cwd)) => SessionLoadResult::Ready { events, cwd },
+        None => {
+            let Some(persisted) = read_persisted_session(id) else {
+                return SessionLoadResult::Unknown;
+            };
+            let mut map = sessions.lock().unwrap();
+            let slot = map
+                .entry(id.clone())
+                .or_insert_with(|| AcpSession::new(persisted.cwd.clone()));
+            slot.events = persisted.events.clone();
+            SessionLoadResult::Ready {
+                events: persisted.events.clone(),
+                cwd: persisted.cwd,
+            }
+        }
+    }
+}
+
+/// Unix seconds → RFC3339 UTC (Howard Hinnant civil-from-days algorithm).
+fn unix_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = secs % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let (h, mi, s) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+    format!("{year:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
 // ── Mirroring helpers ─────────────────────────────────────────────────────────
@@ -1730,6 +1931,36 @@ mod tests {
     }
 
     // ── disk persistence round-trip ──────────────────────────────────────────
+
+    #[test]
+    fn request_permission_response_serializes_as_expected() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOptionId as Id, RequestPermissionOutcome as O,
+            RequestPermissionResponse as R, SelectedPermissionOutcome,
+        };
+        // RequestPermissionOutcome is INTERNALLY tagged: Selected -> {"outcome":"selected",...}.
+        let selected = R::new(O::Selected(SelectedPermissionOutcome::new(Id::new(
+            "opt-0",
+        ))));
+        let v = serde_json::to_value(&selected).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"outcome":{"outcome":"selected","optionId":"opt-0"}})
+        );
+
+        let cancelled = R::new(O::Cancelled);
+        let v2 = serde_json::to_value(&cancelled).unwrap();
+        assert_eq!(v2, serde_json::json!({"outcome":{"outcome":"cancelled"}}));
+    }
+
+    #[test]
+    fn unix_to_rfc3339_formats_utc() {
+        // 2024-04-13T09:20:00Z = 1713000000
+        assert_eq!(unix_to_rfc3339(1_713_000_000), "2024-04-13T09:20:00Z");
+        assert_eq!(unix_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(unix_to_rfc3339(1), "1970-01-01T00:00:01Z");
+        assert_eq!(unix_to_rfc3339(1_021_200_600), "2002-05-12T10:50:00Z");
+    }
 
     #[test]
     fn session_persistence_round_trips_on_disk() {
