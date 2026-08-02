@@ -37,6 +37,7 @@ const HELP_TEXT: &str = r#"# Test Provider Commands
 | `help`          | Show this help                                                  |
 | `echo <text>`   | Stream text back to the UI                                      |
 | `slow <text>`   | Stream text with artificial per-word delays                     |
+| `tool <name> <args-json>` | Emit a scripted tool call to drive a real tool (e.g. `bash`) |
 | `system`        | Show the exact system prompt that is being sent to the model    |
 | `error`         | Emit a provider error to exercise the error-display path        |
 "#;
@@ -145,6 +146,28 @@ impl super::LlmProvider for TestProvider {
                 yield LlmEvent::Error(ProviderError::other("test", "test error triggered by 'error' command"));
             }),
 
+            "tool" => {
+                // Emit one scripted tool call so the agent loop drives a real
+                // tool (offline tool-call exercises for the headless server).
+                let (name, args_json) = match rest.split_once(char::is_whitespace) {
+                    Some((n, a)) => (n.to_string(), a.trim().to_string()),
+                    None => (rest.to_string(), "{}".to_string()),
+                };
+                let args: serde_json::Value = if name.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&args_json).unwrap_or_else(|_| serde_json::json!({}))
+                };
+                Box::pin(stream! {
+                    yield LlmEvent::ToolCall {
+                        id: "tool_1".to_string(),
+                        name: name.to_owned(),
+                        args,
+                    };
+                    yield LlmEvent::Done;
+                })
+            }
+
             "" => stream_text("Type 'help' for a list of test provider commands.\n", None),
 
             _ => {
@@ -208,5 +231,30 @@ mod tests {
             .collect();
 
         assert!(text.contains("Unknown command"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn tool_command_emits_scripted_tool_call() {
+        let provider = TestProvider::new();
+        let events: Vec<LlmEvent> = provider
+            .stream(
+                vec![Message::user("tool bash {\"command\":\"echo hi\"}")],
+                vec![],
+            )
+            .collect()
+            .await;
+
+        let calls: Vec<&LlmEvent> = events
+            .iter()
+            .filter(|e| matches!(e, LlmEvent::ToolCall { .. }))
+            .collect();
+        assert_eq!(calls.len(), 1, "expected one scripted ToolCall event");
+        match &calls[0] {
+            LlmEvent::ToolCall { name, args, .. } => {
+                assert_eq!(name, "bash");
+                assert_eq!(args["command"], "echo hi");
+            }
+            _ => unreachable!(),
+        }
     }
 }

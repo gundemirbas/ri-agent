@@ -17,9 +17,13 @@
   HTTP + WebSocket at `/acp` (axum). Ri-specific `_ri/get_state`,
   `_ri/set_model`, `_ri/set_thinking` custom methods can introspect and swap
   the active provider/thinking level at runtime. `session/load` replays a
-  known in-memory session's history. Tools are registered per prompt so
-  `ask_user` routes through the same channel the loop reads; the sessions data
-  dir and cache dir are excluded from the headless file tracker.
+  known in-memory session's history. Live tool output now streams over the
+  wire: each `ToolOutputChunk` is forwarded as an in-progress
+  `tool_call_update` so bash/exec output appears as it runs (`TestProvider`
+  gains a `tool <name> <args-json>` command to exercise this offline). Tools
+  are registered per prompt so `ask_user` routes through the same channel the
+  loop reads; the sessions data dir and cache dir are excluded from the
+  headless file tracker.
 
 ### Fixed
 

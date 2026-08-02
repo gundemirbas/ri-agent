@@ -221,7 +221,8 @@ Implemented surface:
 
 - `initialize` — protocol v1, image prompts, in-memory `session/load`
 - `session/new`, `session/prompt` (streams `agent_message_chunk`,
-  `agent_thought_chunk`, `tool_call`/`tool_call_update`, `usage_update`)
+  `agent_thought_chunk`, `tool_call`/`tool_call_update` with live tool output
+  forwarded as in-progress updates, `usage_update`)
 - `session/load` — replays a known in-memory session's history as updates
 - `session/cancel` — maps to ri's hard abort
 - `ask_user` — forwarded as `session/request_permission` (multiple-choice

@@ -10,7 +10,8 @@
 //! - `session/new` — in-memory session (history, cancel channel, cwd)
 //! - `session/load` — replays a known in-memory session's history as updates
 //! - `session/prompt` — streams `agent_message_chunk`, `agent_thought_chunk`,
-//!   `tool_call`/`tool_call_update`, `usage_update`, then `end_turn`
+//!   `tool_call`/`tool_call_update` (with live tool output forwarded as
+//!   in-progress `tool_call_update` chunks), `usage_update`, then `end_turn`
 //! - `session/cancel` — maps to ri `HardAbort`
 //! - `ask_user` → `session/request_permission` (multiple-choice mapping;
 //!   freeform-only asks surface a single "Continue" option)
@@ -473,9 +474,27 @@ fn build_agent(
                                 phase = AssistantPhase::Unknown;
                                 usage = None;
                             }
+                            AgentEvent::ToolOutputChunk { id, chunk } => {
+                                // Live tool output: stream each chunk as an
+                                // in-progress `tool_call_update` so headless
+                                // clients render bash/exec output as it runs
+                                // (the final `Completed` update arrives on
+                                // `ToolCallEnd`).
+                                send_update!(
+                                    connection,
+                                    session_id,
+                                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                        id,
+                                        ToolCallUpdateFields::new()
+                                            .status(ToolCallStatus::InProgress)
+                                            .content(vec![ToolCallContent::from(
+                                                ContentBlock::Text(TextContent::new(chunk)),
+                                            )]),
+                                    ))
+                                );
+                            }
                             AgentEvent::ToolCallIntent { .. }
                             | AgentEvent::ToolCallArgsDelta { .. }
-                            | AgentEvent::ToolOutputChunk { .. }
                             | AgentEvent::SteeringConsumed { .. }
                             | AgentEvent::StatusUpdate(_)
                             | AgentEvent::Compacting
