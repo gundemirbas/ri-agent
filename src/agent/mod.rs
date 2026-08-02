@@ -55,6 +55,9 @@ enum TurnOutcome {
     /// The model indicated a tool call was coming but no call arrived
     /// (e.g. truncated by max_tokens).
     ToolIntentWithNoCall,
+    /// The turn was hard-aborted mid-stream (`session/cancel` → `HardAbort`);
+    /// the current model stream was chopped before it finished.
+    Cancelled,
 }
 
 // ── BatchOutcome ──────────────────────────────────────────────────────────────
@@ -152,6 +155,7 @@ async fn stream_assistant_turn(
     messages: Vec<Message>,
     tool_defs: Vec<ToolDefinition>,
     tx: &UnboundedSender<AppEvent>,
+    cancel_rx: &tokio::sync::watch::Receiver<CancelLevel>,
     overflow_retry_remaining: usize,
 ) -> TurnOutcome {
     // Build a lookup from tool name → streaming_field for intent events.
@@ -172,6 +176,11 @@ async fn stream_assistant_turn(
     let mut first_text_token = true;
 
     while let Some(ev) = stream.next().await {
+        // Mid-stream hard abort: chop the current model stream right away
+        // instead of waiting for the next turn/tool boundary.
+        if *cancel_rx.borrow() >= CancelLevel::HardAbort {
+            return TurnOutcome::Cancelled;
+        }
         match ev {
             LlmEvent::Token { text, phase } => {
                 if first_text_token {
@@ -448,6 +457,7 @@ pub async fn run_agent_loop(
             messages,
             tool_defs.clone(),
             &tx,
+            &cancel_rx,
             overflow_retry_remaining,
         )
         .await;
@@ -466,6 +476,11 @@ pub async fn run_agent_loop(
                          (response may have been truncated).",
                     ),
                 )));
+                return;
+            }
+
+            TurnOutcome::Cancelled => {
+                tx.send_ignore(AppEvent::Agent(AgentEvent::Done));
                 return;
             }
 

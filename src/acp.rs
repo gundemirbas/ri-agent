@@ -53,10 +53,10 @@
 //! SDK event loop free during a run, so `_ri/get_state` gives a **live** mid-turn
 //! snapshot and `session/cancel` is dispatched while streaming. Known
 //! limitations: one prompt at a time per session; `_ri/steering` still applies
-//! at the next turn boundary rather than mid-turn; and the agent loop's
-//! `stream_assistant_turn` does not yet observe `HardAbort` between tokens, so
-//! cancel takes effect at the next checkpoint (turn/tool boundary) rather than
-//! chopping a stream in flight. The agent loop itself is reused unchanged.
+//! at the next turn boundary rather than mid-turn. `session/cancel` maps to ri
+//! `HardAbort`, which the agent loop now honours **mid-stream** too — the
+//! current model stream is chopped on the next token. The agent loop itself is
+//! reused unchanged.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -3518,5 +3518,65 @@ mod acp_e2e {
     /// shared v1-keyed map).
     fn cleanup_v1_session(sid: &acp_v2::SessionId) {
         cleanup_session(&SessionId::new(sid.0.as_ref().to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_inproc_cancel_chops_inflight_stream() {
+        let ctx = test_ctx();
+        let agent = build_agent_router(ctx, sessions());
+        let client = Client.builder().connect_with(
+            agent,
+            |cx: ConnectionTo<AcpRoleAgent>| async move {
+                let _ = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let ns = cx
+                    .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+                    .block_task()
+                    .await?;
+                let sid = ns.session_id;
+
+                // Fire a session/cancel ~600ms into a ~4.5s slow token stream.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cx2 = cx.clone();
+                let sid2 = sid.clone();
+                cx2.spawn({
+                    let cx_in = cx2.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        let _ = cx_in.send_notification(CancelNotification::new(sid2.clone()));
+                        let _ = tx.send(());
+                        Ok(())
+                    }
+                })?;
+
+                let words = (0..30)
+                    .map(|i| format!("w{i}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let t0 = std::time::Instant::now();
+                let pr = cx
+                    .send_request(PromptRequest::new(
+                        sid.clone(),
+                        vec![text_block(&format!("slow {words}"))],
+                    ))
+                    .block_task()
+                    .await?;
+                let elapsed = t0.elapsed().as_secs_f64();
+                assert_eq!(pr.stop_reason, StopReason::EndTurn);
+                rx.await.expect("cancel task did not fire");
+                assert!(
+                    elapsed < 3.0,
+                    "mid-stream cancel not honored; turn took {elapsed:.2}s (stream not chopped)"
+                );
+                cleanup_session(&sid);
+                Ok(())
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(6), client)
+            .await
+            .expect("cancel-chop e2e timed out")
+            .expect("client connection failed");
     }
 }

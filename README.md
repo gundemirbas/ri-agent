@@ -257,10 +257,10 @@ Implemented surface:
   ri-specific `_ri/*` methods via shared version-neutral implementations)
 
 Current limitations: one prompt at a time per session; `_ri/steering` applies
-at the next turn boundary (mid-turn injection is not implemented); and
-`session/cancel` maps to ri's `HardAbort`, which the agent loop honours at its
-next checkpoint (turn/tool boundary) rather than chopping a mid-flight stream.
-Requires Rust 1.88 (ACP dependency baseline).
+at the next turn boundary (mid-turn injection is not implemented).
+`session/cancel` maps to ri's `HardAbort`, which the agent loop honours
+mid-stream: the current model stream is chopped on the next token (verified by
+an in-process e2e). Requires Rust 1.88 (ACP dependency baseline).
 
 ## Decoupled TUI (`--tui-acp`)
 

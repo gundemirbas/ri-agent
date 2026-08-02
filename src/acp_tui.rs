@@ -36,9 +36,13 @@ use crate::llm::{AssistantPhase, UsageStats};
 
 /// Control handles handed back to the TUI after a successful spawn.
 /// Admin commands the TUI can push to the child (`_ri/*` methods).
+// The `Set*` variants intentionally share their RPC-verb prefix: each maps to a
+// distinct `_ri/set_*` method, and the shared prefix is the semantic grouping.
+#[allow(clippy::enum_variant_names)]
 pub enum AcpTuiAdmin {
     SetModel(String),
     SetThinking(String),
+    SetProvider(String),
 }
 
 pub struct AcpTuiControls {
@@ -333,6 +337,9 @@ async fn run_loop(
                 let (method, params) = match admin {
                     AcpTuiAdmin::SetModel(model) => ("_ri/set_model", json!({"model": model})),
                     AcpTuiAdmin::SetThinking(level) => ("_ri/set_thinking", json!({"level": level})),
+                    AcpTuiAdmin::SetProvider(provider) => {
+                        ("_ri/set_provider", json!({"provider": provider}))
+                    }
                 };
                 let _ = write_line(
                     &mut stdin,

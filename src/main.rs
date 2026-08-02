@@ -385,6 +385,7 @@ async fn main() -> io::Result<()> {
     }
     let mut synced_model = initial_model.clone();
     let mut synced_thinking = initial_thinking;
+    let mut synced_provider_id = app.provider.current_instance.id.clone();
 
     let custom_tools = load_custom_tools(&custom_tool_dirs());
     let loaded_skills = Arc::new(skills::load_skills());
@@ -509,6 +510,13 @@ async fn main() -> io::Result<()> {
 
         // ── Keep a detached `--tui-acp` child in sync with provider state ──
         if let Some(admin_tx) = &acp_admin {
+            // Provider-instance changes hot-swap the child's active provider
+            // (`_ri/set_provider`), then model/thinking changes apply on it.
+            let cur_provider = app.provider.current_instance.id.clone();
+            if cur_provider != synced_provider_id {
+                let _ = admin_tx.send(acp_tui::AcpTuiAdmin::SetProvider(cur_provider.clone()));
+                synced_provider_id = cur_provider;
+            }
             let cur_model = app.provider.current_model.clone();
             let cur_thinking = app.provider.current_thinking;
             if cur_model != synced_model {

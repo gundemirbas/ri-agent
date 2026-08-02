@@ -39,6 +39,13 @@
   checkpoint). Previously the serial handler blocked the loop, so a client's
   permission reply could never be read back (hang) and `_ri/get_state` only
   reflected state between turns.
+- **Mid-stream `session/cancel`**: the agent loop now observes `HardAbort`
+  inside `stream_assistant_turn`, so cancelling chops the current model stream
+  on the next token instead of waiting for the turn/tool boundary. Verified by
+  an in-process e2e (a ~4.5s stream is cut in well under a second). The
+  `--tui-acp` bridge also pushes provider-instance changes to its detached
+  `ri --serve` child via `_ri/set_provider` (`AcpTuiAdmin::SetProvider`), so
+  switching providers in the TUI hot-swaps the headless agent too.
 - **`_ri/set_provider`**: hot-swap the active provider instance by preset id
   without restarting the server — re-resolves the preset from config, rebuilds
   the provider, and updates the "current instance" + model so later
