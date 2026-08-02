@@ -57,15 +57,15 @@ use agent_client_protocol::schema::v1::{
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
     PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities, SessionForkCapabilities,
-    SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage as AcpUsage, UsageUpdate,
+    RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
+    SessionCloseCapabilities, SessionForkCapabilities, SessionId, SessionInfo,
+    SessionListCapabilities, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+    StopReason, TextContent, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, Usage as AcpUsage, UsageUpdate,
 };
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, JsonRpcRequest, JsonRpcResponse, Result as AcpResult, Stdio,
-    on_receive_notification, on_receive_request,
+    Agent, Client, ConnectTo, ConnectionTo, JsonRpcRequest, JsonRpcResponse, Responder,
+    Result as AcpResult, Stdio, on_receive_notification, on_receive_request,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
@@ -336,12 +336,491 @@ impl AcpSession {
 
 type Sessions = Arc<Mutex<HashMap<SessionId, AcpSession>>>;
 
-/// Send an ACP session update notification, ignoring send failures.
 macro_rules! send_update {
     ($connection:expr, $session_id:expr, $update:expr) => {{
         let _ =
             $connection.send_notification(SessionNotification::new($session_id.clone(), $update));
     }};
+}
+
+// ── Shared turn driver (protocol-version-agnostic) ───────────────────────────
+
+/// Everything the per-turn driver needs, produced synchronously by
+/// [`prepare_turn`] and consumed (on a concurrent task) by [`run_turn`].
+/// Deliberately independent of the ACP protocol version.
+struct TurnSetup {
+    context_size: usize,
+    join: tokio::task::JoinHandle<()>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    cancel_rx: tokio::sync::watch::Receiver<CancelLevel>,
+}
+
+/// Version-agnostic summary of one completed prompt turn.
+struct TurnOutcome {
+    error: Option<String>,
+    final_usage: Option<UsageStats>,
+}
+
+/// Protocol-version-specific mapping of the shared event-forwarding loop onto
+/// ACP notifications, permission requests, and the final prompt response.
+/// The v1 and v2 implementations translate the same [`AppEvent`] stream into
+/// the appropriate schema types; the caller passes the session id as a plain
+/// string so the trait itself stays version-neutral.
+trait TurnEmitter: Send + 'static {
+    fn emit_agent_text(&self, sid: &str, text: &str);
+    fn emit_agent_thought(&self, sid: &str, text: &str);
+    fn emit_usage(&self, sid: &str, u: &UsageStats, context_size: usize);
+    fn emit_tool_pending(&self, sid: &str, id: &str, name: &str);
+    fn emit_tool_completed(&self, sid: &str, id: &str, content: &str);
+    fn emit_tool_output_chunk(&self, sid: &str, id: &str, chunk: &str);
+    async fn ask(
+        &mut self,
+        sid: &str,
+        request: &AskRequest,
+        cancel_rx: &mut tokio::sync::watch::Receiver<CancelLevel>,
+    ) -> AskUserResponse;
+    /// Send the version-specific `session/prompt` response (or error).
+    fn finish(self, sid: &str, outcome: TurnOutcome);
+}
+
+/// Shared permission-option listing `(id, title)` for an ask, ending with the
+/// freeform "Continue" escape when the ask allows freeform input or has no
+/// options. Each protocol version maps these into its own `PermissionOption` list.
+fn permission_option_rows(request: &AskRequest) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = request
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let label = match o.description.as_deref() {
+                Some(d) if !d.is_empty() => format!("{} — {d}", o.title),
+                _ => o.title.clone(),
+            };
+            (format!("opt-{i}"), label)
+        })
+        .collect();
+    if request.allow_freeform || rows.is_empty() {
+        rows.push(("continue".to_string(), "Continue".to_string()));
+    }
+    rows
+}
+
+/// Turn a selected option id into the `ask_user` reply (prefer the option
+/// title, fall back to the id). `None` (no selection, cancelled) maps to
+/// [`AskUserResponse::Cancelled`].
+fn answer_from_selected(option_id: Option<&str>, rows: &[(String, String)]) -> AskUserResponse {
+    match option_id {
+        Some(id) => {
+            let title = rows
+                .iter()
+                .find(|(oid, _)| oid == id)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_else(|| id.to_string());
+            AskUserResponse::Answer(title)
+        }
+        None => AskUserResponse::Cancelled,
+    }
+}
+
+/// Reserve a session for a prompt turn (busy guard, user-message + resource
+/// reads into history, cancel + steering channels) and spawn the agent loop.
+/// Version-agnostic apart from the already-rendered `prompt_text` and
+/// `resource_reads` supplied by the caller.
+async fn prepare_turn(
+    ctx: &Arc<AcpContext>,
+    s_prompt: &Sessions,
+    session_id: &SessionId,
+    prompt_text: String,
+    resource_reads: Vec<SessionEvent>,
+) -> Result<TurnSetup, String> {
+    let (session_cwd, context_size, history_snapshot, steering_rx, cancel_rx, cancel_rx_turn) = {
+        let mut map = s_prompt.lock().unwrap();
+        let Some(s) = map.get_mut(session_id) else {
+            return Err(format!("unknown session: {session_id}"));
+        };
+        if s.running {
+            return Err("session is busy (one prompt at a time)".to_string());
+        }
+        s.running = true;
+        s.events.push(SessionEvent::UserMessage {
+            content: prompt_text.clone(),
+            timestamp: now_ts(),
+        });
+        s.events.extend(resource_reads);
+        let (cancel_tx, cancel_rx) = watch::channel(CancelLevel::None);
+        s.cancel_tx = Some(cancel_tx);
+        let (steering_tx, steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        for text in s.queued_steering.drain(..) {
+            let _ = steering_tx.send(text);
+        }
+        let cancel_rx_turn = cancel_rx.clone();
+        (
+            s.cwd.clone(),
+            context_window_for_model(&ctx.model.read().unwrap()).unwrap_or(200_000),
+            s.events.clone(),
+            steering_rx,
+            cancel_rx,
+            cancel_rx_turn,
+        )
+    };
+
+    // Channel for agent events AND ask_user replies.
+    let (tx, rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) =
+        tokio::sync::mpsc::unbounded_channel();
+    // Tools are registered per prompt so `ask_user` can route its question back
+    // through this prompt's channel (headless mode).
+    let tools = register_builtin_tools(
+        Some(tx.clone()),
+        Arc::clone(&ctx.file_tracker),
+        Arc::clone(&ctx.skills),
+        Vec::new(),
+    )
+    .await;
+    let system_prompt = crate::agent::build_system_prompt(
+        &tools,
+        &session_cwd.to_string_lossy(),
+        &ctx.skills,
+        None,
+    );
+    let provider = ctx.provider.read().unwrap().clone();
+    let model = ctx.model.read().unwrap().clone();
+    let tokio_handle = ctx
+        .tokio_handle
+        .clone()
+        .unwrap_or_else(tokio::runtime::Handle::current);
+
+    let config = AgentLoopConfig {
+        tools,
+        file_tracker: Arc::clone(&ctx.file_tracker),
+        tool_output_log: Arc::new(std::sync::Mutex::new(ToolOutputLog::new(
+            session_id.to_string().as_str(),
+        ))),
+        session_events: history_snapshot,
+        current_model: model,
+        auto_compaction_enabled: true,
+        manual_compaction_instructions: None,
+        executor: Arc::new(DefaultToolExecutor::with_root(session_cwd)),
+        system_prompt: Some(system_prompt),
+    };
+    let provider_loop = Arc::clone(&provider);
+    let task_tx = tx.clone();
+    let join = tokio_handle.spawn(async move {
+        run_agent_loop(config, provider_loop, task_tx, steering_rx, cancel_rx).await;
+    });
+    Ok(TurnSetup {
+        context_size,
+        join,
+        rx,
+        cancel_rx: cancel_rx_turn,
+    })
+}
+
+/// Forward the agent's events to the client via the version-specific [`TurnEmitter`],
+/// answer `ask_user` through a permission request, then finalize (busy-guard
+/// reset, history persistence, response). Runs on its own task so the SDK
+/// event loop stays free during the turn.
+async fn run_turn<E: TurnEmitter>(
+    ctx: Arc<AcpContext>,
+    s_prompt: Sessions,
+    session_id: SessionId,
+    setup: TurnSetup,
+    mut emitter: E,
+) {
+    let TurnSetup {
+        context_size,
+        join,
+        mut rx,
+        cancel_rx,
+    } = setup;
+    let mut cancel_rx = cancel_rx;
+    let sid = session_id.to_string();
+    let mut error: Option<String> = None;
+    let mut assistant_text = String::new();
+    let mut assistant_thinking: Option<String> = None;
+    let mut phase = AssistantPhase::Unknown;
+    let mut usage: Option<UsageStats> = None;
+    // Usage survives TurnEnd's `usage = None` reset so the final end_turn
+    // response can include the last turn's tokens.
+    let mut final_usage: Option<UsageStats> = None;
+    let mut pending_tool: Vec<SessionEvent> = Vec::new();
+
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            AppEvent::AskUser(request) => {
+                let answer = emitter.ask(&sid, &request, &mut cancel_rx).await;
+                match &answer {
+                    AskUserResponse::Answer(a) => {
+                        ctx.log("info", Some(&sid), format!("ask_user answered: {a}"))
+                    }
+                    AskUserResponse::Cancelled => ctx.log("warn", Some(&sid), "ask_user cancelled"),
+                }
+                let _ = request.reply.send(answer);
+            }
+            AppEvent::Agent(agent_ev) => match agent_ev {
+                AgentEvent::Done => break,
+                AgentEvent::Error(e) => {
+                    error = Some(e.message.clone());
+                    break;
+                }
+                AgentEvent::TextToken { text, phase: ph } => {
+                    assistant_text.push_str(&text);
+                    if ph != AssistantPhase::Unknown {
+                        phase = ph;
+                    }
+                    emitter.emit_agent_text(&sid, &text);
+                }
+                AgentEvent::ThinkingToken(t) => {
+                    assistant_thinking
+                        .get_or_insert_with(String::new)
+                        .push_str(&t);
+                    emitter.emit_agent_thought(&sid, &t);
+                }
+                AgentEvent::Usage(u) => {
+                    usage = Some(u);
+                    final_usage = Some(u);
+                    emitter.emit_usage(&sid, &u, context_size);
+                }
+                AgentEvent::ToolCallStart { id, name, args } => {
+                    pending_tool.push(SessionEvent::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args,
+                        include_in_llm: true,
+                        timestamp: now_ts(),
+                    });
+                    emitter.emit_tool_pending(&sid, &id, &name);
+                }
+                AgentEvent::ToolCallEnd { id, result } => {
+                    let content = result.content.as_text().to_string();
+                    pending_tool.push(SessionEvent::ToolResult {
+                        id: id.clone(),
+                        name: String::new(),
+                        content: content.clone(),
+                        is_error: result.is_error,
+                        display_range: None,
+                        include_in_llm: true,
+                        timestamp: now_ts(),
+                    });
+                    emitter.emit_tool_completed(&sid, &id, &content);
+                }
+                AgentEvent::TurnEnd => {
+                    commit_turn(
+                        &s_prompt,
+                        &session_id,
+                        &mut assistant_text,
+                        &mut assistant_thinking,
+                        phase,
+                        usage,
+                        &pending_tool,
+                    );
+                    pending_tool.clear();
+                    assistant_text.clear();
+                    assistant_thinking = None;
+                    phase = AssistantPhase::Unknown;
+                    usage = None;
+                }
+                AgentEvent::ToolOutputChunk { id, chunk } => {
+                    emitter.emit_tool_output_chunk(&sid, &id, &chunk);
+                }
+                AgentEvent::ToolCallIntent { .. }
+                | AgentEvent::ToolCallArgsDelta { .. }
+                | AgentEvent::SteeringConsumed { .. }
+                | AgentEvent::StatusUpdate(_)
+                | AgentEvent::Compacting
+                | AgentEvent::CompactionDone(_)
+                | AgentEvent::ExternalFileChange { .. } => {}
+            },
+            _ => {}
+        }
+    }
+
+    {
+        let mut map = s_prompt.lock().unwrap();
+        if let Some(s) = map.get_mut(&session_id) {
+            s.running = false;
+            s.cancel_tx = None;
+        }
+    }
+    let _ = join.await;
+
+    // Persist the committed history + cwd so the session can be resumed from
+    // disk by a later process (session/load).
+    {
+        let map = s_prompt.lock().unwrap();
+        if let Some(s) = map.get(&session_id)
+            && !s.events.is_empty()
+        {
+            persist_session(&session_id, &s.events, &s.cwd);
+        }
+    }
+
+    match &error {
+        Some(msg) => ctx.log("error", Some(&sid), format!("session/prompt failed: {msg}")),
+        None => ctx.log("info", Some(&sid), "session/prompt end"),
+    }
+    emitter.finish(&sid, TurnOutcome { error, final_usage });
+}
+
+// ── ACP protocol v1 emitter ──────────────────────────────────────────────────
+
+/// v1 transport of the shared turn driver: maps agent events onto v1
+/// `SessionNotification`/`SessionUpdate`, asks via v1
+/// `session/request_permission`, and finishes with the v1 `PromptResponse`.
+struct V1Emitter {
+    connection: ConnectionTo<Client>,
+    responder: Responder<PromptResponse>,
+}
+
+impl V1Emitter {
+    fn new(connection: ConnectionTo<Client>, responder: Responder<PromptResponse>) -> Self {
+        Self {
+            connection,
+            responder,
+        }
+    }
+
+    fn send_update(&self, sid: &str, update: SessionUpdate) {
+        send_update!(self.connection, SessionId::new(sid.to_string()), update);
+    }
+}
+
+impl TurnEmitter for V1Emitter {
+    fn emit_agent_text(&self, sid: &str, text: &str) {
+        self.send_update(
+            sid,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(text),
+            ))),
+        );
+    }
+
+    fn emit_agent_thought(&self, sid: &str, text: &str) {
+        self.send_update(
+            sid,
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(text),
+            ))),
+        );
+    }
+
+    fn emit_usage(&self, sid: &str, u: &UsageStats, context_size: usize) {
+        if let Some(uu) = usage_update_value(u, context_size as u64) {
+            self.send_update(sid, SessionUpdate::UsageUpdate(uu));
+        }
+    }
+
+    fn emit_tool_pending(&self, sid: &str, id: &str, name: &str) {
+        let kind = tool_kind(name);
+        self.send_update(
+            sid,
+            SessionUpdate::ToolCall(
+                ToolCall::new(id.to_string(), name.to_string())
+                    .kind(kind)
+                    .status(ToolCallStatus::Pending),
+            ),
+        );
+    }
+
+    fn emit_tool_completed(&self, sid: &str, id: &str, content: &str) {
+        self.send_update(
+            sid,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                id.to_string(),
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .content(vec![ToolCallContent::from(ContentBlock::Text(
+                        TextContent::new(content),
+                    ))]),
+            )),
+        );
+    }
+
+    fn emit_tool_output_chunk(&self, sid: &str, id: &str, chunk: &str) {
+        // Live tool output: stream each chunk as an in-progress
+        // `tool_call_update` so headless clients render bash/exec output as it
+        // runs (the final `Completed` update arrives on `ToolCallEnd`).
+        self.send_update(
+            sid,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                id.to_string(),
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::InProgress)
+                    .content(vec![ToolCallContent::from(ContentBlock::Text(
+                        TextContent::new(chunk),
+                    ))]),
+            )),
+        );
+    }
+
+    async fn ask(
+        &mut self,
+        sid: &str,
+        request: &AskRequest,
+        cancel_rx: &mut tokio::sync::watch::Receiver<CancelLevel>,
+    ) -> AskUserResponse {
+        let rows = permission_option_rows(request);
+        let mut title = request.question.clone();
+        if let Some(ctx_text) = request.context.as_deref() {
+            title = format!("{title}\n\n{ctx_text}");
+        }
+        let tool_call = ToolCallUpdate::new(
+            format!("ask-{}", now_ts()),
+            ToolCallUpdateFields::new()
+                .title(title)
+                .kind(ToolKind::Other)
+                .status(ToolCallStatus::InProgress),
+        );
+        let options = rows
+            .iter()
+            .map(|(id, t)| permission_option(id.clone(), t))
+            .collect();
+        // Safe to await block_task here: this task runs concurrently with the
+        // (free) event loop, so the client's response is routed to us. A
+        // mid-turn session/cancel also resolves the ask (as cancelled)
+        // instead of hanging.
+        let outcome = tokio::select! {
+            o = self.connection.send_request(RequestPermissionRequest::new(
+                SessionId::new(sid.to_string()),
+                tool_call,
+                options,
+            ))
+            .block_task() => Some(o),
+            _ = cancel_rx.wait_for(|l| *l >= CancelLevel::HardAbort) => None,
+        };
+        match outcome {
+            Some(outcome) => match &outcome {
+                Ok(r) => match &r.outcome {
+                    RequestPermissionOutcome::Selected(sel) => {
+                        answer_from_selected(Some(sel.option_id.0.as_ref()), &rows)
+                    }
+                    _ => AskUserResponse::Cancelled,
+                },
+                Err(_) => AskUserResponse::Cancelled,
+            },
+            None => AskUserResponse::Cancelled,
+        }
+    }
+
+    fn finish(self, _sid: &str, outcome: TurnOutcome) {
+        let _ = match outcome.error {
+            Some(msg) => self
+                .responder
+                .respond_with_error(agent_client_protocol::Error::internal_error().data(msg)),
+            None => {
+                let mut resp = PromptResponse::new(StopReason::EndTurn);
+                // ACP end_turn_token_usage: fold the turn's usage into the
+                // response in addition to the streamed usage_update.
+                if let Some(u) = &outcome.final_usage {
+                    resp = resp.usage(AcpUsage::new(
+                        u.total_tokens.unwrap_or_default() as u64,
+                        u.input_tokens.unwrap_or_default() as u64,
+                        u.output_tokens.unwrap_or_default() as u64,
+                    ));
+                }
+                self.responder.respond(resp)
+            }
+        };
+    }
 }
 
 /// Reject an unauthorized mutating `_ri/*` request and return from the handler.
@@ -604,98 +1083,25 @@ fn build_agent(
                     ),
                 );
 
-                // Per-session (cwd, busy guard) + push user message / resource reads.
-                let (session_cwd, cancel_rx, context_size, history_snapshot, steering_rx) = {
-                    let mut map = s_prompt.lock().unwrap();
-                    let Some(s) = map.get_mut(&session_id) else {
-                        responder
-                            .respond_with_error(
-                                agent_client_protocol::Error::invalid_params()
-                                    .data(format!("unknown session: {session_id}")),
-                            )
-                            .ok();
-                        return Ok(());
-                    };
-                    if s.running {
-                        responder
-                            .respond_with_error(
-                                agent_client_protocol::Error::invalid_params()
-                                    .data("session is busy (one prompt at a time)"),
-                            )
-                            .ok();
-                        return Ok(());
-                    }
-                    s.running = true;
-                    s.events.push(SessionEvent::UserMessage {
-                        content: prompt_text.clone(),
-                        timestamp: now_ts(),
-                    });
-                    s.events.extend(synthesize_resource_reads(&req.prompt));
-                    let (cancel_tx, cancel_rx) = watch::channel(CancelLevel::None);
-                    s.cancel_tx = Some(cancel_tx);
-                    let (steering_tx, steering_rx) = tokio::sync::mpsc::unbounded_channel();
-                    for text in s.queued_steering.drain(..) {
-                        let _ = steering_tx.send(text);
-                    }
-                    let cwd = s.cwd.clone();
-                    (
-                        cwd,
-                        cancel_rx,
-                        context_window_for_model(&ctx.model.read().unwrap()).unwrap_or(200_000),
-                        s.events.clone(),
-                        steering_rx,
-                    )
-                };
-
-                // Channel for agent events AND ask_user replies.
-                let (tx, rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) =
-                    tokio::sync::mpsc::unbounded_channel();
-                let mut rx = rx;
-
-                // Tools are registered per prompt so `ask_user` can route its
-                // question back through this prompt's channel (headless mode).
-                let tools = register_builtin_tools(
-                    Some(tx.clone()),
-                    Arc::clone(&ctx.file_tracker),
-                    Arc::clone(&ctx.skills),
-                    Vec::new(),
-                )
-                .await;
-                let system_prompt = crate::agent::build_system_prompt(
-                    &tools,
-                    &session_cwd.to_string_lossy(),
-                    &ctx.skills,
-                    None,
-                );
-                let provider = ctx.provider.read().unwrap().clone();
-                let model = ctx.model.read().unwrap().clone();
+                let resource_reads = synthesize_resource_reads(&req.prompt);
                 let tokio_handle = ctx
                     .tokio_handle
                     .clone()
                     .unwrap_or_else(tokio::runtime::Handle::current);
-
-                let config = AgentLoopConfig {
-                    tools,
-                    file_tracker: Arc::clone(&ctx.file_tracker),
-                    tool_output_log: Arc::new(std::sync::Mutex::new(ToolOutputLog::new(
-                        session_id.to_string().as_str(),
-                    ))),
-                    session_events: history_snapshot,
-                    current_model: model,
-                    auto_compaction_enabled: true,
-                    manual_compaction_instructions: None,
-                    executor: Arc::new(DefaultToolExecutor::with_root(session_cwd.clone())),
-                    system_prompt: Some(system_prompt),
-                };
-                let provider_loop = Arc::clone(&provider);
-                let task_tx = tx.clone();
-                // Cancel can arrive mid-turn (it used to be queued behind the
-                // serialised prompt handler); the turn task observes it so a
-                // pending request_permission is also resolved on cancel.
-                let cancel_rx_task = cancel_rx.clone();
-                let join = tokio_handle.clone().spawn(async move {
-                    run_agent_loop(config, provider_loop, task_tx, steering_rx, cancel_rx).await;
-                });
+                let setup =
+                    match prepare_turn(&ctx, &s_prompt, &session_id, prompt_text, resource_reads)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(msg) => {
+                            responder
+                                .respond_with_error(
+                                    agent_client_protocol::Error::invalid_params().data(msg),
+                                )
+                                .ok();
+                            return Ok(());
+                        }
+                    };
 
                 // SDK event-loop constraint: handler callbacks run on a single
                 // event loop, so the connection cannot read client responses
@@ -708,269 +1114,10 @@ fn build_agent(
                 // get served mid-turn.
                 let s_prompt_task = Arc::clone(&s_prompt);
                 let ctx_task = Arc::clone(&ctx);
-                let connection_task = connection.clone();
                 let session_id_task = session_id.clone();
-                let context_size_task = context_size;
-                let handle_task = tokio_handle.clone();
-                handle_task.spawn(async move {
-                    let connection = connection_task;
-                    let session_id = session_id_task;
-                    let s_prompt = s_prompt_task;
-                    let ctx = ctx_task;
-                    let context_size = context_size_task;
-                    let mut cancel_rx = cancel_rx_task;
-
-                    // Forward agent events + answer ask_user via request_permission.
-                    let mut error: Option<String> = None;
-                    let mut assistant_text = String::new();
-                    let mut assistant_thinking: Option<String> = None;
-                    let mut phase = AssistantPhase::Unknown;
-                    let mut usage: Option<UsageStats> = None;
-                    // Usage survives TurnEnd's `usage = None` reset so the final
-                    // end_turn response can include the last turn's tokens.
-                    let mut final_usage: Option<UsageStats> = None;
-                    let mut pending_tool: Vec<SessionEvent> = Vec::new();
-
-                    while let Some(ev) = rx.recv().await {
-                        match ev {
-                            AppEvent::AskUser(request) => {
-                                let (options, option_titles) = permission_options(&request);
-                                let mut title = request.question.clone();
-                                if let Some(ctx_text) = request.context.as_deref() {
-                                    title = format!("{title}\n\n{ctx_text}");
-                                }
-                                let tool_call = ToolCallUpdate::new(
-                                    format!("ask-{}", now_ts()),
-                                    ToolCallUpdateFields::new()
-                                        .title(title)
-                                        .kind(ToolKind::Other)
-                                        .status(ToolCallStatus::InProgress),
-                                );
-                                // Safe to await block_task here: this task runs
-                                // concurrently with the (free) event loop, so
-                                // the client's response is routed to us. A
-                                // mid-turn session/cancel also resolves the
-                                // ask (as cancelled) instead of hanging.
-                                let outcome = tokio::select! {
-                                    o = connection
-                                        .send_request(RequestPermissionRequest::new(
-                                            session_id.clone(),
-                                            tool_call,
-                                            options,
-                                        ))
-                                        .block_task() => Some(o),
-                                    _ = cancel_rx.wait_for(|l| *l >= CancelLevel::HardAbort) => None,
-                                };
-                                let answer = match outcome {
-                                    Some(outcome) => {
-                                        ask_reply_from_outcome(&outcome, &option_titles)
-                                    }
-                                    None => {
-                                        ctx.log(
-                                            "info",
-                                            Some(&session_id.to_string()),
-                                            "ask_user resolved by session/cancel",
-                                        );
-                                        AskUserResponse::Cancelled
-                                    }
-                                };
-                                match &answer {
-                                    AskUserResponse::Answer(a) => ctx.log(
-                                        "info",
-                                        Some(&session_id.to_string()),
-                                        format!("ask_user answered: {a}"),
-                                    ),
-                                    AskUserResponse::Cancelled => ctx.log(
-                                        "warn",
-                                        Some(&session_id.to_string()),
-                                        "ask_user cancelled",
-                                    ),
-                                }
-                                let _ = request.reply.send(answer);
-                            }
-                            AppEvent::Agent(agent_ev) => match agent_ev {
-                                AgentEvent::Done => break,
-                                AgentEvent::Error(e) => {
-                                    error = Some(e.message.clone());
-                                    break;
-                                }
-                                AgentEvent::TextToken { text, phase: ph } => {
-                                    assistant_text.push_str(&text);
-                                    if ph != AssistantPhase::Unknown {
-                                        phase = ph;
-                                    }
-                                    send_update!(
-                                        connection,
-                                        session_id,
-                                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                            ContentBlock::Text(TextContent::new(text)),
-                                        ))
-                                    );
-                                }
-                                AgentEvent::ThinkingToken(t) => {
-                                    assistant_thinking
-                                        .get_or_insert_with(String::new)
-                                        .push_str(&t);
-                                    send_update!(
-                                        connection,
-                                        session_id,
-                                        SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                                            ContentBlock::Text(TextContent::new(t.clone())),
-                                        ))
-                                    );
-                                }
-                                AgentEvent::Usage(u) => {
-                                    usage = Some(u);
-                                    final_usage = Some(u);
-                                    if let Some(uu) = usage_update_value(&u, context_size as u64) {
-                                        send_update!(
-                                            connection,
-                                            session_id,
-                                            SessionUpdate::UsageUpdate(uu)
-                                        );
-                                    }
-                                }
-                                AgentEvent::ToolCallStart { id, name, args } => {
-                                    pending_tool.push(SessionEvent::ToolCall {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        args,
-                                        include_in_llm: true,
-                                        timestamp: now_ts(),
-                                    });
-                                    let kind = tool_kind(&name);
-                                    send_update!(
-                                        connection,
-                                        session_id,
-                                        SessionUpdate::ToolCall(
-                                            ToolCall::new(id, name.clone())
-                                                .kind(kind)
-                                                .status(ToolCallStatus::Pending)
-                                        )
-                                    );
-                                }
-                                AgentEvent::ToolCallEnd { id, result } => {
-                                    pending_tool.push(SessionEvent::ToolResult {
-                                        id: id.clone(),
-                                        name: String::new(),
-                                        content: result.content.as_text().to_string(),
-                                        is_error: result.is_error,
-                                        display_range: None,
-                                        include_in_llm: true,
-                                        timestamp: now_ts(),
-                                    });
-                                    let content = result.content.as_text().to_string();
-                                    send_update!(
-                                        connection,
-                                        session_id,
-                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                                            id,
-                                            ToolCallUpdateFields::new()
-                                                .status(ToolCallStatus::Completed)
-                                                .content(vec![ToolCallContent::from(
-                                                    ContentBlock::Text(TextContent::new(content)),
-                                                )]),
-                                        ))
-                                    );
-                                }
-                                AgentEvent::TurnEnd => {
-                                    commit_turn(
-                                        &s_prompt,
-                                        &session_id,
-                                        &mut assistant_text,
-                                        &mut assistant_thinking,
-                                        phase,
-                                        usage,
-                                        &pending_tool,
-                                    );
-                                    pending_tool.clear();
-                                    assistant_text.clear();
-                                    assistant_thinking = None;
-                                    phase = AssistantPhase::Unknown;
-                                    usage = None;
-                                }
-                                AgentEvent::ToolOutputChunk { id, chunk } => {
-                                    // Live tool output: stream each chunk as an
-                                    // in-progress `tool_call_update` so headless
-                                    // clients render bash/exec output as it runs
-                                    // (the final `Completed` update arrives on
-                                    // `ToolCallEnd`).
-                                    send_update!(
-                                        connection,
-                                        session_id,
-                                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                                            id,
-                                            ToolCallUpdateFields::new()
-                                                .status(ToolCallStatus::InProgress)
-                                                .content(vec![ToolCallContent::from(
-                                                    ContentBlock::Text(TextContent::new(chunk)),
-                                                )]),
-                                        ))
-                                    );
-                                }
-                                AgentEvent::ToolCallIntent { .. }
-                                | AgentEvent::ToolCallArgsDelta { .. }
-                                | AgentEvent::SteeringConsumed { .. }
-                                | AgentEvent::StatusUpdate(_)
-                                | AgentEvent::Compacting
-                                | AgentEvent::CompactionDone(_)
-                                | AgentEvent::ExternalFileChange { .. } => {}
-                            },
-                            _ => {}
-                        }
-                    }
-
-                    {
-                        let mut map = s_prompt.lock().unwrap();
-                        if let Some(s) = map.get_mut(&session_id) {
-                            s.running = false;
-                            s.cancel_tx = None;
-                        }
-                    }
-                    let _ = join.await;
-
-                    // Persist the committed history + cwd so the session can be
-                    // resumed from disk by a later process (session/load).
-                    {
-                        let map = s_prompt.lock().unwrap();
-                        if let Some(s) = map.get(&session_id)
-                            && !s.events.is_empty()
-                        {
-                            persist_session(&session_id, &s.events, &s.cwd);
-                        }
-                    }
-
-                    match &error {
-                        Some(msg) => {
-                            ctx.log(
-                                "error",
-                                Some(&session_id.to_string()),
-                                format!("session/prompt failed: {msg}"),
-                            );
-                        }
-                        None => {
-                            ctx.log("info", Some(&session_id.to_string()), "session/prompt end")
-                        }
-                    }
-
-                    let _ = match error {
-                        Some(msg) => responder.respond_with_error(
-                            agent_client_protocol::Error::internal_error().data(msg),
-                        ),
-                        None => {
-                            let mut resp = PromptResponse::new(StopReason::EndTurn);
-                            // ACP end_turn_token_usage: fold the turn's usage into
-                            // the response in addition to the streamed usage_update.
-                            if let Some(u) = &final_usage {
-                                resp = resp.usage(AcpUsage::new(
-                                    u.total_tokens.unwrap_or_default() as u64,
-                                    u.input_tokens.unwrap_or_default() as u64,
-                                    u.output_tokens.unwrap_or_default() as u64,
-                                ));
-                            }
-                            responder.respond(resp)
-                        }
-                    };
+                let emitter = V1Emitter::new(connection, responder);
+                tokio_handle.spawn(async move {
+                    run_turn(ctx_task, s_prompt_task, session_id_task, setup, emitter).await;
                 });
                 // Detach the JoinHandle: the turn task completes on its own.
                 Ok(())
@@ -1517,54 +1664,8 @@ fn session_replay_updates(events: &[SessionEvent]) -> Vec<SessionUpdate> {
 /// Build ACP permission options for an `ask_user` request. Each `ask_user`
 /// option maps to an `AllowOnce` choice (option `description` is folded into
 /// the visible label). When the ask also allows freeform input — or has no
-/// listed options at all — a trailing "Continue" escape is added so the
-/// headless client can always proceed without picking a listed option.
-fn permission_options(request: &AskRequest) -> (Vec<PermissionOption>, Vec<(String, String)>) {
-    let mut options: Vec<PermissionOption> = request
-        .options
-        .iter()
-        .enumerate()
-        .map(|(i, o)| {
-            let label = match o.description.as_deref() {
-                Some(d) if !d.is_empty() => format!("{} — {d}", o.title),
-                _ => o.title.clone(),
-            };
-            permission_option(format!("opt-{i}"), &label)
-        })
-        .collect();
-    if request.allow_freeform || options.is_empty() {
-        options.push(permission_option("continue".to_string(), "Continue"));
-    }
-    let titles = options
-        .iter()
-        .map(|o| (o.option_id.0.to_string(), o.name.clone()))
-        .collect();
-    (options, titles)
-}
-
 fn permission_option(id: String, title: &str) -> PermissionOption {
     PermissionOption::new(id, title.to_string(), PermissionOptionKind::AllowOnce)
-}
-
-/// Map a `session/request_permission` outcome back to an `ask_user` reply.
-fn ask_reply_from_outcome(
-    outcome: &Result<RequestPermissionResponse, agent_client_protocol::Error>,
-    option_titles: &[(String, String)],
-) -> AskUserResponse {
-    match outcome {
-        Ok(r) => match &r.outcome {
-            RequestPermissionOutcome::Selected(sel) => {
-                let title = option_titles
-                    .iter()
-                    .find(|(id, _)| id == &sel.option_id.0.to_string())
-                    .map(|(_, t)| t.clone())
-                    .unwrap_or_else(|| sel.option_id.0.to_string());
-                AskUserResponse::Answer(title)
-            }
-            _ => AskUserResponse::Cancelled,
-        },
-        Err(_) => AskUserResponse::Cancelled,
-    }
 }
 
 /// Commit one completed assistant turn (message + tool pairs) into the
@@ -1914,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_options_map_titles_descriptions_and_continue_escape() {
+    fn permission_option_rows_map_titles_descriptions_and_continue_escape() {
         // Freeform asks add a trailing "Continue" escape even when options exist.
         let (req, _) = ask_request_opts(
             vec![
@@ -1930,14 +2031,24 @@ mod tests {
             true,
             false,
         );
-        let (opts, titles) = permission_options(&req);
-        assert_eq!(opts.len(), 3, "freeform ask: 2 options + Continue");
-        assert_eq!(opts[0].name, "Yes");
-        assert_eq!(opts[1].name, "No");
-        assert_eq!(opts[0].option_id.0.as_ref(), "opt-0");
-        assert_eq!(titles[1].1, "No");
-        assert_eq!(opts[2].name, "Continue");
-        assert_eq!(titles[2].1, "Continue");
+        let rows = permission_option_rows(&req);
+        assert_eq!(rows.len(), 3, "freeform ask: 2 options + Continue");
+        assert_eq!(rows[0], ("opt-0".to_string(), "Yes".to_string()));
+        assert_eq!(rows[1].1, "No");
+        assert_eq!(rows[2], ("continue".to_string(), "Continue".to_string()));
+
+        assert!(matches!(
+            answer_from_selected(Some("opt-0"), &rows),
+            AskUserResponse::Answer(a) if a == "Yes"
+        ));
+        assert!(matches!(
+            answer_from_selected(Some("opt-9"), &rows),
+            AskUserResponse::Answer(a) if a == "opt-9"
+        ));
+        assert!(matches!(
+            answer_from_selected(None, &rows),
+            AskUserResponse::Cancelled
+        ));
 
         // Non-freeform asks with options: no Continue injection.
         let (req, _) = ask_request_opts(
@@ -1948,68 +2059,51 @@ mod tests {
             false,
             false,
         );
-        let (opts, _) = permission_options(&req);
-        assert_eq!(opts.len(), 1, "non-freeform ask: no Continue escape");
+        let rows = permission_option_rows(&req);
+        assert_eq!(rows.len(), 1, "non-freeform ask: no Continue escape");
         assert_eq!(
-            opts[0].name, "Run tests — cargo test --all-features",
+            rows[0].1, "Run tests — cargo test --all-features",
             "description folded into visible label"
         );
 
         // Empty options degenerate to a Continue escape in all cases.
         let (bare, _) = ask_request_opts(vec![], false, false);
-        let (opts, titles) = permission_options(&bare);
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0].name, "Continue");
-        assert_eq!(titles[0].1, "Continue");
+        let rows = permission_option_rows(&bare);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], ("continue".to_string(), "Continue".to_string()));
+
+        // version-specific mapping of rows -> v1 PermissionOption list.
+        let opts: Vec<PermissionOption> = rows
+            .iter()
+            .map(|(id, t)| permission_option(id.clone(), t))
+            .collect();
         assert_eq!(opts[0].option_id.0.as_ref(), "continue");
+        assert_eq!(opts[0].name, "Continue");
     }
-
     #[test]
-    fn ask_reply_maps_selected_cancelled_and_error_outcomes() {
-        use agent_client_protocol::schema::v1::{
-            PermissionOptionId as Id, SelectedPermissionOutcome,
-        };
-
+    fn answer_from_selected_maps_titles_and_cancelled() {
         let (req, _) = ask_request(vec![AskUserOption {
             title: "Run tests".to_string(),
             description: None,
         }]);
-        let (_opts, titles) = permission_options(&req);
+        let rows = permission_option_rows(&req);
 
-        let selected = Ok(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(Id::new("opt-0"))),
-        ));
         assert!(matches!(
-            ask_reply_from_outcome(&selected, &titles),
+            answer_from_selected(Some("opt-0"), &rows),
             AskUserResponse::Answer(t) if t == "Run tests"
         ));
-
-        let cancelled = Ok(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Cancelled,
-        ));
+        // No selection (cancelled / errored transport) -> Cancelled.
         assert!(matches!(
-            ask_reply_from_outcome(&cancelled, &titles),
-            AskUserResponse::Cancelled
-        ));
-
-        let err = Err(agent_client_protocol::Error::internal_error());
-        assert!(matches!(
-            ask_reply_from_outcome(&err, &titles),
+            answer_from_selected(None, &rows),
             AskUserResponse::Cancelled
         ));
     }
 
     #[test]
-    fn ask_reply_falls_back_to_option_id_for_unknown_selection() {
-        use agent_client_protocol::schema::v1::{
-            PermissionOptionId as Id, SelectedPermissionOutcome,
-        };
-        let unknown = Ok(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(Id::new("mystery"))),
-        ));
-        let titles = [("opt-0".to_string(), "Run tests".to_string())];
+    fn answer_from_selected_falls_back_to_option_id_for_unknown_selection() {
+        let rows = [("opt-0".to_string(), "Run tests".to_string())];
         assert!(matches!(
-            ask_reply_from_outcome(&unknown, &titles),
+            answer_from_selected(Some("mystery"), &rows),
             AskUserResponse::Answer(t) if t == "mystery"
         ));
     }
