@@ -13,7 +13,6 @@ pub trait DetachFromTty {
     fn detach_from_tty(&mut self) -> &mut Self;
 }
 
-#[cfg(unix)]
 impl DetachFromTty for std::process::Command {
     fn detach_from_tty(&mut self) -> &mut Self {
         use std::os::unix::process::CommandExt;
@@ -29,7 +28,6 @@ impl DetachFromTty for std::process::Command {
     }
 }
 
-#[cfg(unix)]
 impl DetachFromTty for tokio::process::Command {
     fn detach_from_tty(&mut self) -> &mut Self {
         // tokio::process::Command::pre_exec is an inherent method on Unix;

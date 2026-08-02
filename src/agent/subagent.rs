@@ -228,6 +228,7 @@ pub async fn run_subagent(
                         // registry are reused, but invoke_subagent was stripped.
                         subagent: None,
                         root: None,
+                        sandbox: sub.sandbox,
                     };
 
                     let result = match tools.get(tool_name) {
@@ -360,6 +361,7 @@ mod tests {
             skills: Arc::new(vec![]),
             cwd: "/tmp".to_string(),
             tools: stub_registry(&[]),
+            sandbox: false,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -417,6 +419,7 @@ mod tests {
             skills: Arc::new(vec![]),
             cwd: "/tmp".to_string(),
             tools: stub_registry(&["bash", "invoke_subagent"]),
+            sandbox: false,
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

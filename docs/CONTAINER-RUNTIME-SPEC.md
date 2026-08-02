@@ -824,3 +824,96 @@ ri-agent update
 - ✅ Bootstrapping: rustc ile yeni tool'lar üret
 - ✅ Custom tool'lar musl statik binary
 - ✅ ~40MB rootfs, ~2ms sandbox başlatma
+
+---
+
+## 15. Uygulama Durumu (Implementation Status)
+
+Bu belge, özellikle §2 (gömülü rootfs) ve §5/§6 (bootstrapping) kısımlarıyla
+birlikte *hedef mimariyi* çizer. Aşağıda, ri-agent içinde **şu an kodlanan ve
+test edilen** sürüm (`--sandbox`, `ri-sandbox` binary'si) açıklanıyor; fiili
+tasarım spek'ten şu noktalarda üstünlük/güvenilirlik için ayrışıyor:
+
+### Çalışanlar ✅
+
+| Bölüm | Durum | Not |
+|-------|-------|-----|
+| §3 Rootless user namespace | ✅ | `unshare(CLONE_NEWUSER\|CLONE_NEWNS)` + self-uid/gid-map → 0. Root yok, `unshare -Ur` ile aynı mekanizma. |
+| §4 chroot + bind mount | ✅ | `ri-sandbox` alt-süreci (pre-tokio tek-iş-parçacıklı `main`); `/work`, `/tools`, `/tmp`, `/proc`(best-effort), non-secret `/etc/*`, loader lib dir'leri RO. Image root'u RO remount. |
+| §7 RLIMIT | ⚠️ Kısmen | `ri-sandbox` minimal ve güvenli; RLIMIT/`nice` ekleme kolay — şu an atlanmış. |
+| §7 Seccomp | ⏭️ Ertelendi | BPF kırılganlığı + araç çeşitliliği (cargo/network). userns+chroot zaten ana sınırı veriyor. |
+| §8 Host network shared | ✅ | `CLONE_NEWNET` kullanılmıyor → internet açık (crates.io, API). |
+| §9 Dosya yapısı (`src/container/`) | ✅ | `mod.rs`/`rootfs.rs`/`sys.rs`/`bin_sandbox.rs` + `tests/container_sandbox.rs`. |
+| §13 Performans | ✅ | userns+chroot birkaç ms; ekstra binary `ri-sandbox` (~5MB debug / musl static). |
+
+### Bilinçli saptamalar (spek'ten)
+
+1. **Gömülü 40MB rootfs yerine → on-disk flat image + lazy bootstrap**
+   (§2'den saptı). `include_bytes!` build edilmemiş bir rootfs olmadan derlemeyi
+   kırardı ve fresh clone/CI'da kırılgan olurdu. Gerçekleşen: image
+   `~/.cache/ri/sandbox/rootfs`'te (veya `$RI_SANDBOX_IMAGE`);
+   `rootfs::assemble_image` idempotent biçimde, ilk kullanımda dizin yapısını,
+   host `/bin/sh`'i ve **statik musl uutils coreutils**'i kurar.
+
+2. **Dosya araçları = statik uutils coreutils** (kullanıcının yönlendirdiği)
+   (§5 ile uyumlu, "musl static" felsefesi). Tek multicall binary
+   (`coreutils 0.9.0`) → `<image>/usr/bin/coreutils` + applet symlink'leri.
+   Sağlanırken (`scripts/fetch-uutils-coreutils.sh` veya
+   `rootfs/usr/bin/coreutils`) sandbox host `/bin`,`/usr` **hiç bağlamaz**
+   (en sıkı izolasyon). Sağlanmazsa her dağıtımda çalışsın diye host `/bin`,
+   `/sbin`, `/usr` RO bind fallback'i.
+
+3. **Shell host'tan**: `bash` aracı `/bin/sh -c` çalıştırır; minimal image'da
+   statik bir shell yok. `ri-sandbox`, host `/bin/sh`'i tek-dosya bind'ler,
+   dinamik loader lib dizinlerini (`/lib*`, `/usr/lib*`, NixOS'un
+   `/nix/store` + `/run/current-system/sw`) RO bağlar. Yani shell dinamik,
+   dosya araçları + custom tool'lar statik musl → sıfır bağımlılık.
+
+4. **`/etc` "scrubbed"**: host `/etc` bağlanmaz; yalnızca
+   `passwd/group/resolv.conf/nsswitch.conf/hosts` + `/etc/ssl` (CA cert'ler)
+   non-secret dosyalar bağlanır. `/etc/shadow`, `/etc/ssh` vs. görünmez.
+
+5. **Bootstrapping (§6)**: agent henüz sandbox İÇİNDE rustc ile tool
+   derlemiyor; custom tool'lar host'ta musl-static üretilip `/tools`'a konur
+   ve sandbox içinde çalışır (zaten static olduklarından hiçbir lib gerekmez).
+   Sandbox içi rustc, image içeriği büyütülerek ileride eklenebilir.
+
+### Kullanım
+
+```bash
+# provisioning (opsiyonel ama önerilir — statik dosya araçları?)
+scripts/fetch-uutils-coreutils.sh     # rootfs/usr/bin/coreutils (gitignored)
+
+cargo build --bins                    # hem `ri` hem `ri-sandbox`'ı üretir
+
+# Başlat: --sandbox bayrağı (veya config.toml'da `sandbox = true`)
+ri --sandbox                          # TUI, araçlar sandbox içinde
+ri --serve --sandbox                  # ACP headless aynı sandbox'la
+ri --print --provider test --sandbox "run: pwd && id"
+```
+
+Image'i elle önceden kurmak istersen:
+`RI_SANDBOX_IMAGE=/tmp/img ri ...` ile ilk açılışta kurulur; `cargo test`
+testler `$RI_SANDBOX_IMAGE` altında geçici scratch image'ler kurar.
+
+### Testler
+
+```bash
+cargo build --bins && cargo test --all-features
+```
+
+- `tests/container_sandbox.rs` (integration, `CARGO_BIN_EXE_ri-sandbox`):
+  - uid→0 mapping, host dosyası izolasyonu, `/etc/shadow` görünmezliği,
+    `/work` kalıcı yazması, statik uutils varlığı.
+  - Host'ta unprivileged user namespace yoksa **SKIP** (kırılmaz).
+- `agent::tools::subprocess::tests::sandbox_flag_routes_bash_tool_through_ri_sandbox`
+  (birim): gerçek `bash` aracı akışı → `ri-sandbox` → fake-root + `/work`.
+- `container::tests::*`: image assembly idempotency, marker'lar, `sandbox_argv`
+  custom-tool yol eşlemesi.
+
+### Anti-deadlock / mimari notu
+
+`ri-sandbox`, `fork()` içeren çok iş parçacıklı süreç riskini almamak için
+ayrı bir binary: tokio altında `unshare(CLONE_NEWUSER)` zaten EINVAL verir.
+Tıpkı `--tui-acp`'deki ayrı `ri --serve` süreci gibi, "tek binary ailesi, ayrı
+süreç" deseni: `ri` (ana) ⇒ `ri-sandbox` (her sandbox'ı çalıştırır).

@@ -36,6 +36,12 @@ pub struct RiConfig {
     /// The name of the currently active agent.
     #[serde(default)]
     pub agent: Option<String>,
+    /// Route agent tool subprocesses through the rootless container sandbox
+    /// (user namespace + chroot). Linux-only; overridable via `--sandbox`.
+    ///
+    /// See docs/CONTAINER-RUNTIME-SPEC.md.
+    #[serde(default)]
+    pub sandbox: bool,
     pub thinking: Option<String>,
     #[serde(default)]
     pub thinking_by_model: HashMap<String, String>,

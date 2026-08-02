@@ -284,6 +284,9 @@ pub struct AcpContext {
     /// Optional admin token. When set, state-mutating `_ri/*` methods require
     /// a matching `token` request field (`--serve-ws-token`).
     pub admin_token: Option<Arc<str>>,
+    /// Route tool subprocesses through the rootless container sandbox when
+    /// the server was started with `--sandbox` / config `sandbox = true`.
+    pub sandbox: bool,
 }
 
 /// A single `_ri/logs` entry.
@@ -512,7 +515,7 @@ async fn prepare_turn(
         current_model: model,
         auto_compaction_enabled: true,
         manual_compaction_instructions: None,
-        executor: Arc::new(DefaultToolExecutor::with_root(session_cwd)),
+        executor: Arc::new(DefaultToolExecutor::with_root(session_cwd).sandboxed(ctx.sandbox)),
         system_prompt: Some(system_prompt),
     };
     let provider_loop = Arc::clone(&provider);
@@ -2946,6 +2949,7 @@ mod acp_e2e {
             skills: Arc::new(Vec::new()),
             logs: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             admin_token: None,
+            sandbox: false,
         })
     }
 

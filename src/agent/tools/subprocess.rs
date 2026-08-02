@@ -47,6 +47,9 @@ pub struct SubprocessCommand {
     stdin_data: Option<Vec<u8>>,
     /// When `true`, a non-zero exit code promotes the result to `is_error`.
     error_on_nonzero: bool,
+    /// When `true`, this command is routed through the rootless sandbox child
+    /// (`ri-sandbox`, user namespace + chroot). See [`crate::container`].
+    sandbox: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,14 +63,12 @@ struct CollectedOutput {
     stdout: String,
     stderr: String,
     exit_code: i32,
-    #[cfg(unix)]
     signal: Option<i32>,
 }
 
 #[derive(Debug)]
 struct ProcessOutcome {
     result: ToolResult,
-    #[cfg(unix)]
     signal: Option<i32>,
 }
 
@@ -81,7 +82,15 @@ impl SubprocessCommand {
             current_dir: None,
             stdin_data: None,
             error_on_nonzero: false,
+            sandbox: false,
         }
+    }
+
+    /// Route this command through the rootless container sandbox child.
+    /// Defaults to off; tools enable it from [`ToolCallContext::sandbox`].
+    pub fn sandboxed(mut self, on: bool) -> Self {
+        self.sandbox = on;
+        self
     }
 
     /// Append a single argument.
@@ -133,8 +142,30 @@ impl SubprocessCommand {
     /// Live output chunks are forwarded via `ctx.tx` as
     /// [`AgentEvent::ToolOutputChunk`] if a sender is present.
     pub async fn run(self, ctx: ToolCallContext) -> ToolResult {
-        let mut cmd = tokio::process::Command::new(&self.program);
-        cmd.args(&self.args)
+        // When the sandbox is enabled, re-target the command at the
+        // `ri-sandbox` child and pass the requested program through it as
+        // argv. Custom-tool host paths are mapped to their guest `/tools*`
+        // locations (the host absolute path does not exist inside the chroot).
+        let custom_tool_dirs = crate::agent::tools::custom::custom_tool_dirs();
+        let custom_tool_dir_map: Vec<(&std::path::Path, &str)> = custom_tool_dirs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.is_dir())
+            .map(|(i, d)| (d.as_path(), if i == 0 { "/tools" } else { "/tools-local" }))
+            .collect();
+        let sandbox_binds: Vec<String> = custom_tool_dir_map
+            .iter()
+            .map(|(h, g)| format!("{}>{g}", h.to_string_lossy()))
+            .collect();
+
+        let (program, args) = if self.sandbox {
+            crate::container::sandbox_argv(&self.program, &self.args, &custom_tool_dir_map)
+        } else {
+            (self.program.clone(), self.args.clone())
+        };
+
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&args)
             .stdin(if self.stdin_data.is_some() {
                 Stdio::piped()
             } else {
@@ -153,6 +184,11 @@ impl SubprocessCommand {
         for (k, v) in &self.envs {
             cmd.env(k, v);
         }
+        // Writable custom-tool binds are passed to the sandbox child through
+        // the environment (comma-separated `host>guest` pairs).
+        if !sandbox_binds.is_empty() {
+            cmd.env("RI_SANDBOX_BINDS", sandbox_binds.join(","));
+        }
 
         if let Some(ref dir) = self.current_dir {
             cmd.current_dir(dir);
@@ -161,7 +197,7 @@ impl SubprocessCommand {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult::err(format!("Failed to spawn `{}`: {e}", self.program));
+                return ToolResult::err(format!("Failed to spawn `{}`: {e}", program));
             }
         };
 
@@ -210,7 +246,6 @@ impl SubprocessCommand {
                     match level {
                         CancelLevel::ForceKill => {
                             if termination_requested != Some(RequestedTermination::Sigkill) {
-                                #[cfg(unix)]
                                 if let Some(pid) = child_pid {
                                     // SAFETY: libc::kill only sends a signal to the child PID.
                                     unsafe { libc::kill(pid, libc::SIGKILL); }
@@ -220,7 +255,6 @@ impl SubprocessCommand {
                         }
                         CancelLevel::HardAbort => {
                             if termination_requested.is_none() {
-                                #[cfg(unix)]
                                 if let Some(pid) = child_pid {
                                     // SAFETY: libc::kill only sends a signal to the child PID.
                                     unsafe { libc::kill(pid, libc::SIGTERM); }
@@ -299,7 +333,6 @@ async fn collect_output(
 
     ProcessOutcome {
         result,
-        #[cfg(unix)]
         signal: collected.signal,
     }
 }
@@ -308,7 +341,6 @@ async fn collect_output_inner(
     child: tokio::process::Child,
     ctx: &ToolCallContext,
 ) -> CollectedOutput {
-    #[cfg(unix)]
     let (out_bytes, err_bytes, exit_code, signal) = collect_unix(child, ctx).await;
 
     let stdout = apply_terminal_render(&String::from_utf8_lossy(&out_bytes))
@@ -322,7 +354,6 @@ async fn collect_output_inner(
         stdout,
         stderr,
         exit_code,
-        #[cfg(unix)]
         signal,
     }
 }
@@ -331,7 +362,6 @@ fn annotate_termination_result(
     outcome: ProcessOutcome,
     termination_requested: Option<RequestedTermination>,
 ) -> ToolResult {
-    #[cfg(unix)]
     {
         match (termination_requested, outcome.signal) {
             (Some(RequestedTermination::Sigterm), Some(libc::SIGTERM)) => {
@@ -388,7 +418,6 @@ pub(crate) async fn run_with_timeout(
 
 // ── Unix: concurrent Phase1+Phase2 drain ─────────────────────────────────────
 
-#[cfg(unix)]
 async fn collect_unix(
     mut child: tokio::process::Child,
     ctx: &ToolCallContext,
@@ -484,16 +513,11 @@ async fn collect_unix(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::*;
-    #[cfg(unix)]
     use crate::agent::types::CancelLevel;
-    #[cfg(unix)]
     use crate::app_event::AppEvent;
-    #[cfg(unix)]
     use tokio::sync::mpsc;
 
-    #[cfg(unix)]
     fn test_ctx(
         cancel_rx: tokio::sync::watch::Receiver<CancelLevel>,
         tx: Option<mpsc::UnboundedSender<AppEvent>>,
@@ -504,10 +528,10 @@ mod tests {
             cancel_rx: Some(cancel_rx),
             subagent: None,
             root: None,
+            sandbox: false,
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn hard_abort_sigterms_subprocess_and_returns_user_killed_error() {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(CancelLevel::None);
@@ -535,7 +559,6 @@ mod tests {
         assert!(result.content.as_text().contains("killed by user"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn repeated_hard_abort_emits_force_kill_hint_while_tool_hangs() {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(CancelLevel::None);
@@ -583,5 +606,73 @@ mod tests {
             saw_hint,
             "expected force-kill reminder after repeated hard abort"
         );
+    }
+
+    /// End-to-end sandbox path: with the flag on, the ordinary `bash` tool
+    /// command is re-targeted at the `ri-sandbox` child, which maps the caller
+    /// to fake-root and binds the cwd to `/work`. Requires the `ri-sandbox`
+    /// binary (build it with `cargo build --bins`); skipped otherwise.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_flag_routes_bash_tool_through_ri_sandbox() {
+        use crate::container::rootfs::assemble_image;
+
+        if !crate::container::sandbox_bin_path().is_file() {
+            eprintln!("SKIP: `ri-sandbox` not built — run `cargo build --bins`");
+            return;
+        }
+        let has_userns = std::process::Command::new("unshare")
+            .args(["-Ur", "true"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !has_userns {
+            eprintln!("SKIP: unprivileged user namespaces unavailable");
+            return;
+        }
+
+        let img = std::env::temp_dir().join(format!("ri-sbox-sub-{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("ri-sbox-sub-work-{}", std::process::id()));
+        std::fs::remove_dir_all(&img).ok();
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::create_dir_all(&work).unwrap();
+        assemble_image(&img).unwrap();
+
+        // Point the sandbox at the scratch image. Edition-2024 unsafe + the
+        // test is the only writer of this env in this process.
+        unsafe { std::env::set_var("RI_SANDBOX_IMAGE", &img) };
+
+        let ctx = ToolCallContext {
+            id: "sbx-e2e".to_string(),
+            tx: None,
+            cancel_rx: None,
+            subagent: None,
+            root: Some(work.clone()),
+            sandbox: true,
+        };
+        let result = SubprocessCommand::new("sh")
+            .arg("-c")
+            .arg("id -u && echo cwd=$(pwd) && echo done > /work/out.txt")
+            .current_dir(work.to_string_lossy())
+            .sandboxed(true)
+            .run(ctx)
+            .await;
+        unsafe { std::env::remove_var("RI_SANDBOX_IMAGE") };
+
+        let text = result.content.as_text().to_string();
+        assert!(!result.is_error, "sandboxed bash tool failed: {text}");
+        for needle in ["0", "cwd=/work"] {
+            assert!(
+                text.contains(needle),
+                "missing {needle:?} in sandboxed output: {text}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(work.join("out.txt")).expect("read sandboxed /work output"),
+            "done\n",
+            "sandboxed /work writes must persist to the host cwd"
+        );
+
+        std::fs::remove_dir_all(&img).ok();
+        std::fs::remove_dir_all(&work).ok();
     }
 }

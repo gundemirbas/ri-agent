@@ -262,6 +262,9 @@ pub struct ToolCallContext {
     /// with this cwd and relative file paths are anchored here (headless
     /// per-session cwd).
     pub root: Option<std::path::PathBuf>,
+    /// When `true`, this tool call's subprocesses run inside the rootless
+    /// sandbox instead of directly on the host (copied from the executor).
+    pub sandbox: bool,
 }
 
 #[cfg(test)]
@@ -274,6 +277,7 @@ impl ToolCallContext {
             cancel_rx: None,
             subagent: None,
             root: None,
+            sandbox: false,
         }
     }
 }
@@ -293,6 +297,8 @@ pub struct SubagentContext {
     /// Outer tool registry from which the subagent's filtered tool set is
     /// derived (excluding `invoke_subagent` itself to prevent recursion).
     pub tools: ToolRegistry,
+    /// Propagate the rootless sandbox flag into subagent tool calls.
+    pub sandbox: bool,
 }
 
 // ── Tool trait ────────────────────────────────────────────────────────────────
@@ -368,6 +374,10 @@ pub struct DefaultToolExecutor {
     /// Optional cancellation receiver for mid-tool abort checks (passed to
     /// [`ToolCallContext`]).
     pub cancel_rx: Option<tokio::sync::watch::Receiver<CancelLevel>>,
+    /// When `true`, tool subprocesses run inside the rootless container
+    /// sandbox (user namespace + chroot; see [`crate::container`]). Defaults
+    /// to off; wired by `main` from `--sandbox` / config.toml.
+    pub sandbox: bool,
     /// Subagent-launch context passed through to tools. When present, the
     /// `invoke_subagent` tool can run named subagents (see [`SubagentContext`]).
     pub subagent: Option<SubagentContext>,
@@ -383,6 +393,7 @@ impl DefaultToolExecutor {
             cancel_rx: None,
             subagent: None,
             root: None,
+            sandbox: false,
         }
     }
 
@@ -393,6 +404,12 @@ impl DefaultToolExecutor {
             root: Some(root),
             ..Self::new()
         }
+    }
+
+    /// Enable/disable the rootless container sandbox for tool subprocesses.
+    pub fn sandboxed(mut self, on: bool) -> Self {
+        self.sandbox = on;
+        self
     }
 }
 
@@ -425,8 +442,10 @@ impl ToolExecutor for DefaultToolExecutor {
                             skills: s.skills.clone(),
                             cwd: s.cwd.clone(),
                             tools: tools.clone(),
+                            sandbox: s.sandbox,
                         }),
                         root: self.root.clone(),
+                        sandbox: self.sandbox,
                     };
                     let r = tool.run(args.clone(), ctx).await;
                     let cmd_summary = args.get("command").and_then(|v| v.as_str());

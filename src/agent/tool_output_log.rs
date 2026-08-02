@@ -84,7 +84,6 @@ impl Drop for ToolOutputLog {
 
 fn resolve_dir(session_id: &str) -> PathBuf {
     // Prefer XDG_RUNTIME_DIR on Linux when it is set to an absolute path.
-    #[cfg(target_os = "linux")]
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         let base = PathBuf::from(runtime);
         if base.is_absolute() {

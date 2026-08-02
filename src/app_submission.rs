@@ -91,6 +91,7 @@ impl App {
             executor: std::sync::Arc::new({
                 let mut ex = crate::agent::DefaultToolExecutor::new();
                 ex.cancel_rx = Some(cancel_rx.clone());
+                ex.sandbox = self.sandbox;
                 // Wire subagent launching: the `invoke_subagent` tool can then
                 // run named subagents against this provider and tool universe.
                 ex.subagent = Some(crate::agent::types::SubagentContext {
@@ -98,6 +99,7 @@ impl App {
                     agents: std::sync::Arc::new(self.agents.clone()),
                     skills: std::sync::Arc::new(self.loaded_skills.clone()),
                     cwd: self.session.current_cwd.clone(),
+                    sandbox: self.sandbox,
                     tools: subagent_tools,
                 });
                 ex

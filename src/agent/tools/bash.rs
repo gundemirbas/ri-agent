@@ -63,7 +63,10 @@ impl Tool for BashTool {
                 Err(e) => return *e,
             };
 
-            let mut command_builder = SubprocessCommand::new("sh").arg("-c").arg(command);
+            let mut command_builder = SubprocessCommand::new("sh")
+                .arg("-c")
+                .arg(command)
+                .sandboxed(ctx.sandbox);
             if let Some(dir) = &ctx.root {
                 command_builder = command_builder.current_dir(dir.to_string_lossy());
             }
@@ -336,7 +339,6 @@ mod tests {
 
     /// Verify that commands run by BashTool have no controlling terminal:
     /// stdout (fd 1) must not be a TTY, and /dev/tty must not be accessible.
-    #[cfg(unix)]
     #[tokio::test]
     async fn bash_no_controlling_terminal() {
         let tool = BashTool;

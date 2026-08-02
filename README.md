@@ -91,9 +91,45 @@ cargo install --path .
 | | `--serve-ws-token <TOKEN>` | Require this admin token on mutating `_ri/*` methods |
 | | `--serve-ws-cert <CERT>` / `--serve-ws-key <KEY>` | Serve `--serve-ws` over TLS (`wss://`) |
 | | `--tui-acp` | Keep the interactive TUI but run the agent as a detached child `ri --serve` over ACP (decoupled UI ↔ agent) |
+| | `--sandbox` | Route agent tool subprocesses through the rootless container sandbox (`ri-sandbox`, user namespace + chroot). Linux-only; also settable via `sandbox = true` in config.toml |
 | | `--print-dirs` | Print the file-system paths ri uses and exit |
 | `-h` | `--help` | Print help |
 | `-V` | `--version` | Print version |
+
+## Rootless tool sandbox (`--sandbox`)
+
+Agent tool subprocesses (`bash`, `exec`, custom tools) normally run directly on
+the host. With `--sandbox` (or `sandbox = true` in config.toml) each one runs
+inside a **rootless container** built from raw Linux syscalls — no OCI, no
+podman/docker, no root:
+
+- `ri-sandbox` (a second bin target, spawned per tool call) creates a
+  **user namespace** (`unshare(CLONE_NEWUSER|CLONE_NEWNS)`), maps your uid to
+  0, binds a scrubbed view into a flat rootfs directory and `chroot`s.
+- Isolation: the host's `$HOME`, `/root`, `/etc` secrets and other projects are
+  invisible. Only the explicit binds are visible/writable: `/work` (the tool
+  cwd), `/tools` (custom tools), `/tmp` (scratch), non-secret `/etc/*` for
+  DNS/users, and the dynamic loader dirs for the shell.
+- Network stays host-shared (internet works: crates.io, APIs, curl).
+- File tools come from a **static musl uutils coreutils** when provisioned
+  (`just sandbox-provision` / `scripts/fetch-uutils-coreutils.sh`); otherwise
+  the host's `/bin`, `/usr` are bind-mounted read-only as a fallback, so the
+  sandbox works everywhere. Custom tools are static-musl binaries and run
+  inside with zero dependencies.
+- Linux-only; user namespaces must be enabled in the kernel.
+
+See `docs/CONTAINER-RUNTIME-SPEC.md` for the full design spec and its
+implementation-status appendix. Tests: `tests/container_sandbox.rs` (uid
+mapping, host isolation, `/work` persistence, static coreutils) plus an
+in-process `bash`-tool round-trip; they skip gracefully when user namespaces
+are unavailable.
+
+```sh
+scripts/fetch-uutils-coreutils.sh    # optional: static file tools
+cargo build --bins                   # produces `ri` + `ri-sandbox`
+ri --sandbox                         # TUI with sandboxed tools
+ri --serve --sandbox                 # headless ACP agent, same sandbox
+```
 
 ## Keybindings
 

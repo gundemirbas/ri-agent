@@ -47,6 +47,7 @@ impl Tool for CustomTool {
             SubprocessCommand::new(self.path.to_string_lossy())
                 .stdin_data(args_json.into_bytes())
                 .error_on_nonzero_exit()
+                .sandboxed(ctx.sandbox)
                 .run(ctx)
                 .await
         })

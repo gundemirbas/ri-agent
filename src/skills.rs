@@ -624,7 +624,6 @@ description: guides most non-trivial coding work.
         assert!(skills.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn load_skills_handles_symlink_loops() {
         use std::io::Write;

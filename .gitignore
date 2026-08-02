@@ -30,3 +30,7 @@ ri-session-*.html
 # Todo / scratch files
 .todo
 .worktrees/
+
+# Sandbox: provisioned static uutils coreutils (fetched by scripts/fetch-uutils-coreutils.sh)
+rootfs/usr/bin/coreutils
+rootfs/usr/bin/.coreutils-source

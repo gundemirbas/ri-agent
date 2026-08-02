@@ -100,7 +100,9 @@ impl Tool for ExecTool {
                 Err(e) => return *e,
             };
 
-            let mut cmd = SubprocessCommand::new(program).args(argv);
+            let mut cmd = SubprocessCommand::new(program)
+                .args(argv)
+                .sandboxed(ctx.sandbox);
             for (k, v) in env {
                 cmd = cmd.env(k, v);
             }

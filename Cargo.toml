@@ -16,6 +16,13 @@ exclude = [".github/", "docs/", "AGENTS.md"]
 name = "ri"
 path = "src/main.rs"
 
+# The sandbox child: a single-purpose, pre-tokio, single-threaded executable
+# that performs the rootless user-namespace + chroot pipeline for sandboxed
+# tool calls (see docs/CONTAINER-RUNTIME-SPEC.md). Main `ri` spawns it.
+[[bin]]
+name = "ri-sandbox"
+path = "src/container/bin_sandbox.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4", features = ["derive"] }

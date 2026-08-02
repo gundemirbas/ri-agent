@@ -33,6 +33,7 @@ mod commands;
 mod completion;
 mod completion_state;
 mod config;
+mod container;
 mod context_window;
 mod debug_log;
 mod dirs;
@@ -141,6 +142,12 @@ struct Cli {
     /// in-process agent loop.
     #[arg(long)]
     tui_acp: bool,
+
+    /// Run agent tool subprocesses inside the rootless container sandbox
+    /// (user namespace + chroot; see docs/CONTAINER-RUNTIME-SPEC.md).
+    /// Linux-only. Default is off: tools run directly on the host.
+    #[arg(long)]
+    sandbox: bool,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -201,6 +208,21 @@ async fn main() -> io::Result<()> {
     // Built-in hosted providers are always available from the static catalog.
     // Config only stores user-configured instances and overrides.
 
+    // ── Sandbox: route tool subprocesses through the rootless container ────
+    // `--sandbox` beats config.toml; initializing the image up front fails
+    // fast (and loudly on non-Linux) instead of breaking mid-session.
+    let sandbox = cli.sandbox || config.sandbox;
+    if sandbox {
+        container::ensure_initialized().map_err(|e| {
+            eprintln!(
+                "error: could not prepare the sandbox image: {e}\n\
+                       (the rootless sandbox is Linux-only and needs user\n\
+                       namespaces enabled in the kernel)"
+            );
+            io::Error::other("sandbox initialization failed")
+        })?;
+    }
+
     // ── Non-interactive (--print / -p) mode ───────────────────────────────────
     if let Some(words) = cli.print {
         let prompt = words.join(" ");
@@ -215,6 +237,7 @@ async fn main() -> io::Result<()> {
             provider_override,
             cli.model.as_deref(),
             &config,
+            sandbox,
         )
         .await;
     }
@@ -293,6 +316,7 @@ async fn main() -> io::Result<()> {
             skills: Arc::new(skills::load_skills()),
             logs: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             admin_token: cli.serve_ws_token.as_deref().map(Arc::from),
+            sandbox,
         };
         let ctx = Arc::new(context);
 
@@ -357,12 +381,15 @@ async fn main() -> io::Result<()> {
             current_model: initial_model.clone(),
             auto_compaction_enabled: true,
             manual_compaction_instructions: None,
-            executor: std::sync::Arc::new(crate::agent::DefaultToolExecutor::new()),
+            executor: std::sync::Arc::new(
+                crate::agent::DefaultToolExecutor::new().sandboxed(sandbox),
+            ),
             system_prompt: None,
         },
         config.display.clone(),
     );
     app.theme = theme;
+    app.sandbox = sandbox;
 
     let app_event_tx = app.app_event_tx();
 
@@ -375,6 +402,15 @@ async fn main() -> io::Result<()> {
             "--model".to_string(),
             initial_model.clone(),
         ];
+        let child_args = {
+            let mut v = child_args;
+            // Keep the detached ACP agent inside the same sandbox when the
+            // parent runs with it enabled.
+            if sandbox {
+                v.push("--sandbox".to_string());
+            }
+            v
+        };
         let controls = acp_tui::spawn(child_args, cwd.clone(), app_event_tx.clone())
             .await
             .map_err(|e| {

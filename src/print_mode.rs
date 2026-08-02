@@ -37,6 +37,7 @@ pub(crate) async fn run_print_mode(
     provider_override: &str,
     model_override: Option<&str>,
     config: &crate::config::RiConfig,
+    sandbox: bool,
 ) -> io::Result<()> {
     let resolved_instance = with_resolved_model(
         model_override,
@@ -80,6 +81,7 @@ pub(crate) async fn run_print_mode(
         manual_compaction_instructions: None,
         executor: std::sync::Arc::new({
             let mut ex = crate::agent::DefaultToolExecutor::new();
+            ex.sandbox = sandbox;
             // Wire subagent launching in headless mode too: subagents can
             // delegate against the same provider/tool universe.
             ex.subagent = Some(crate::agent::types::SubagentContext {
@@ -88,6 +90,7 @@ pub(crate) async fn run_print_mode(
                 skills: std::sync::Arc::new((*loaded_skills).clone()),
                 cwd: cwd.clone(),
                 tools: tools.clone(),
+                sandbox,
             });
             ex
         }),

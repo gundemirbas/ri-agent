@@ -4,6 +4,25 @@
 
 ### Added
 
+- **Rootless tool sandbox (`--sandbox`, spec §15)**: agent tool subprocesses
+  (`bash`, `exec`, custom tools) can run inside a rootless user-namespace +
+  chroot container built entirely in Rust — no OCI/podman/docker, no root.
+  A new `ri-sandbox` bin target performs `unshare(CLONE_NEWUSER|CLONE_NEWNS)`,
+  maps the invoking uid → 0, binds a scrubbed view into a lazily assembled
+  flat rootfs (`~/.cache/ri/sandbox/rootfs` or `$RI_SANDBOX_IMAGE`) with
+  writable `/work` (tool cwd), `/tools` (custom tools), `/tmp`, then `chroot`s
+  and `execvp`s. Host `$HOME`, `/root`, `/etc` secrets and other projects are
+  invisible; the network namespace stays shared (internet available). File
+  tools come from a **static musl uutils coreutils** when provisioned
+  (`scripts/fetch-uutils-coreutils.sh` / `just sandbox-provision`), otherwise
+  host `/bin`,`/usr` are bound read-only as a fallback. Wired through an
+  explicit `sandbox` flag on the tool executor → `ToolCallContext` →
+  `SubprocessCommand` (no global state), honoring `--tui-acp`, `--serve`,
+  `--print`, and in-process TUI modes. Linux-only. Tests:
+  `tests/container_sandbox.rs` (uid mapping, host isolation, `/etc/shadow`
+  invisibility, `/work` persistence, static coreutils; skips when user
+  namespaces are unavailable) plus an in-process `bash`-tool round-trip and
+  image-assembly unit tests.
 - **Protocol v2 serving (T2-4, complete)**: `unstable_protocol_v2` is enabled
   and every connection's `initialize` is routed through an
   `AgentProtocolRouter`. Protocol v1 keeps the full surface; protocol v2

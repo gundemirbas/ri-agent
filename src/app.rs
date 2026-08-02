@@ -142,6 +142,12 @@ pub struct App {
     // ── Display thresholds ────────────────────────────────────────────────────
     pub(crate) display: DisplayConfig,
 
+    // ── Rootless sandbox for tool subprocesses ───────────────────────────────
+    /// When `true`, the in-process agent routes tool subprocesses through the
+    /// `ri-sandbox` container child (user namespace + chroot). Wired by `main`
+    /// from `--sandbox` / config.toml `sandbox = true`.
+    pub(crate) sandbox: bool,
+
     // ── Mouse selection ───────────────────────────────────────────────────────
     pub(crate) mouse_select: MouseSelectState,
 }
@@ -190,6 +196,7 @@ impl App {
             theme: Theme::default(),
             display,
             mouse_select: MouseSelectState::new(),
+            sandbox: false,
         }
     }
 
@@ -678,6 +685,10 @@ impl App {
             cancel_rx: None,
             subagent: None,
             root: None,
+            // Interactive slash-mode shell commands stay on the host: they are
+            // user-initiated convenience commands (git, dnf, …) that would be
+            // surprising inside the sandbox.
+            sandbox: false,
         };
 
         self.runtime.pending_shell_handle = Some(tokio::spawn(async move {
