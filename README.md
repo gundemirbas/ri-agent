@@ -90,6 +90,7 @@ cargo install --path .
 | | `--serve-ws <ADDR>` | Run as a headless ACP server over HTTP + WebSocket (`ws://ADDR/acp`) instead of the TUI |
 | | `--serve-ws-token <TOKEN>` | Require this admin token on mutating `_ri/*` methods |
 | | `--serve-ws-cert <CERT>` / `--serve-ws-key <KEY>` | Serve `--serve-ws` over TLS (`wss://`) |
+| | `--tui-acp` | Keep the interactive TUI but run the agent as a detached child `ri --serve` over ACP (decoupled UI ↔ agent) |
 | | `--print-dirs` | Print the file-system paths ri uses and exit |
 | `-h` | `--help` | Print help |
 | `-V` | `--version` | Print version |
@@ -245,3 +246,21 @@ Implemented surface:
 
 Current limitations: one prompt at a time per session. Requires Rust 1.88
 (ACP dependency baseline).
+
+## Decoupled TUI (`--tui-acp`)
+
+`ri --tui-acp` keeps the familiar ratatui interface but stops owning the
+agent loop: it spawns a detached child `ri --serve` (same provider/model) and
+speaks ACP over stdio, so the UI and the agent are two separate processes
+joined only by the protocol. Submitted messages become `session/prompt` calls,
+`session/update` notifications are translated back into the TUI's event
+vocabulary, tool-permission asks surface through the TUI ask dialog
+(`session/request_permission`), and `Ctrl-C` maps to `session/cancel`.
+
+```sh
+ri --tui-acp --provider test   # interactive TUI driving a detached --serve
+```
+
+Limitations: one prompt at a time, no steering, and provider/model switches
+inside the TUI are not pushed to the already-spawned child (restart to
+apply). The plain in-process TUI remains the default.

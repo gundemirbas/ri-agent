@@ -131,6 +131,9 @@ pub struct App {
     // ── Runtime/task state ───────────────────────────────────────────────────
     pub(crate) runtime: AgentRuntime,
 
+    // ── Agent execution backend (Local vs ACP) ───────────────────────────────
+    pub(crate) backend: AgentBackend,
+
     // ── Step-back state ──────────────────────────────────────────────────────
     pub(crate) step_back: StepBackState,
 
@@ -145,6 +148,13 @@ pub struct App {
 
 // Convenience alias used throughout this module.
 pub(crate) type DynProvider = Arc<dyn LlmProvider + Send + Sync + 'static>;
+
+/// How the agent turn is executed: in-process (`Local`, the default) or over
+/// the Agent Client Protocol by a detached `ri --serve` child (`--tui-acp`).
+pub(crate) enum AgentBackend {
+    Local,
+    Acp(crate::acp_tui::AcpTuiControls),
+}
 
 impl App {
     pub fn new(
@@ -174,6 +184,7 @@ impl App {
             cache_miss_warning: false,
             session: Tracked::new(SessionManager::new()),
             ask_user: AskUserState::new(),
+            backend: AgentBackend::Local,
             runtime: AgentRuntime::new(),
             step_back: StepBackState::default(),
             theme: Theme::default(),

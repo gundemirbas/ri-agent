@@ -13,6 +13,7 @@ use std::{
 };
 
 mod acp;
+mod acp_tui;
 mod agent;
 mod agent_runtime;
 mod agents;
@@ -134,6 +135,12 @@ struct Cli {
     /// PEM private key file (PKCS#8 or PKCS#1) used with `--serve-ws-cert`.
     #[arg(long, value_name = "KEY")]
     serve_ws_key: Option<std::path::PathBuf>,
+
+    /// Run the interactive TUI but drive a detached agent over ACP by
+    /// spawning a child `ri --serve` (decoupled UI ↔ agent). Default is the
+    /// in-process agent loop.
+    #[arg(long)]
+    tui_acp: bool,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -321,6 +328,7 @@ async fn main() -> io::Result<()> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".to_string());
 
+    let acp_provider_id = initial_instance.id.clone();
     let mut app = App::new(
         initial_instance,
         &initial_model,
@@ -341,6 +349,23 @@ async fn main() -> io::Result<()> {
     app.theme = theme;
 
     let app_event_tx = app.app_event_tx();
+
+    // ── Decoupled mode: drive a detached agent over ACP (`--tui-acp`) ──
+    if cli.tui_acp {
+        let child_args = vec![
+            "--provider".to_string(),
+            acp_provider_id.clone(),
+            "--model".to_string(),
+            initial_model.clone(),
+        ];
+        let controls = acp_tui::spawn(child_args, cwd.clone(), app_event_tx.clone())
+            .await
+            .map_err(|e| {
+                io::Error::other(format!("--tui-acp failed to start the ACP agent: {e}"))
+            })?;
+        app.backend = crate::app::AgentBackend::Acp(controls);
+    }
+
     let custom_tools = load_custom_tools(&custom_tool_dirs());
     let loaded_skills = Arc::new(skills::load_skills());
     let tools = register_builtin_tools(

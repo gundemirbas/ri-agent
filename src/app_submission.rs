@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::agent::types::CancelLevel;
 use crate::agent::{AgentLoopConfig, ToolOutputLog, run_agent_loop};
-use crate::app::{App, DynProvider, StreamingStatus};
+use crate::app::{AgentBackend, App, DynProvider, StreamingStatus};
 use crate::at_file::{AtFileResult, parse_at_tokens, resolve_at_tokens};
 use crate::live_turn::LiveToolResult;
 use crate::llm::{Message, Role};
@@ -16,6 +16,28 @@ impl App {
     /// Returns `false` when the loop could not be started (no session state).
     /// Callers must stop the turn / surface a notice in that case.
     fn start_agent_task(&mut self, provider: &DynProvider) -> bool {
+        // ── ACP backend: forward the submitted message to the detached agent ──
+        if let AgentBackend::Acp(controls) = &self.backend {
+            let Some(session_state) = self.session.session_state.as_ref() else {
+                log::debug!("start_agent_task (acp): no session_state; refusing to launch");
+                return false;
+            };
+            // The just-submitted user message is the last UserMessage.
+            let prompt_text = session_state.events().iter().rev().find_map(|e| match e {
+                SessionEvent::UserMessage { content, .. } => Some(content.clone()),
+                _ => None,
+            });
+            // Reuse the App cancel channel: Esc/Ctrl-C map to session/cancel in
+            // the ACP client. Steering and local agent_task are unsupported.
+            self.runtime.cancel_tx = Some(controls.cancel_tx.clone());
+            self.runtime.steering_tx = None;
+            self.runtime.agent_task = None;
+            if let Some(text) = prompt_text {
+                let _ = controls.prompt_tx.send(text);
+            }
+            return true;
+        }
+
         // Ensure the session ID is assigned before creating the log so the
         // output directory uses the real session key, not the "init" placeholder.
         let session_id = self.ensure_session_id();

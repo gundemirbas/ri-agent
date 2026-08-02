@@ -41,6 +41,14 @@
   `--serve-ws` can run TLS via `--serve-ws-cert`/`--serve-ws-key` (`wss://`),
   and the WS server multiplexes many client connections while stdio serves
   one.
+- **Decoupled TUI (`--tui-acp`)**: the ratatui UI can now be driven by a
+  detached `ri --serve` child over ACP instead of the in-process loop. A new
+  ACP client bridge (`src/acp_tui.rs`) translates `session/update`
+  notifications back into the TUI's `AgentEvent` vocabulary, routes
+  `session/request_permission` through the TUI ask dialog, and maps Ctrl-C to
+  `session/cancel`. Verified over a real pseudo-terminal: text streams,
+  cancel, multi-turn, and a live detached child process. The in-process TUI
+  remains the default.
 
 ### Fixed
 
