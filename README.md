@@ -86,6 +86,7 @@ cargo install --path .
 | `-P` | `--provider <PROVIDER>` | Configured provider instance id to use |
 | `-m` | `--model <MODEL>` | Model name to use (e.g. gpt-4o) |
 | `-p` | `--print <PROMPT>...` | Run in non-interactive mode: send PROMPT, stream the response to stdout, and exit. Accepts multiple words without shell quoting |
+| | `--serve` | Run as a headless ACP (Agent Client Protocol) server on stdio instead of the TUI |
 | | `--print-dirs` | Print the file-system paths ri uses and exit |
 | `-h` | `--help` | Print help |
 | `-V` | `--version` | Print version |
@@ -200,3 +201,23 @@ session for the current folder, `/resume` for the full picker, and `/export`
 to write a self-contained HTML transcript. Long sessions are automatically
 compacted against the active model's context window; `/compact` forces it
 manually, optionally with custom summary instructions.
+
+## Headless mode (Agent Client Protocol)
+
+`ri --serve` runs the same agent loop without the TUI, speaking the
+vendor-neutral [Agent Client Protocol](https://agentclientprotocol.com/) —
+JSON-RPC 2.0 over stdio, one message per newline — so any ACP-capable client
+(editors, desktop/web UIs, `acpx`, …) can drive ri as a subprocess:
+
+```sh
+ri --serve --provider test   # or any configured provider
+```
+
+Implemented surface: `initialize` (protocol v1, image prompts accepted),
+`session/new`, `session/prompt` (streams `agent_message_chunk`,
+`agent_thought_chunk`, `tool_call`/`tool_call_update`, `usage_update`), and
+`session/cancel` (maps to ri's hard abort).
+
+Current limitations: one prompt at a time per session; auto-compaction is
+disabled; `ask_user`/`request_permission` and session load/resume are not yet
+wired. Requires Rust 1.88 (ATC dependency baseline).

@@ -12,6 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+mod acp;
 mod agent;
 mod agent_runtime;
 mod agents;
@@ -107,6 +108,12 @@ struct Cli {
     /// Path to a theme.toml file. Overrides the `theme` key in config.toml.
     #[arg(long, value_name = "PATH")]
     theme: Option<std::path::PathBuf>,
+
+    /// Run as a headless ACP (Agent Client Protocol) server on stdio instead
+    /// of launching the TUI. Drives the same agent loop behind the standard
+    /// JSON-RPC surface so external ACP clients can connect.
+    #[arg(long)]
+    serve: bool,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -198,6 +205,38 @@ async fn main() -> io::Result<()> {
     let initial_model = initial_instance.effective_model().to_string();
     let initial_thinking =
         provider_setup::resolve_thinking_level_for_model(&config, &initial_model);
+
+    // ── Headless ACP server mode ──────────────────────────────────────────
+    // No TUI, no terminal: build the provider and serve the agent loop over
+    // ACP on stdio. The SDK's Stdio transport uses blocking-thread + async-io
+    // facilities, so the connection runs on a dedicated OS thread; ri's tokio
+    // runtime is reached through a captured handle.
+    if cli.serve {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string());
+        let provider =
+            match build_provider_for_instance(&initial_instance, initial_thinking, &config) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: provider unavailable in --serve mode: {e}");
+                    return Err(io::Error::other(e.to_string()));
+                }
+            };
+        let context =
+            acp::build_context(provider, &initial_model, std::path::Path::new(&cwd)).await;
+        let ctx = Arc::new(context);
+        let handle = tokio::runtime::Handle::current();
+        let server = std::thread::spawn(move || {
+            futures_lite::future::block_on(acp::run_acp_server(ctx, handle))
+        });
+        match server.join() {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => return Err(io::Error::other(e.to_string())),
+            Err(_) => return Err(io::Error::other("ACP server thread panicked")),
+        }
+    }
+
     let window_folder = std::env::current_dir()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))

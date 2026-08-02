@@ -4,6 +4,16 @@
 
 ### Added
 
+- **ACP headless server**: `ri --serve` exposes the agent loop over the
+  vendor-neutral Agent Client Protocol (JSON-RPC 2.0 over stdio): `initialize`
+  (protocol v1, image prompts), `session/new`, `session/prompt` (streams
+  `agent_message_chunk` / `agent_thought_chunk` / `tool_call` (±update) /
+  `usage_update`), and `session/cancel`. The existing agent loop is reused
+  unchanged; the ACP connection runs on a dedicated thread. Now requires
+  Rust 1.88 (ACP dependency baseline).
+
+### Fixed
+
 - **Subagents (completed)**: `mode: subagent` agent profiles can now be invoked
   by the orchestrator through the new `invoke_subagent` tool. Each subagent runs
   with its own system prompt, tool/skill filters (with `invoke_subagent` stripped

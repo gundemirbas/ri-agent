@@ -431,10 +431,10 @@ mod tests {
         // Live output was streamed under the outer tool id (stub tool + text).
         let mut saw_chunk = false;
         while let Ok(ev) = rx.try_recv() {
-            if let AppEvent::Agent(AgentEvent::ToolOutputChunk { id, .. }) = ev {
-                if id == "outer_1" {
-                    saw_chunk = true;
-                }
+            if let AppEvent::Agent(AgentEvent::ToolOutputChunk { id, .. }) = ev
+                && id == "outer_1"
+            {
+                saw_chunk = true;
             }
         }
         assert!(saw_chunk, "expected live ToolOutputChunk under outer_1");

@@ -2,7 +2,8 @@
 name = "ri-agent"
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88: required by agent-client-protocol / serde_with (ACP support).
+rust-version = "1.88"
 license = "AGPL-3.0-only"
 description = "A focused AI agent for the terminal"
 repository = "https://github.com/gundemirbas/ri-agent"
@@ -49,6 +50,8 @@ jawohl = "0.1.0"
 csscolorparser = "0.8.3"
 libc = "0.2"
 rig-core = { version = "0.41", default-features = false, features = ["reqwest", "rustls"] }
+agent-client-protocol = "2"
+futures-lite = "2"
 
 [dev-dependencies]
 tempfile = "3"
