@@ -24,6 +24,12 @@
   are registered per prompt so `ask_user` routes through the same channel the
   loop reads; the sessions data dir and cache dir are excluded from the
   headless file tracker.
+- **ACP session persistence**: each completed prompt is written to
+  `~/.local/share/ri/sessions/acp/<id>.json` (atomically via temp+rename), so
+  `session/load` can resume a session from a previous run: `_ri/list_sessions`
+  lists persisted sessions (newest first), `session/load` replays the restored
+  history and registers it in memory, and the next `session/prompt` continues
+  the multi-turn conversation from that history across process restarts.
 
 ### Fixed
 

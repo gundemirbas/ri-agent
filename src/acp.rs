@@ -8,7 +8,9 @@
 //! - `initialize` — protocol v1, capability negotiation (image prompts,
 //!   in-memory `session/load`)
 //! - `session/new` — in-memory session (history, cancel channel, cwd)
-//! - `session/load` — replays a known in-memory session's history as updates
+//! - `session/load` — replays a known session's history as updates; sessions
+//!   are persisted to disk (`~/.local/share/ri/sessions/acp/<id>.json`) after
+//!   each prompt, so they can be resumed by a later process
 //! - `session/prompt` — streams `agent_message_chunk`, `agent_thought_chunk`,
 //!   `tool_call`/`tool_call_update` (with live tool output forwarded as
 //!   in-progress `tool_call_update` chunks), `usage_update`, then `end_turn`
@@ -16,16 +18,18 @@
 //! - `ask_user` → `session/request_permission` (multiple-choice mapping;
 //!   freeform-only asks surface a single "Continue" option)
 //! - Custom `_ri/*` methods: `_ri/get_state`, `_ri/set_model`,
-//!   `_ri/set_thinking` (provider is rebuilt on change)
+//!   `_ri/set_thinking` (provider is rebuilt on change),
+//!   `_ri/list_sessions` (persisted sessions, newest first)
 //!
 //! Limitations (deliberate, documented): one prompt at a time per session;
-//! auto-compaction disabled (follow-up); `session/load` replays only
-//! in-memory sessions (no disk persistence); tool cwd is the current process
+//! auto-compaction disabled (follow-up); tool cwd is the current process
 //! directory (per-session cwd is used for the system prompt). The agent loop
 //! itself is reused unchanged.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::{fs, path::Path};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
@@ -97,6 +101,24 @@ struct RiSetThinkingResponse {
     ok: bool,
     error: Option<String>,
     level: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_ri/list_sessions", response = RiListSessionsResponse)]
+struct RiListSessionsRequest;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RiListSessionsResponse {
+    sessions: Vec<RiSessionMeta>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RiSessionMeta {
+    id: String,
+    cwd: String,
+    updated: u64,
 }
 
 // ── Context ───────────────────────────────────────────────────────────────────
@@ -199,51 +221,50 @@ fn build_agent(
             },
             on_receive_request!(),
         )
-        // ── session/load (in-memory replay) ────────────────────────────────
+        // ── session/load (in-memory or disk resume) ───────────────────────
         .on_receive_request(
             async move |req: LoadSessionRequest, responder, connection| {
-                let (running, events) = {
+                // Prefer a live in-memory session; fall back to a persisted
+                // session from a previous run (disk resume).
+                let in_memory = {
                     let map = s_load.lock().unwrap();
-                    let Some(s) = map.get(&req.session_id) else {
+                    map.get(&req.session_id)
+                        .map(|s| (s.running, s.events.clone(), s.cwd.clone()))
+                };
+                let (events, _cwd) = match in_memory {
+                    Some((true, _, _)) => {
                         responder
                             .respond_with_error(
                                 agent_client_protocol::Error::invalid_params()
-                                    .data("unknown session"),
+                                    .data("session is busy; cannot load while a prompt runs"),
                             )
                             .ok();
                         return Ok(());
-                    };
-                    (s.running, s.events.clone())
-                };
-                if running {
-                    responder
-                        .respond_with_error(
-                            agent_client_protocol::Error::invalid_params()
-                                .data("session is busy; cannot load while a prompt runs"),
-                        )
-                        .ok();
-                    return Ok(());
-                }
-                for ev in &events {
-                    match ev {
-                        SessionEvent::UserMessage { content, .. } => send_update!(
-                            connection,
-                            req.session_id,
-                            SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::Text(
-                                TextContent::new(content.clone()),
-                            )))
-                        ),
-                        SessionEvent::AssistantMessage { content, .. } => send_update!(
-                            connection,
-                            req.session_id,
-                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                ContentBlock::Text(TextContent::new(content.clone()),)
-                            ))
-                        ),
-                        _ => {}
                     }
+                    Some((false, events, cwd)) => (events, cwd),
+                    None => {
+                        let Some(persisted) = read_persisted_session(&req.session_id) else {
+                            responder
+                                .respond_with_error(
+                                    agent_client_protocol::Error::invalid_params()
+                                        .data("unknown session"),
+                                )
+                                .ok();
+                            return Ok(());
+                        };
+                        // Register in memory so subsequent prompts resume from
+                        // the restored history.
+                        let mut map = s_load.lock().unwrap();
+                        let slot = map
+                            .entry(req.session_id.clone())
+                            .or_insert_with(|| AcpSession::new(persisted.cwd.clone()));
+                        slot.events = persisted.events.clone();
+                        (persisted.events.clone(), persisted.cwd)
+                    }
+                };
+                for update in session_replay_updates(&events) {
+                    send_update!(connection, req.session_id, update);
                 }
-                let _ = req.cwd;
                 responder.respond(LoadSessionResponse::new())
             },
             on_receive_request!(),
@@ -514,6 +535,17 @@ fn build_agent(
                 }
                 let _ = join.await;
 
+                // Persist the committed history + cwd so the session can be
+                // resumed from disk by a later process (session/load).
+                {
+                    let map = s_prompt.lock().unwrap();
+                    if let Some(s) = map.get(&session_id)
+                        && !s.events.is_empty()
+                    {
+                        persist_session(&session_id, &s.events, &s.cwd);
+                    }
+                }
+
                 match error {
                     Some(msg) => responder.respond_with_error(
                         agent_client_protocol::Error::internal_error().data(msg),
@@ -552,6 +584,21 @@ fn build_agent(
                         streaming_sessions: streaming,
                     })
                 }
+            },
+            on_receive_request!(),
+        )
+        // ── _ri/list_sessions (persisted, newest first) ──────────────────────
+        .on_receive_request(
+            async move |_req: RiListSessionsRequest, responder, _connection| {
+                let sessions = persisted_session_list()
+                    .into_iter()
+                    .map(|p| RiSessionMeta {
+                        id: p.id,
+                        cwd: p.cwd.to_string_lossy().into_owned(),
+                        updated: p.updated,
+                    })
+                    .collect();
+                responder.respond(RiListSessionsResponse { sessions })
             },
             on_receive_request!(),
         )
@@ -648,6 +695,28 @@ pub async fn run_acp_ws(ctx: Arc<AcpContext>, addr: std::net::SocketAddr) -> any
 }
 
 // ── Mirroring helpers ─────────────────────────────────────────────────────────
+
+/// Turn a session's committed history into ACP update notifications that a
+/// client can replay on `session/load`.
+fn session_replay_updates(events: &[SessionEvent]) -> Vec<SessionUpdate> {
+    let mut updates = Vec::new();
+    for ev in events {
+        match ev {
+            SessionEvent::UserMessage { content, .. } => {
+                updates.push(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(content.clone())),
+                )))
+            }
+            SessionEvent::AssistantMessage { content, .. } => {
+                updates.push(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(content.clone())),
+                )))
+            }
+            _ => {}
+        }
+    }
+    updates
+}
 
 /// Build ACP permission options for an `ask_user` request. Freeform-only asks
 /// (no options) get a single "Continue" option so the headless client always
@@ -811,6 +880,93 @@ fn resource_uri(r: &agent_client_protocol::schema::v1::EmbeddedResourceResource)
         }
         _ => String::new(),
     }
+}
+
+// ── Persistence ───────────────────────────────────────────────────────────────
+
+/// On-disk shape of an ACP session (events + cwd), written after each prompt
+/// so a later process can resume the conversation via `session/load`.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedSession {
+    id: String,
+    cwd: PathBuf,
+    updated: u64,
+    events: Vec<SessionEvent>,
+}
+
+/// Namespaced sessions dir, separate from the TUI's `sessions/<cwd>/` store.
+fn acp_sessions_dir() -> Option<PathBuf> {
+    crate::dirs::PROJECT_DIRS
+        .as_ref()
+        .map(|d| d.data_dir().join("sessions").join("acp"))
+}
+
+/// Atomically write the session's committed history + cwd to disk.
+fn persist_session(id: &SessionId, events: &[SessionEvent], cwd: &Path) {
+    let Some(dir) = acp_sessions_dir() else {
+        return;
+    };
+    persist_session_in(&dir, id, events, cwd);
+}
+
+fn persist_session_in(dir: &Path, id: &SessionId, events: &[SessionEvent], cwd: &Path) {
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let payload = PersistedSession {
+        id: id.to_string(),
+        cwd: cwd.to_path_buf(),
+        updated: now_ts(),
+        events: events.to_vec(),
+    };
+    let Ok(json) = serde_json::to_string_pretty(&payload) else {
+        return;
+    };
+    let path = dir.join(format!("{id}.json"));
+    let tmp = dir.join(format!("{id}.json.tmp"));
+    // Write to a temp name first so a crash never leaves a torn session file.
+    if fs::write(&tmp, json.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
+}
+
+/// Read a persisted session, if present.
+fn read_persisted_session(id: &SessionId) -> Option<PersistedSession> {
+    let dir = acp_sessions_dir()?;
+    read_persisted_session_in(&dir, id)
+}
+
+fn read_persisted_session_in(dir: &Path, id: &SessionId) -> Option<PersistedSession> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let data = fs::read_to_string(dir.join(format!("{id}.json"))).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// All persisted sessions, newest `updated` first.
+fn persisted_session_list() -> Vec<PersistedSession> {
+    let Some(dir) = acp_sessions_dir() else {
+        return Vec::new();
+    };
+    list_persisted_in(&dir)
+}
+
+fn list_persisted_in(dir: &Path) -> Vec<PersistedSession> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PersistedSession> = entries
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .filter_map(|e| {
+            let data = fs::read_to_string(e.path()).ok()?;
+            serde_json::from_str(&data).ok()
+        })
+        .collect();
+    out.sort_by_key(|p| std::cmp::Reverse(p.updated));
+    out
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1007,5 +1163,42 @@ mod tests {
             ask_reply_from_outcome(&unknown, &titles),
             AskUserResponse::Answer(t) if t == "mystery"
         ));
+    }
+
+    // ── disk persistence round-trip ──────────────────────────────────────────
+
+    #[test]
+    fn session_persistence_round_trips_on_disk() {
+        let dir = std::env::temp_dir().join(format!("ri-acp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = SessionId::new("sess-resume-test".to_string());
+        let events = vec![
+            SessionEvent::UserMessage {
+                content: "acp devam".to_string(),
+                timestamp: 100,
+            },
+            SessionEvent::AssistantMessage {
+                content: "merhaba".to_string(),
+                thinking: None,
+                phase: AssistantPhase::Final,
+                usage: None,
+                timestamp: 101,
+            },
+        ];
+        persist_session_in(&dir, &id, &events, Path::new("/tmp/work"));
+
+        let loaded = read_persisted_session_in(&dir, &id).expect("load persisted");
+        assert_eq!(loaded.cwd, PathBuf::from("/tmp/work"));
+        assert_eq!(loaded.events.len(), 2);
+        assert!(matches!(
+            &loaded.events[1],
+            SessionEvent::AssistantMessage { content, .. } if content == "merhaba"
+        ));
+
+        let list = list_persisted_in(&dir);
+        assert_eq!(list.len(), 1, "expected one persisted session");
+        assert_eq!(list[0].cwd, PathBuf::from("/tmp/work"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

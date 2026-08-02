@@ -223,16 +223,19 @@ Implemented surface:
 - `session/new`, `session/prompt` (streams `agent_message_chunk`,
   `agent_thought_chunk`, `tool_call`/`tool_call_update` with live tool output
   forwarded as in-progress updates, `usage_update`)
-- `session/load` — replays a known in-memory session's history as updates
+- `session/load` — replays a session's history as updates; sessions are
+  persisted to disk after each prompt (`~/.local/share/ri/sessions/acp/`), so
+  a later process can resume them (`_ri/list_sessions` → `session/load` →
+  `session/prompt`)
 - `session/cancel` — maps to ri's hard abort
 - `ask_user` — forwarded as `session/request_permission` (multiple-choice
   mapping; freeform-only asks surface a single "Continue" option), so headless
   clients can approve/deny tool operations
 - ri-specific `_ri/*` methods: `_ri/get_state` (model, thinking level,
-  sessions), `_ri/set_model`, `_ri/set_thinking` (both rebuild the active
-  provider; call `_ri/get_state` with `"params": null`)
+  sessions), `_ri/set_model`, `_ri/set_thinking` (all rebuild/swap the active
+  provider), `_ri/list_sessions` (persisted sessions, newest first); call
+  unit-request methods with `"params": null`
 
 Current limitations: one prompt at a time per session; auto-compaction is
-disabled; `session/load` replays only in-memory sessions (no disk persistence);
-tool cwd is the process directory (per-session `cwd` feeds the system prompt).
-Requires Rust 1.88 (ACP dependency baseline).
+disabled; tool cwd is the process directory (per-session `cwd` feeds the
+system prompt). Requires Rust 1.88 (ACP dependency baseline).
