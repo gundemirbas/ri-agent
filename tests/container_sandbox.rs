@@ -239,3 +239,167 @@ fn static_uutils_coreutils_provides_file_tools_when_provisioned() {
     );
     std::fs::remove_dir_all(&img).ok();
 }
+
+const RI_SH_BIN: &str = env!("CARGO_BIN_EXE_ri-sh");
+
+/// Change an env var for the duration of the closure (serialized via the
+/// global test lock; edition-2024 unsafe).
+fn with_env<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+    let r = f();
+    unsafe {
+        std::env::remove_var(key);
+    }
+    r
+}
+
+#[test]
+fn strict_static_shell_drops_host_shell_and_lib_binds() {
+    if !userns_available() {
+        eprintln!("SKIP: unprivileged user namespaces unavailable");
+        return;
+    }
+    if !coreutils_candidates().iter().any(|c| c.is_file()) {
+        eprintln!("SKIP: no static coreutils provisioned (scripts/fetch-uutils-coreutils.sh)");
+        return;
+    }
+    let _g = unlock_poisoned();
+    let img = scratch("strict");
+    with_env("RI_SANDBOX_SH", Some(RI_SH_BIN), || {
+        assemble_image(&img).expect("assemble strict image")
+    });
+    let static_sh = std::fs::read_to_string(img.join("has-static-sh"))
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    assert!(static_sh, "ri-sh must be installed as the static shell");
+    // bin/sh must be a symlink to the static ri-sh, not a host copy.
+    use std::fs::symlink_metadata;
+    let m = symlink_metadata(img.join("bin/sh")).expect("bin/sh exists");
+    assert!(
+        m.file_type().is_symlink(),
+        "bin/sh must be a symlink in strict mode"
+    );
+
+    let out = in_sandbox(
+        &img,
+        &img,
+        &[
+            "/bin/sh",
+            "-c",
+            "ls -ld /bin/sh >/dev/null 2>&1; echo UID=$(id -u); ls /usr/bin/coreutils >/dev/null && echo UUTILS_OK; echo LIBCNT=$(ls -A /lib | wc -l); ls /opt 2>&1",
+        ],
+    );
+    let t = all_output(&out);
+    assert!(t.contains("UID=0"), "static shell must map uid to 0: {t}");
+    assert!(
+        t.contains("UUTILS_OK"),
+        "static coreutils must be present: {t}"
+    );
+    // Strict image: no host /lib loader binds → /lib is empty (LIBCNT=0).
+    assert!(
+        t.contains("LIBCNT=0"),
+        "expected an empty /lib (no host lib binds); got: {t}"
+    );
+    assert!(
+        t.contains("No such file"),
+        "host /opt must stay invisible: {t}"
+    );
+    std::fs::remove_dir_all(&img).ok();
+}
+
+#[test]
+fn compat_mode_uses_host_shell_without_static_ri_sh() {
+    if !userns_available() {
+        eprintln!("SKIP: unprivileged user namespaces unavailable");
+        return;
+    }
+    let _g = unlock_poisoned();
+    let img = scratch("compat");
+    // Force the compatible image: a static ri-sh is deliberately not found
+    // (the override short-circuits the sibling auto-detection).
+    with_env("RI_SANDBOX_SH", Some("/__ri_sh_unset_compat__"), || {
+        assemble_image(&img).expect("assemble compat image")
+    });
+    let static_sh = std::fs::read_to_string(img.join("has-static-sh"))
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+    assert!(!static_sh, "compat image must NOT have a static shell");
+
+    // bin/sh is a host copy (regular file), not a symlink.
+    use std::fs::symlink_metadata;
+    let m = symlink_metadata(img.join("bin/sh")).expect("bin/sh exists");
+    assert!(
+        !m.file_type().is_symlink(),
+        "compat bin/sh must be a host copy"
+    );
+
+    // The compatible host shell still runs inside the sandbox.
+    let out = in_sandbox(
+        &img,
+        &img,
+        &["/bin/sh", "-c", "echo shell-ok; echo PI=$(pwd)"],
+    );
+    let t = all_output(&out);
+    assert!(t.contains("shell-ok"), "compat host shell must run: {t}");
+    assert!(
+        t.contains("PI=/work"),
+        "host shell must run with /work cwd: {t}"
+    );
+    std::fs::remove_dir_all(&img).ok();
+}
+
+#[test]
+fn rlimits_are_applied_inside_the_sandbox() {
+    if !userns_available() {
+        eprintln!("SKIP: unprivileged user namespaces unavailable");
+        return;
+    }
+    let _g = unlock_poisoned();
+    let img = scratch("rlimit");
+    assemble_image(&img).expect("assemble");
+    // Explicit limits so the assertion is deterministic.
+    let out = Command::new(SANDBOX)
+        .arg(&img)
+        .arg("--")
+        .args([
+            "/bin/sh",
+            "-c",
+            "cat /proc/self/limits 2>/dev/null || echo NO_PROC",
+        ])
+        .env(
+            "RI_SANDBOX_RLIMITS",
+            "nofile=2048,nproc=64,as=512m,cpu=30,fsize=1g,core=0",
+        )
+        .current_dir(&img)
+        .output()
+        .expect("spawn ri-sandbox");
+    let t = all_output(&out);
+    if t.contains("NO_PROC") {
+        // /proc is not bind-mounted on this host (e.g. hardened kernels) —
+        // the limit is still applied; we just cannot observe it here.
+        eprintln!("INFO: /proc unavailable; RLIMIT not observable (limits still set)");
+        return;
+    }
+    let lines = t.lines().collect::<Vec<_>>();
+    let find = |name: &str| {
+        lines
+            .iter()
+            .find(|l| l.contains(name))
+            .map(|l| l.to_string())
+    };
+    if let Some(l) = find("Max open files") {
+        assert!(l.contains("2048"), "nofile must be 2048: {l}");
+    }
+    if let Some(l) = find("Max cpu time") {
+        assert!(l.contains("30"), "cpu limit must be 30s: {l}");
+    }
+    if let Some(l) = find("Max address space") {
+        assert!(l.contains("524288"), "as limit must be 512m (kB): {l}");
+    }
+    std::fs::remove_dir_all(&img).ok();
+}

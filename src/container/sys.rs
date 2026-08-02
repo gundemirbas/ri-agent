@@ -151,12 +151,48 @@ pub fn run_child(image: &Path, argv: &[String], binds: &[Binds]) -> io::Result<(
         }
     }
 
+    enum Marker {
+        One,
+        Zero,
+        Missing,
+    }
+    let marker = |name: &str| -> Marker {
+        match std::fs::read_to_string(image.join(name)) {
+            Ok(s) if s.trim() == "1" => Marker::One,
+            Ok(_) => Marker::Zero,
+            Err(_) => Marker::Missing,
+        }
+    };
+    let has_uutils = matches!(marker("has-uutils"), Marker::One);
+    // Strict image: static ri-sh shell + static coreutils → the image is fully
+    // self-contained, so no host /lib loader dirs and no /bin,/usr fallback
+    // are mounted at all. Any other combination falls back to host binds.
+    let strict = has_uutils && matches!(marker("has-static-sh"), Marker::One);
+
+    // Loader/lib dirs are only needed when the shell or fallback tools are
+    // dynamic (i.e. the image is not fully static).
+    if !strict {
+        for d in [
+            "/nix/store",
+            "/run/current-system/sw",
+            "/lib",
+            "/lib64",
+            "/lib32",
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/lib32",
+        ] {
+            if Path::new(d).is_dir() {
+                let target = image.join(d.trim_start_matches('/'));
+                if target.is_dir() {
+                    let _ = bind_mount(d, &target);
+                }
+            }
+        }
+    }
+
     // Fallback: without static coreutils, expose host /bin,/sbin,/usr RO so
     // common file tools exist. Skipped when the image ships its own tools.
-    let has_uutils = image.join("has-uutils").is_file()
-        && std::fs::read_to_string(image.join("has-uutils"))
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
     if !has_uutils {
         for d in ["/bin", "/sbin", "/usr"] {
             if Path::new(d).is_dir() {
@@ -261,6 +297,16 @@ pub fn run_child(image: &Path, argv: &[String], binds: &[Binds]) -> io::Result<(
         std::env::set_var("container", "ri-sandbox");
     }
 
+    // ── resource limits (spec §7): constrain runaway tools ─────────────────
+    // Hard limits so a tool cannot raise them back. Configurable via
+    // `$RI_SANDBOX_RLIMITS` (`name=value,…`); `none` disables. Units: bytes
+    // with optional k/m/g suffix; cpu in seconds; nproc/nofile as a count.
+    let limits = std::env::var("RI_SANDBOX_RLIMITS")
+        .unwrap_or_else(|_| "cpu=30,nproc=64,nofile=2048,as=512m,fsize=1g,core=0".to_string());
+    if limits != "none" {
+        apply_rlimits(&limits);
+    }
+
     if argv.is_empty() {
         return Err(io::Error::other("sandbox: empty command"));
     }
@@ -284,6 +330,51 @@ pub fn run_child(image: &Path, argv: &[String], binds: &[Binds]) -> io::Result<(
         argv[0],
         io::Error::last_os_error()
     )))
+}
+
+/// Parse a byte-size value with an optional `k`/`m`/`g` suffix.
+fn parse_size(s: &str) -> Option<libc::rlim_t> {
+    let (num, mult) = match s.as_bytes().last().copied() {
+        Some(b'k') | Some(b'K') => (&s[..s.len() - 1], 1024u64),
+        Some(b'm') | Some(b'M') => (&s[..s.len() - 1], 1024u64 * 1024),
+        Some(b'g') | Some(b'G') => (&s[..s.len() - 1], 1024u64 * 1024 * 1024),
+        _ => (s, 1u64),
+    };
+    num.parse::<u64>().ok().map(|n| n.saturating_mul(mult))
+}
+
+/// Set a single `name=value` resource limit (best-effort).
+fn apply_one(name: &str, value: &str) {
+    let (res, lim): (libc::c_int, Option<libc::rlim_t>) = match name {
+        "cpu" => (
+            libc::RLIMIT_CPU,
+            value.parse::<u64>().ok().map(|n| n.max(1)),
+        ),
+        "nproc" => (libc::RLIMIT_NPROC, value.parse::<u64>().ok()),
+        "nofile" => (libc::RLIMIT_NOFILE, value.parse::<u64>().ok()),
+        "as" => (libc::RLIMIT_AS, parse_size(value)),
+        "fsize" => (libc::RLIMIT_FSIZE, parse_size(value)),
+        "core" => (libc::RLIMIT_CORE, parse_size(value)),
+        "stack" => (libc::RLIMIT_STACK, parse_size(value)),
+        _ => return,
+    };
+    let Some(lim) = lim else { return };
+    let rlim = libc::rlimit {
+        rlim_cur: lim,
+        rlim_max: lim,
+    };
+    // SAFETY: setrlimit only writes the rlimit we pass; the child is
+    // single-threaded (numeric arguments; no Rust invariants involved).
+    unsafe { libc::setrlimit(res, &rlim) };
+}
+
+/// Apply the comma-separated `name=value` limit list.
+fn apply_rlimits(spec: &str) {
+    for pair in spec.split(',').filter(|p| !p.is_empty()) {
+        if let Some((name, value)) = pair.split_once('=') {
+            apply_one(name.trim(), value.trim());
+        }
+    }
 }
 
 /// A host → guest bind request passed into the child.
@@ -312,5 +403,15 @@ mod tests {
         let b = bind("/home/x", "/work");
         assert_eq!(b.host, "/home/x");
         assert_eq!(b.guest, "/work");
+    }
+
+    #[test]
+    fn parse_size_handles_suffixes() {
+        assert_eq!(parse_size("1024"), Some(1024));
+        assert_eq!(parse_size("8"), Some(8));
+        assert_eq!(parse_size("512m"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_size("1g"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size("64k"), Some(64 * 1024));
+        assert_eq!(parse_size("junk"), None);
     }
 }

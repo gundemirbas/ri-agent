@@ -840,10 +840,11 @@ tasarım spek'ten şu noktalarda üstünlük/güvenilirlik için ayrışıyor:
 |-------|-------|-----|
 | §3 Rootless user namespace | ✅ | `unshare(CLONE_NEWUSER\|CLONE_NEWNS)` + self-uid/gid-map → 0. Root yok, `unshare -Ur` ile aynı mekanizma. |
 | §4 chroot + bind mount | ✅ | `ri-sandbox` alt-süreci (pre-tokio tek-iş-parçacıklı `main`); `/work`, `/tools`, `/tmp`, `/proc`(best-effort), non-secret `/etc/*`, loader lib dir'leri RO. Image root'u RO remount. |
-| §7 RLIMIT | ⚠️ Kısmen | `ri-sandbox` minimal ve güvenli; RLIMIT/`nice` ekleme kolay — şu an atlanmış. |
+| §7 RLIMIT | ✅ | `ri-sandbox`, `sh` çalıştırılmadan önce sert limitler kurar: `RI_SANDBOX_RLIMITS` veya varsayılan `cpu=30,nproc=64,nofile=2048,as=512m,fsize=1g,core=0`. `parse_size` `k/m/g` öneklerini çözer. |
+| §7 Seccomp | ⏭️ Ertelendi | BPF kırılganlığı + araç çeşitliliği (cargo/network). userns+chroot zaten ana sınırı veriyor. |
 | §7 Seccomp | ⏭️ Ertelendi | BPF kırılganlığı + araç çeşitliliği (cargo/network). userns+chroot zaten ana sınırı veriyor. |
 | §8 Host network shared | ✅ | `CLONE_NEWNET` kullanılmıyor → internet açık (crates.io, API). |
-| §9 Dosya yapısı (`src/container/`) | ✅ | `mod.rs`/`rootfs.rs`/`sys.rs`/`bin_sandbox.rs` + `tests/container_sandbox.rs`. |
+| §9 Dosya yapısı (`src/container/`) | ✅ | `mod.rs`/`rootfs.rs`/`sys.rs`/`bin_sandbox.rs`/`sh_main.rs` + `tests/container_sandbox.rs`. |
 | §13 Performans | ✅ | userns+chroot birkaç ms; ekstra binary `ri-sandbox` (~5MB debug / musl static). |
 
 ### Bilinçli saptamalar (spek'ten)
@@ -863,11 +864,21 @@ tasarım spek'ten şu noktalarda üstünlük/güvenilirlik için ayrışıyor:
    (en sıkı izolasyon). Sağlanmazsa her dağıtımda çalışsın diye host `/bin`,
    `/sbin`, `/usr` RO bind fallback'i.
 
-3. **Shell host'tan**: `bash` aracı `/bin/sh -c` çalıştırır; minimal image'da
-   statik bir shell yok. `ri-sandbox`, host `/bin/sh`'i tek-dosya bind'ler,
-   dinamik loader lib dizinlerini (`/lib*`, `/usr/lib*`, NixOS'un
-   `/nix/store` + `/run/current-system/sw`) RO bağlar. Yani shell dinamik,
-   dosya araçları + custom tool'lar statik musl → sıfır bağımlılık.
+3. **Shell = `ri-sh` (statik Rust shell)**: web araştırması sonucu seçilen
+   [`epsh`](https://crates.io/crates/epsh) — Rust'ta gömülebilir POSIX shell
+   (dash uyumlu, library-first, `libc`+`rustix`+`fxhash`; ayrıca crates.io
+   dependency'si, vendor değil) — üzerine ~70 satırlık ince bir `-c`/script/
+   stdin CLI: `ri-sh`. Bu statik musl binary, image'a `/bin/sh` (sembolik link)
+   olarak kurulur. Görüntü tamamen alter şeffaf:
+   - **Strict mod** (`ri-sh` + statik coreutils): image'da yalnız statik
+     binary'ler (ri-sh, coreutils, custom tool'lar) → host `/bin/sh` kopyası
+     da, `/lib`/`/usr/lib`/`nix/store` bind'leri de hiç yok; `ri-sandbox`
+     sadece `exec` yapar, shell mantığı `ri-sh` (epsh) içinde in-process çalışır.
+   - **Compat mod** (statik sh yoksa): evvelki davranış (host `/bin/sh`
+     kopyası + dinamik loader lib bind'leri) her dağıtımda çalışır.
+   - Shell script özellikleri (pipeline `|`, `&&`/`||`, `$()`, heredoc,
+     redirect) epsh tarafından yorumlanır; dış komutlar sandbox `PATH`'teki
+     statik uutils applet'ları / `/tools` custom tool'ları olur.
 
 4. **`/etc` "scrubbed"**: host `/etc` bağlanmaz; yalnızca
    `passwd/group/resolv.conf/nsswitch.conf/hosts` + `/etc/ssl` (CA cert'ler)

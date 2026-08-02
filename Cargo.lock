@@ -1002,6 +1002,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "epsh"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8aceb5591c30f9f7ed8048cbc39f95fb09d86d3da91eee558db05aeb5685212"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2859,6 +2868,7 @@ dependencies = [
  "crossterm",
  "csscolorparser 0.8.3",
  "directories",
+ "epsh",
  "futures-lite",
  "futures-util",
  "getrandom 0.3.4",

@@ -116,6 +116,15 @@ podman/docker, no root:
   the host's `/bin`, `/usr` are bind-mounted read-only as a fallback, so the
   sandbox works everywhere. Custom tools are static-musl binaries and run
   inside with zero dependencies.
+- The shell is itself a **static Rust shell**: `ri-sh` (a ~70-line `sh`
+  CLI built on the embeddable [`epsh`](https://crates.io/crates/epsh) POSIX
+  shell library) is installed as `/bin/sh`. In the default **strict** image
+  (ri-sh + static coreutils) every binary is static, so there is no host
+  `/bin/sh` copy and no `/lib`/loader binds at all; a **compatible** fallback
+  keeps the host shell when ri-sh is absent.
+- Resource limits are applied by default
+  (`cpu=30s, nproc=64, nofile=2048, as=512MiB, fsize=1GiB, core=0`) and can be
+  tuned via `$RI_SANDBOX_RLIMITS` (`none` disables).
 - Linux-only; user namespaces must be enabled in the kernel.
 
 See `docs/CONTAINER-RUNTIME-SPEC.md` for the full design spec and its
@@ -126,7 +135,7 @@ are unavailable.
 
 ```sh
 scripts/fetch-uutils-coreutils.sh    # optional: static file tools
-cargo build --bins                   # produces `ri` + `ri-sandbox`
+cargo build --bins                   # produces `ri` + `ri-sandbox` + `ri-sh`
 ri --sandbox                         # TUI with sandboxed tools
 ri --serve --sandbox                 # headless ACP agent, same sandbox
 ```

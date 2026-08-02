@@ -153,6 +153,8 @@ const READY_MARKER: &str = ".ri-image-ready";
 const UUTILS_MARKER: &str = "has-uutils";
 /// Marker written when a shell is present in the image (0/1).
 const SHELL_MARKER: &str = "has-shell";
+/// Marker written when the shell is a static musl binary (ri-sh, 0/1).
+const STATIC_SH_MARKER: &str = "has-static-sh";
 
 /// Result of assembling an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,9 +162,13 @@ pub struct AssembledImage {
     /// A static musl coreutils is installed; the runtime may omit the host
     /// `/bin`/`/usr` fallback binds and rely on the self-contained file tools.
     pub has_uutils: bool,
-    /// A shell exists in the image (`bin/sh` was copied from the host). When
-    /// absent, the runtime binds host `/bin` so `/bin/sh` still works.
+    /// A shell exists in the image. When absent, the runtime binds host
+    /// `/bin` so `/bin/sh` still works.
     pub has_shell: bool,
+    /// The shell is the static musl `ri-sh` (built on the embeddable `epsh`
+    /// POSIX-shell library). When true AND `has_uutils`, the image is fully
+    /// self-contained: no host `/bin/sh` copy and no `/lib` binds at all.
+    pub has_static_sh: bool,
 }
 
 /// Candidate locations for a static coreutils binary, in priority order.
@@ -198,6 +204,54 @@ pub fn coreutils_candidates() -> Vec<PathBuf> {
     out
 }
 
+/// Candidate locations for a static `ri-sh` (POSIX shell) binary.
+///
+/// 1. `$RI_SANDBOX_SH` (explicit override).
+/// 2. Siblings of the running binary (`target/<profile>/ri-sh` next to
+///    `ri`, `ri-sandbox`), or the parent profile dir of the test harness.
+pub fn sh_candidates() -> Vec<PathBuf> {
+    // An explicit override short-circuits the auto-detection: useful both to
+    // force a specific ri-sh and (by pointing at a non-existent path) to force
+    // the compatible host-shell image in tests.
+    if let Some(p) = std::env::var_os("RI_SANDBOX_SH") {
+        return vec![PathBuf::from(p)];
+    }
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        out.push(dir.join("ri-sh"));
+        if let Some(parent) = dir.parent() {
+            out.push(parent.join("ri-sh"));
+        }
+    }
+    out
+}
+
+/// Install a static `ri-sh` shell into `<image>/bin/ri-sh` and expose it as
+/// `bin/sh` (symlink). Returns whether one was found and installed. When
+/// installed, the runtime needs no dynamic host shell and no `/lib` binds.
+fn install_static_sh(image: &Path) -> io::Result<bool> {
+    let Some(src) = sh_candidates().into_iter().find(|c| c.is_file()) else {
+        return Ok(false);
+    };
+    let dst = image.join("bin").join("ri-sh");
+    let _ = fs::remove_file(&dst);
+    fs::copy(&src, &dst)?;
+    #[cfg(unix)]
+    fs::set_permissions(&dst, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    fs::write(
+        image.join("bin").join(".ri-sh-source"),
+        src.to_string_lossy().as_bytes(),
+    )?;
+    // `bin/sh` → `ri-sh` (the bash tool invokes `/bin/sh -c …`).
+    let sh_link = image.join("bin").join("sh");
+    let _ = fs::remove_file(&sh_link);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("ri-sh", &sh_link)?;
+    Ok(true)
+}
+
 /// Idempotently assemble the sandbox image at `image`.
 pub fn assemble_image(image: &Path) -> io::Result<AssembledImage> {
     // Fast path: already assembled.
@@ -206,18 +260,26 @@ pub fn assemble_image(image: &Path) -> io::Result<AssembledImage> {
         && image.join(SHELL_MARKER).is_file()
     {
         let mut has_uutils = fs::read_to_string(image.join(UUTILS_MARKER))?.trim() == "1";
-        let has_shell = fs::read_to_string(image.join(SHELL_MARKER))?.trim() == "1";
-        // Self-heal: a static coreutils may have been provisioned *after* the
-        // image was first assembled (e.g. scripts/fetch-uutils-coreutils.sh
-        // just ran). Upgrade in place so the stricter, self-contained image
-        // takes effect without a manual cache wipe.
+        let mut has_shell = fs::read_to_string(image.join(SHELL_MARKER))?.trim() == "1";
+        let mut has_static_sh = fs::read_to_string(image.join(STATIC_SH_MARKER))?.trim() == "1";
+        // Self-heal: a static coreutils (`scripts/fetch-uutils-coreutils.sh`)
+        // or the static `ri-sh` may have become available *after* the image
+        // was first assembled. Upgrade in place so the stricter,
+        // self-contained image takes effect without a manual cache wipe.
         if !has_uutils && coreutils_candidates().iter().any(|c| c.is_file()) {
             has_uutils = install_coreutils(image)?;
             fs::write(image.join(UUTILS_MARKER), "1")?;
         }
+        if !has_static_sh && sh_candidates().iter().any(|c| c.is_file()) {
+            has_static_sh = install_static_sh(image)?;
+            has_shell = true;
+            fs::write(image.join(STATIC_SH_MARKER), "1")?;
+            fs::write(image.join(SHELL_MARKER), "1")?;
+        }
         return Ok(AssembledImage {
             has_uutils,
             has_shell,
+            has_static_sh,
         });
     }
 
@@ -255,10 +317,17 @@ pub fn assemble_image(image: &Path) -> io::Result<AssembledImage> {
         )?;
     }
 
-    // Shell: copy the host shell into the image (dynamic; its interpreter and
-    // libraries live in the loader dirs the runtime binds read-only). If no
-    // host shell, the runtime falls back to binding host `/bin`, `/usr`.
-    let has_host_sh = copy_host_shell(image)?;
+    // Shell: prefer the static `ri-sh` binary (built on the embeddable `epsh`
+    // POSIX-shell library); only when it is unavailable copy the host's
+    // (dynamic) `/bin/sh`, whose interpreter/library dirs the runtime then
+    // binds read-only.
+    let has_static_sh = install_static_sh(image)?;
+    let has_host_sh = if !has_static_sh {
+        copy_host_shell(image)?
+    } else {
+        false
+    };
+    let has_shell = has_static_sh || has_host_sh;
 
     // Static coreutils (file tools) — self-contained, no host binds needed.
     let has_uutils = install_coreutils(image)?;
@@ -268,15 +337,17 @@ pub fn assemble_image(image: &Path) -> io::Result<AssembledImage> {
         image.join(UUTILS_MARKER),
         if has_uutils { "1" } else { "0" },
     )?;
+    fs::write(image.join(SHELL_MARKER), if has_shell { "1" } else { "0" })?;
     fs::write(
-        image.join(SHELL_MARKER),
-        if has_host_sh { "1" } else { "0" },
+        image.join(STATIC_SH_MARKER),
+        if has_static_sh { "1" } else { "0" },
     )?;
     fs::write(image.join(".ri-image-ready"), env!("CARGO_PKG_VERSION"))?;
 
     Ok(AssembledImage {
         has_uutils,
-        has_shell: has_host_sh,
+        has_shell,
+        has_static_sh,
     })
 }
 

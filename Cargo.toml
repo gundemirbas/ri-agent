@@ -23,6 +23,14 @@ path = "src/main.rs"
 name = "ri-sandbox"
 path = "src/container/bin_sandbox.rs"
 
+# The sandbox's static POSIX shell: a minimal `sh -c`/script/stdin interpreter
+# built on the embeddable `epsh` library (Rust, no external binaries). Installed
+# into the sandbox image as /bin/sh so the image needs no dynamic host shell
+# and no host library binds (see docs/CONTAINER-RUNTIME-SPEC.md §15).
+[[bin]]
+name = "ri-sh"
+path = "src/container/sh_main.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4", features = ["derive"] }
@@ -56,6 +64,9 @@ shlex = "1.3"
 jawohl = "0.1.0"
 csscolorparser = "0.8.3"
 libc = "0.2"
+# Embeddable POSIX shell (Rust): used by the `ri-sh` bin to give the sandbox a
+# static /bin/sh (dash-conformant, library-first, no external binaries).
+epsh = "0.0.6"
 rig-core = { version = "0.41", default-features = false, features = ["reqwest", "rustls"] }
 agent-client-protocol = { version = "2", features = ["unstable_end_turn_token_usage", "unstable_session_fork", "unstable_protocol_v2"] }
 futures-lite = "2"

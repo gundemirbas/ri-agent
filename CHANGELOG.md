@@ -4,6 +4,16 @@
 
 ### Added
 
+- **Static Rust shell + resource limits in the sandbox**: the sandbox's
+  `/bin/sh` is now `ri-sh`, a minimal `sh` CLI built on the embeddable
+  [`epsh`](https://crates.io/crates/epsh) POSIX shell library (Rust, no
+  external binaries). In the default **strict** image (static `ri-sh` +
+  static uutils coreutils) every binary is static, so the host `/bin/sh` copy
+  and all `/lib`/loader binds are dropped; a compatible fallback keeps the
+  host shell when ri-sh is absent. `ri-sandbox` also applies resource limits
+  before exec (`RI_SANDBOX_RLIMITS` or `cpu=30,nproc=64,nofile=2048,as=512m,
+  fsize=1g,core=0`; `none` disables). New integration tests cover strict mode
+  (empty `/lib`, symlinked static shell), compat mode, and observable limits.
 - **Rootless tool sandbox (`--sandbox`, spec §15)**: agent tool subprocesses
   (`bash`, `exec`, custom tools) can run inside a rootless user-namespace +
   chroot container built entirely in Rust — no OCI/podman/docker, no root.
