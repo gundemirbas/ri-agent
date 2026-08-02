@@ -38,12 +38,13 @@
 //! Protocol negotiations: each connection's `initialize` is routed through an
 //! `AgentProtocolRouter`. Protocol v1 serves the full surface (load/close/
 //! list/fork + `_ri/*`); protocol **v2** (unstable) is served over the same
-//! per-turn core with a bounded surface — `initialize`, `session/new`,
-//! `session/prompt` (streamed v2 `UpdateSessionNotification` chunks with
-//! per-turn `MessageId`), `session/cancel`, and `ask_user` →
-//! `session/request_permission` (v2 title+options). v1-only conveniences
-//! (`session/load`/`resume`/`close`/`list`/`fork`, `_ri/*`) are not served
-//! over v2 yet.
+//! per-turn core with the standard v2 surface — `initialize`, `session/new`,
+//! `session/resume` (register + replay), `session/list`, `session/close`,
+//! `session/fork`, `session/delete`, `session/prompt` (streamed v2
+//! `UpdateSessionNotification` chunks with per-turn `MessageId`, plus embedded
+//! resource reads), `session/cancel`, and `ask_user` →
+//! `session/request_permission` (v2 title+options). Only the ri-specific
+//! `_ri/*` custom methods remain v1-only.
 //!
 //! Event loop: `session/prompt` handlers return immediately and run the whole
 //! turn (event forwarding, the `request_permission` ask bridge, the final
@@ -1476,6 +1477,72 @@ fn build_agent(
 
 // ── ACP protocol v2 (unstable) ───────────────────────────────────────────────
 
+/// v2 replay mirror of `session_replay_updates`: maps committed session events
+/// to v2 `UserMessageChunk`/`AgentMessageChunk` updates (per-turn `MessageId`).
+fn session_replay_updates_v2(events: &[SessionEvent]) -> Vec<acp_v2::SessionUpdate> {
+    let mut updates = Vec::new();
+    let message_id = acp_v2::MessageId::new(format!("msg-{}", now_ts()));
+    for ev in events {
+        match ev {
+            SessionEvent::UserMessage { content, .. } => updates.push(
+                acp_v2::SessionUpdate::UserMessageChunk(acp_v2::ContentChunk::new(
+                    acp_v2::ContentBlock::Text(acp_v2::TextContent::new(content.clone())),
+                    message_id.clone(),
+                )),
+            ),
+            SessionEvent::AssistantMessage { content, .. } => updates.push(
+                acp_v2::SessionUpdate::AgentMessageChunk(acp_v2::ContentChunk::new(
+                    acp_v2::ContentBlock::Text(acp_v2::TextContent::new(content.clone())),
+                    message_id.clone(),
+                )),
+            ),
+            _ => {}
+        }
+    }
+    updates
+}
+
+/// v2 mirror of `synthesize_resource_reads`: embedded v2 text/blob resources in
+/// a prompt generate `read_file` tool events so the agent sees their content.
+fn synthesize_v2_resource_reads(blocks: &[acp_v2::ContentBlock]) -> Vec<SessionEvent> {
+    let mut out = Vec::new();
+    for (idx, block) in blocks.iter().enumerate() {
+        let acp_v2::ContentBlock::Resource(r) = block else {
+            continue;
+        };
+        let uri = match &r.resource {
+            acp_v2::EmbeddedResourceResource::TextResourceContents(t) => t.uri.clone(),
+            acp_v2::EmbeddedResourceResource::BlobResourceContents(b) => b.uri.clone(),
+            _ => String::new(),
+        };
+        if uri.is_empty() {
+            continue;
+        }
+        let path = uri.strip_prefix("file://").unwrap_or(&uri).to_string();
+        let ts = now_ts();
+        let id = format!("attach_{idx}");
+        out.push(SessionEvent::ToolCall {
+            id: id.clone(),
+            name: "read_file".to_string(),
+            args: serde_json::json!({ "path": path }),
+            include_in_llm: true,
+            timestamp: ts,
+        });
+        if let acp_v2::EmbeddedResourceResource::TextResourceContents(t) = &r.resource {
+            out.push(SessionEvent::ToolResult {
+                id,
+                name: "read_file".to_string(),
+                content: t.text.clone(),
+                is_error: false,
+                display_range: None,
+                include_in_llm: true,
+                timestamp: ts,
+            });
+        }
+    }
+    out
+}
+
 /// Minimal v2 → user-text renderer. v2 clients typically send `Text` blocks;
 /// resource/other blocks are preserved as a short placeholder (resource reads
 /// are not yet synthesized for v2 prompts).
@@ -1666,8 +1733,17 @@ fn build_v2_agent(
 ) -> impl agent_client_protocol::ConnectTo<Client> {
     let s_new = Arc::clone(&sessions);
     let s_prompt = Arc::clone(&sessions);
+    let s_resume = Arc::clone(&sessions);
+    let s_list = Arc::clone(&sessions);
+    let s_close = Arc::clone(&sessions);
+    let s_fork = Arc::clone(&sessions);
+    let s_delete = Arc::clone(&sessions);
     let s_cancel = Arc::clone(&sessions);
     let ctx_new = Arc::clone(&ctx);
+    let ctx_resume = Arc::clone(&ctx);
+    let ctx_close = Arc::clone(&ctx);
+    let ctx_fork = Arc::clone(&ctx);
+    let ctx_delete = Arc::clone(&ctx);
     let ctx_cancel = Arc::clone(&ctx);
 
     agent_client_protocol::Agent
@@ -1723,20 +1799,25 @@ fn build_v2_agent(
                     .tokio_handle
                     .clone()
                     .unwrap_or_else(tokio::runtime::Handle::current);
-                // v2 resource reads are not synthesized yet.
-                let setup =
-                    match prepare_turn(&ctx, &s_prompt, &session_id, prompt_text, Vec::new()).await
-                    {
-                        Ok(s) => s,
-                        Err(msg) => {
-                            responder
-                                .respond_with_error(
-                                    agent_client_protocol::Error::invalid_params().data(msg),
-                                )
-                                .ok();
-                            return Ok(());
-                        }
-                    };
+                let setup = match prepare_turn(
+                    &ctx,
+                    &s_prompt,
+                    &session_id,
+                    prompt_text,
+                    synthesize_v2_resource_reads(&req.prompt),
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(msg) => {
+                        responder
+                            .respond_with_error(
+                                agent_client_protocol::Error::invalid_params().data(msg),
+                            )
+                            .ok();
+                        return Ok(());
+                    }
+                };
                 // Same event-loop discipline as v1: run the turn on its own
                 // task so the connection keeps reading client responses.
                 let s_prompt_task = Arc::clone(&s_prompt);
@@ -1747,6 +1828,183 @@ fn build_v2_agent(
                     run_turn(ctx_task, s_prompt_task, session_id_task, setup, emitter).await;
                 });
                 Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ── session/resume (register + replay; shared map, v1-keyed) ───────
+        .on_receive_request(
+            async move |req: acp_v2::ResumeSessionRequest, responder, connection| {
+                let key = SessionId::new(req.session_id.0.as_ref().to_string());
+                let (events, _cwd) = match resolve_session_for_load(&s_resume, &key) {
+                    SessionLoadResult::Ready { events, cwd } => (events, cwd),
+                    SessionLoadResult::Busy => {
+                        responder
+                            .respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("session is busy; cannot resume while a prompt runs"),
+                            )
+                            .ok();
+                        return Ok(());
+                    }
+                    SessionLoadResult::Unknown => {
+                        responder
+                            .respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("unknown session"),
+                            )
+                            .ok();
+                        return Ok(());
+                    }
+                };
+                ctx_resume.log("info", Some(&key.to_string()), "v2 session/resume");
+                for u in session_replay_updates_v2(&events) {
+                    let _ = connection.send_notification(acp_v2::UpdateSessionNotification::new(
+                        req.session_id.clone(),
+                        u,
+                    ));
+                }
+                responder.respond(acp_v2::ResumeSessionResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ── session/list (persisted first, then live in-memory) ────────────
+        .on_receive_request(
+            async move |_req: acp_v2::ListSessionsRequest, responder, _connection| {
+                let mut sessions: Vec<acp_v2::SessionInfo> = Vec::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for p in persisted_session_list() {
+                    seen.insert(p.id.clone());
+                    sessions.push(acp_v2::SessionInfo::new(
+                        acp_v2::SessionId::new(p.id),
+                        acp_v2::AbsolutePath::new(p.cwd),
+                    ));
+                }
+                {
+                    let map = s_list.lock().unwrap();
+                    let mut live: Vec<(String, std::path::PathBuf)> = map
+                        .iter()
+                        .filter(|(id, _)| !seen.contains(&id.to_string()))
+                        .map(|(id, s)| (id.to_string(), s.cwd.clone()))
+                        .collect();
+                    live.sort();
+                    for (id, cwd) in live {
+                        sessions.push(acp_v2::SessionInfo::new(
+                            acp_v2::SessionId::new(id),
+                            acp_v2::AbsolutePath::new(cwd),
+                        ));
+                    }
+                }
+                responder.respond(acp_v2::ListSessionsResponse::new(sessions))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ── session/close (drop in-memory; history stays resumable) ─────────
+        .on_receive_request(
+            async move |req: acp_v2::CloseSessionRequest, responder, _connection| {
+                let key = SessionId::new(req.session_id.0.as_ref().to_string());
+                let mut map = s_close.lock().unwrap();
+                if let Some(s) = map.get(&key)
+                    && s.running
+                {
+                    drop(map);
+                    responder
+                        .respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data("session is busy; cannot close while a prompt runs"),
+                        )
+                        .ok();
+                    return Ok(());
+                }
+                let removed = map.remove(&key).is_some();
+                drop(map);
+                ctx_close.log(
+                    "info",
+                    Some(&key.to_string()),
+                    if removed {
+                        "v2 session/close".to_string()
+                    } else {
+                        "v2 session/close (already closed)".to_string()
+                    },
+                );
+                responder.respond(acp_v2::CloseSessionResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ── session/fork (clone live or persisted session into a new id) ───
+        .on_receive_request(
+            async move |req: acp_v2::ForkSessionRequest, responder, _connection| {
+                let key = SessionId::new(req.session_id.0.as_ref().to_string());
+                let src = {
+                    let map = s_fork.lock().unwrap();
+                    map.get(&key).map(|s| (s.events.clone(), s.cwd.clone()))
+                };
+                let (events, cwd) = match src {
+                    Some(x) => x,
+                    None => match read_persisted_session(&key) {
+                        Some(p) => (p.events, p.cwd),
+                        None => {
+                            responder
+                                .respond_with_error(
+                                    agent_client_protocol::Error::invalid_params()
+                                        .data("unknown session"),
+                                )
+                                .ok();
+                            return Ok(());
+                        }
+                    },
+                };
+
+                let new_id = acp_v2::SessionId::new(format!("sess-{}", new_session_suffix()));
+                let new_key = SessionId::new(new_id.0.as_ref().to_string());
+                let mut session = AcpSession::new(cwd.clone());
+                session.events = events.clone();
+                {
+                    let mut map = s_fork.lock().unwrap();
+                    map.insert(new_key.clone(), session);
+                }
+                persist_session(&new_key, &events, &cwd);
+                ctx_fork.log(
+                    "info",
+                    Some(&key.to_string()),
+                    format!("v2 session/fork -> {new_id} ({} events)", events.len()),
+                );
+                responder.respond(acp_v2::ForkSessionResponse::new(new_id))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ── session/delete (in-memory + persisted file) ─────────────────────
+        .on_receive_request(
+            async move |req: acp_v2::DeleteSessionRequest, responder, _connection| {
+                let key = SessionId::new(req.session_id.0.as_ref().to_string());
+                let mut error: Option<String> = None;
+                let mut deleted_in_memory = false;
+                {
+                    let mut map = s_delete.lock().unwrap();
+                    if let Some(s) = map.get(&key) {
+                        if s.running {
+                            error =
+                                Some("session is busy; cancel the active prompt first".to_string());
+                        } else {
+                            map.remove(&key);
+                            deleted_in_memory = true;
+                        }
+                    }
+                }
+                let deleted_on_disk = delete_persisted_session(&key);
+                if let Some(e) = error {
+                    responder
+                        .respond_with_error(agent_client_protocol::Error::invalid_params().data(e))
+                        .ok();
+                    return Ok(());
+                }
+                ctx_delete.log(
+                    "info",
+                    Some(&key.to_string()),
+                    format!(
+                        "v2 session/delete (memory={deleted_in_memory}, disk={deleted_on_disk})"
+                    ),
+                );
+                responder.respond(acp_v2::DeleteSessionResponse::new())
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -2252,6 +2510,33 @@ fn new_session_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthesizes_v2_resource_reads_as_read_file_events() {
+        use agent_client_protocol::schema::v2::{
+            ContentBlock, EmbeddedResource, EmbeddedResourceResource, TextResourceContents,
+        };
+        let blocks = vec![
+            ContentBlock::Text(acp_v2::TextContent::new("hi")),
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                    "print(1)",
+                    "file:///abs/v2.py",
+                )),
+            )),
+        ];
+        let events = synthesize_v2_resource_reads(&blocks);
+        assert_eq!(events.len(), 2, "one read_file ToolCall + ToolResult");
+        assert!(matches!(
+            &events[0],
+            SessionEvent::ToolCall { name, args, .. }
+                if name == "read_file" && args["path"] == "/abs/v2.py"
+        ));
+        assert!(matches!(
+            &events[1],
+            SessionEvent::ToolResult { content, .. } if content == "print(1)"
+        ));
+    }
 
     #[test]
     fn maps_tool_kind_names() {
@@ -3045,7 +3330,52 @@ mod acp_e2e {
                 // machinery (already covered by v1) resolves any pending ask.
                 let _ = cx.send_notification(acp_v2::CancelSessionNotification::new(sid.clone()));
 
+                // Standard v2 session lifecycle over the shared map.
+                let list = cx
+                    .send_request(acp_v2::ListSessionsRequest::new())
+                    .block_task()
+                    .await?;
+                assert!(
+                    list.sessions.iter().any(|s| s.session_id == sid),
+                    "v2 session/list missing the session"
+                );
+
+                let forked = cx
+                    .send_request(acp_v2::ForkSessionRequest::new(
+                        sid.clone(),
+                        acp_v2::AbsolutePath::new("/tmp"),
+                    ))
+                    .block_task()
+                    .await?;
+                let fork_id = forked.session_id;
+
+                let resume = cx
+                    .send_request(acp_v2::ResumeSessionRequest::new(
+                        fork_id.clone(),
+                        acp_v2::AbsolutePath::new("/tmp"),
+                    ))
+                    .block_task()
+                    .await?;
+                let _ = &resume;
+
+                // close drops the in-memory session; the persisted file remains
+                let _ = cx
+                    .send_request(acp_v2::CloseSessionRequest::new(sid.clone()))
+                    .block_task()
+                    .await?;
+                // delete removes the persisted file
+                let _ = cx
+                    .send_request(acp_v2::DeleteSessionRequest::new(sid.clone()))
+                    .block_task()
+                    .await?;
+
+                cleanup_v1_session(&fork_id);
                 cleanup_v1_session(&sid);
+
+                // list after delete: neither the (closed+deleted) sid nor fork
+                // necessarily remains; the persisted fork could exist, but the
+                // key assertions above (new/prompt/ask/list/fork/resume/close/
+                // delete all round-tripped) are what we're checking here.
                 Ok(())
             });
         tokio::time::timeout(Duration::from_secs(30), client)

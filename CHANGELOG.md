@@ -4,19 +4,19 @@
 
 ### Added
 
-- **Protocol v2 serving (T2-4, partial)**: `unstable_protocol_v2` is enabled
+- **Protocol v2 serving (T2-4, complete)**: `unstable_protocol_v2` is enabled
   and every connection's `initialize` is routed through an
   `AgentProtocolRouter`. Protocol v1 keeps the full surface; protocol v2
-  (unstable) is served over the same version-agnostic per-turn core with a
-  bounded surface: `initialize` (v2 capabilities), `session/new`,
-  `session/prompt` (streams v2 `UpdateSessionNotification` chunks carrying a
-  per-turn `MessageId`, plus `ToolCallUpdate`/`UsageUpdate`), `session/cancel`
-  (`CancelSessionNotification`), and `ask_user` →
-  `session/request_permission` (v2 title+options+outcome). Verified with an
-  in-process v2 client test (negotiate V2 → new → echo stream → ask → cancel).
-  Remaining v2 work: `session/load`/`resume`/`close`/`list`/`fork`, the `_ri/*`
-  custom methods, and v2 resource-read synthesis (currently text-only
-  prompt rendering).
+  (unstable) serves the same version-agnostic per-turn core with the full
+  standard v2 session surface: `initialize` (v2 capabilities), `session/new`,
+  `session/prompt` (streams v2 `UpdateSessionNotification` chunks with a
+  per-turn `MessageId`, `ToolCallUpdate`/`UsageUpdate`, and embedded resource
+  reads), `session/cancel`, `session/resume` (register + replay),
+  `session/list`, `session/close`, `session/fork`, `session/delete`, and
+  `ask_user` → `session/request_permission` (v2 title+options+outcome).
+  Verified with an in-process v2 client test covering the whole lifecycle
+  (negotiate V2 → new → echo stream → ask → cancel → list → fork → resume →
+  close → delete). The ri-specific `_ri/*` custom methods remain v1-only.
 
 
 - **ACP headless server**: `ri --serve` exposes the agent loop over the
