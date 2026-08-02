@@ -1,18 +1,19 @@
-//! The `rustc` tool — compile a custom tool inside the sandbox (bootstrapping).
+//! The `muslcc` tool — compile C inside the sandbox (bootstrapping, C side).
 //!
-//! Implements `docs/CONTAINER-RUNTIME-SPEC.md` §6: the agent supplies a Rust
-//! **single-file source**; the tool compiles it **inside the sandbox** to a
-//! static musl binary and installs it into the host custom-tools directory
-//! (`~/.ri/tools`), where `load_custom_tools()` picks it up so the agent can
-//! invoke it on a following turn.
+//! The sister tool to `rustc`: the agent supplies a **single-file C source**;
+//! this tool compiles it **inside the sandbox** with the bundled musl C cross
+//! compiler and installs the resulting static binary into the host
+//! custom-tools directory (`~/.ri/tools`).
 //!
-//! The compiler is the sandbox's self-owned **musl-host** Rust toolchain
-//! (`scripts/fetch-rust-toolchain.sh` → bound read-only at `/toolchain`), NOT
-//! the system rustup. Pure-Rust (std-only) sources need no musl dev libraries:
-//! Rust's `-C link-self-contained=yes` ships `libc.a` + CRT + `libunwind.a`
-//! for the target. For plain **C** sources use the sibling `muslcc` tool
-//! (spec §17, bundled musl.cc cross compiler); the `cc`-crate path would
-//! additionally need the crates' source vendored next to the tool.
+//! Compiler: musl.cc `x86_64-linux-musl-cross` (fetched by
+//! `scripts/fetch-rust-toolchain.sh` into `rootfs/toolchain/musl-cross`, bound
+//! into the sandbox at its canonical `/x86_64-linux-musl-cross` prefix). The
+//! driver is a fully static i386 binary and relocatable, so it boots inside
+//! the strict musl-only image with **no host musl-dev and no extra libs** —
+//! the cross toolchain carries its own musl and produces a static-pie binary
+//! with `-static`. C sources that merely include `<stdio.h>`/`<stdlib.h>` etc.
+//! build out of the box; third-party C libraries must be vendored alongside
+//! (see `docs/CONTAINER-RUNTIME-SPEC.md` §16).
 
 use std::pin::Pin;
 
@@ -21,22 +22,33 @@ use serde_json::Value;
 use super::custom::custom_tool_dirs;
 use super::subprocess::SubprocessCommand;
 use crate::agent::types::{Tool, ToolCallContext, ToolResult};
-use crate::container::rootfs::{TOOLCHAIN_TRIPLE, toolchain_candidates, toolchain_valid};
+use crate::container::rootfs::{toolchain_candidates, toolchain_valid};
 
-/// Path of the bundled LINKER inside the sandbox (rust-lld, no external ld).
-pub const RUST_LD: &str = "/toolchain/lib/rustlib/x86_64-unknown-linux-musl/bin/rust-lld";
+/// Sandbox path of the cross gcc (bound into the image at the canonical musl.cc
+/// prefix so its relocatable sysroot resolution finds `<prefix>/x86_64-linux-musl`).
+pub const CROSS_GCC: &str = "/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc";
+
+/// The cross gcc sub-directory inside each (potentially valid) toolchain dir.
+const CROSS_REL: &str = "musl-cross/bin/x86_64-linux-musl-gcc";
+
+/// Returns true when a provisioned toolchain ships the musl C cross compiler.
+pub fn musl_cross_provisioned() -> bool {
+    toolchain_candidates()
+        .iter()
+        .filter(|d| toolchain_valid(d))
+        .any(|d| d.join(CROSS_REL).is_file())
+}
 
 #[derive(serde::Deserialize)]
-struct RustcArgs {
-    /// The complete Rust source of the tool (uses std + no crates).
+struct MuslccArgs {
+    /// The complete C source of the tool (single translation unit).
     source: String,
-    /// Output tool name (filename inside the tools dir). Optional; derived
-    /// from the first `fn` if absent.
+    /// Output tool name (filename inside the tools dir). Optional.
     #[serde(default)]
     name: Option<String>,
 }
 
-pub struct RustcTool;
+pub struct MuslccTool;
 
 /// Sanitize a user-supplied tool name into a safe filename token.
 fn sanitize_name(raw: &str) -> String {
@@ -50,7 +62,7 @@ fn sanitize_name(raw: &str) -> String {
     }
     let out = out.trim_matches(['.', '-', '_']);
     if out.is_empty() {
-        "ri_tool".to_string()
+        "ri_c_tool".to_string()
     } else {
         out.to_string()
     }
@@ -63,18 +75,17 @@ const PROTOCOL_HINT: &str = "the compiled tool must implement the custom-tool \
                              JSON args on stdin produce a result on stdout. \
                              It becomes active on the next tool (re)load.";
 
-impl Tool for RustcTool {
+impl Tool for MuslccTool {
     fn name(&self) -> &str {
-        "rustc"
+        "muslcc"
     }
 
     fn description(&self) -> &str {
-        "Compile a single-file Rust program into a static musl custom tool \
-         inside the sandbox and install it in the custom-tools directory \
-         (~/.ri/tools). The tool then follows the custom-tool protocol: \
-         `--describe` prints a JSON descriptor; JSON on stdin returns a result \
-         on stdout. Requires the sandbox (--sandbox) and the provisioned Rust \
-         toolchain."
+        "Compile a single-file C program into a static musl custom tool inside \
+         the sandbox and install it in the custom-tools directory (~/.ri/tools). \
+         The tool then follows the custom-tool protocol: `--describe` prints a \
+         JSON descriptor; JSON on stdin returns a result on stdout. Requires the \
+         sandbox (--sandbox) and the provisioned musl C cross toolchain."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -83,7 +94,7 @@ impl Tool for RustcTool {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Complete Rust 2021 source of the tool (std only, no external crates). Implement fn main() that parses an optional --describe flag and JSON args on stdin."
+                    "description": "Complete C11 source of the tool (single translation unit; stdio/stdlib ok). Implement main() that parses an optional --describe flag and JSON args on stdin."
                 },
                 "name": {
                     "type": "string",
@@ -106,26 +117,27 @@ impl Tool for RustcTool {
         Box::pin(async move {
             if !ctx.sandbox {
                 return ToolResult::err(
-                    "the `rustc` bootstrap tool compiles inside the sandbox; \
+                    "the `muslcc` bootstrap tool compiles inside the sandbox; \
                      start ri with --sandbox (or sandbox = true in config.toml)",
                 );
             }
-            let parsed: RustcArgs = match serde_json::from_value(args) {
+            let parsed: MuslccArgs = match serde_json::from_value(args) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::err(format!("bad arguments: {e}")),
             };
 
-            // The compiler must be provisioned (self-owned toolchain; env /
-            // repo-staging / cache — see rootfs::toolchain_candidates).
-            if !toolchain_candidates().iter().any(|d| toolchain_valid(d)) {
+            // The cross compiler must be provisioned (fetched together with the
+            // Rust toolchain by scripts/fetch-rust-toolchain.sh).
+            if !musl_cross_provisioned() {
                 return ToolResult::err(
-                    "no Rust toolchain provisioned: run \
-                     `scripts/fetch-rust-toolchain.sh` (see \
-                     docs/CONTAINER-RUNTIME-SPEC.md §16)",
+                    "no musl C cross toolchain provisioned: run \
+                     `scripts/fetch-rust-toolchain.sh` (it also fetches \
+                     musl.cc x86_64-linux-musl-cross into rootfs/toolchain; \
+                     see docs/CONTAINER-RUNTIME-SPEC.md §16)",
                 );
             }
 
-            let name = sanitize_name(parsed.name.as_deref().unwrap_or("ri_tool"));
+            let name = sanitize_name(parsed.name.as_deref().unwrap_or("ri_c_tool"));
 
             // Host-side tools dir that /tools maps to (custom_tool_dirs()[0]
             // is the shared tools dir; ensure it exists so the bind has a
@@ -144,31 +156,19 @@ impl Tool for RustcTool {
             // Write the source into the shared /tmp (inside the sandbox it is
             // visible at the same absolute path via the /tmp bind).
             let src_host =
-                std::env::temp_dir().join(format!("ri-rustc-{}-{name}.rs", std::process::id()));
+                std::env::temp_dir().join(format!("ri-muslcc-{}-{name}.c", std::process::id()));
             if let Err(e) = std::fs::write(&src_host, parsed.source.as_bytes()) {
                 return ToolResult::err(format!("cannot write source: {e}"));
             }
 
-            let rustc = "/toolchain/bin/rustc";
-            let mut cmd = SubprocessCommand::new(rustc);
-            cmd = cmd
-                .arg("--target")
-                .arg(TOOLCHAIN_TRIPLE)
-                .sandboxed(ctx.sandbox);
-            for flag in [
-                "link-self-contained=yes",
-                "linker-flavor=ld.lld",
-                "target-feature=+crt-static",
-                "opt-level=2",
-            ] {
-                cmd = cmd.arg("-C").arg(flag);
-            }
-            cmd = cmd.arg("-C").arg(format!("linker={RUST_LD}"));
-            cmd = cmd
+            let cmd = SubprocessCommand::new(CROSS_GCC)
+                .arg("-static")
+                .arg("-O2")
                 .arg("-o")
                 .arg(format!("/tools/{name}"))
                 .arg(src_host.to_string_lossy().into_owned())
-                .current_dir(std::env::temp_dir().to_string_lossy());
+                .current_dir(std::env::temp_dir().to_string_lossy())
+                .sandboxed(ctx.sandbox);
 
             let result = cmd.run(ctx).await;
             let _ = std::fs::remove_file(&src_host);
@@ -176,9 +176,9 @@ impl Tool for RustcTool {
             if result.is_error {
                 let detail = result.content.as_text();
                 return ToolResult::err(format!(
-                    "rustc failed:\n{detail}\n\nCompile errors above; if the \
-                     source needs C libraries, the sandbox does not yet ship a \
-                     musl C cross toolchain (spec §16 note)."
+                    "muslcc failed:\n{detail}\n\nThe cross compiler carries its \
+                     own musl (no host musl-dev needed); if you need a \
+                     third-party C library, vendor it next to the source."
                 ));
             }
 
@@ -218,19 +218,22 @@ mod tests {
     }
 
     fn tmp(dir: &str, tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("ri-rustc-{tag}-{dir}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("ri-muslcc-{tag}-{dir}-{}", std::process::id()))
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn rustc_tool_bootstraps_static_tool_into_tools_dir() {
+    async fn muslcc_tool_bootstraps_static_c_tool_into_tools_dir() {
         use crate::container::rootfs::assemble_image;
 
         if !userns_available() {
             eprintln!("SKIP: unprivileged user namespaces unavailable");
             return;
         }
-        if !toolchain_candidates().iter().any(|d| toolchain_valid(d)) {
-            eprintln!("SKIP: no Rust toolchain provisioned (fetch-rust-toolchain.sh)");
+        if !musl_cross_provisioned() {
+            eprintln!(
+                "SKIP: no musl C cross toolchain provisioned \
+                 (scripts/fetch-rust-toolchain.sh)"
+            );
             return;
         }
         let _g = crate::container::SANDBOX_ENV_LOCK.lock().await;
@@ -241,10 +244,10 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
         std::fs::create_dir_all(&img).ok();
         std::fs::create_dir_all(home.join(".ri").join("tools")).unwrap();
-        let tools_bin = home.join(".ri").join("tools").join("greet_tool");
+        let tools_bin = home.join(".ri").join("tools").join("greet_c");
 
         // Point image/toolchain/home at scratch + real assets for the duration
-        // (edition-2024 unsafe; serialized by ENV_LOCK).
+        // (edition-2024 unsafe; serialized by SANDBOX_ENV_LOCK).
         unsafe {
             std::env::set_var("RI_SANDBOX_IMAGE", &img);
             std::env::set_var("RI_SANDBOX_TOOLCHAIN", toolchain_candidates()[0].clone());
@@ -253,62 +256,65 @@ mod tests {
         assemble_image(&img).expect("assemble scratch image");
 
         let source = r#"
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--describe") {
-        println!("{}", "{\"name\":\"greet_tool\",\"description\":\"greets\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}");
-        return;
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--describe") == 0) {
+        printf("{\"name\":\"greet_c\",\"description\":\"greets from C\",\"parameters_schema\":{\"type\":\"object\",\"properties\":{}}}");
+        return 0;
     }
-    let who = args.iter().skip(1).next().map(|s| s.as_str()).unwrap_or("nobody");
-    println!("GREET-OK:{}", who);
+    char who[128] = "nobody";
+    if (argc > 1) { snprintf(who, sizeof who, "%s", argv[1]); }
+    printf("GREET-C:%s\n", who);
+    return 0;
 }
 "#;
 
         let ctx = ToolCallContext {
-            id: "rustc-boot".to_string(),
+            id: "muslcc-boot".to_string(),
             tx: None,
             cancel_rx: None,
             subagent: None,
             root: Some(home.clone()),
             sandbox: true,
         };
-        let result = RustcTool
-            .run(json!({"source": source, "name": "greet_tool"}), ctx)
+        let result = MuslccTool
+            .run(json!({"source": source, "name": "greet_c"}), ctx)
             .await;
         let text = result.content.as_text().to_string();
-        assert!(!result.is_error, "rustc bootstrap failed: {text}");
+        assert!(!result.is_error, "muslcc bootstrap failed: {text}");
         assert!(
             tools_bin.is_file(),
             "compiled tool must land in ~/.ri/tools"
         );
 
-        // Run the freshly compiled static tool inside the sandbox.
+        // Run the freshly compiled static C tool inside the sandbox.
         let run_ctx = ToolCallContext {
-            id: "rustc-run".to_string(),
+            id: "muslcc-run".to_string(),
             tx: None,
             cancel_rx: None,
             subagent: None,
             root: Some(home.clone()),
             sandbox: true,
         };
-        let out = crate::agent::tools::subprocess::SubprocessCommand::new("/tools/greet_tool")
+        let out = crate::agent::tools::subprocess::SubprocessCommand::new("/tools/greet_c")
             .arg("world")
             .sandboxed(true)
             .run(run_ctx)
             .await;
         let out_text = out.content.as_text().to_string();
         assert!(
-            !out.is_error && out_text.contains("GREET-OK:world"),
-            "compiled static tool must run in the sandbox: {out_text}"
+            !out.is_error && out_text.contains("GREET-C:world"),
+            "compiled static C tool must run in the sandbox: {out_text}"
         );
 
-        // Hot-reload: a fresh registry (same process, same $HOME) must pick
-        // the compiled binary up right away — no app restart needed.
+        // Hot-reload: the fresh binary must be visible to a registry refresh
+        // and runnable through the custom-tool protocol (--describe).
         let mut registry = crate::agent::types::ToolRegistry::new();
         crate::agent::tools::custom::refresh_custom_tools(&mut registry);
         assert!(
-            registry.contains_key("greet_tool"),
-            "compiled tool must hot-reload into the registry"
+            registry.contains_key("greet_c"),
+            "compiled C tool must hot-reload into the registry"
         );
 
         unsafe {

@@ -228,6 +228,16 @@ pub fn run_child(image: &Path, argv: &[String], binds: &[Binds]) -> io::Result<(
         if gcc.is_file() && gcc_dst.is_file() {
             let _ = bind_mount(&gcc.to_string_lossy(), &gcc_dst);
         }
+        // musl C cross compiler (musl.cc `x86_64-linux-musl-cross`, bundled at
+        // `<tc>/musl-cross`). Its driver is a fully static i386 binary and it
+        // is relocatable (empty `--prefix`; sysroot resolved relative to the
+        // gcc location), so binding it at the canonical install prefix is all
+        // that is needed — no host musl-dev, no extra libs.
+        let xcc = tc_dir.join("musl-cross");
+        let xcc_mount = image.join("x86_64-linux-musl-cross");
+        if xcc.is_dir() && xcc_mount.is_dir() {
+            let _ = bind_mount(&xcc.to_string_lossy(), &xcc_mount);
+        }
     }
 
     // ── device nodes (best-effort single-file binds over placeholders) ─────
@@ -256,7 +266,7 @@ pub fn run_child(image: &Path, argv: &[String], binds: &[Binds]) -> io::Result<(
                 std::ptr::null(),
             )
         };
-        let _ = rc;
+        let _ = rc; // best-effort: on hosts without procfs, tools fall back
     }
 
     // ── writable scratch: /tmp shared with the host ────────────────────────
@@ -336,6 +346,23 @@ pub fn run_child(image: &Path, argv: &[String], binds: &[Binds]) -> io::Result<(
         apply_rlimits(&limits);
     }
 
+    // ── seccomp denylist (spec §7): block namespace/fs/kernel escapes ─────
+    // Default-action ALLOW keeps tools (and cargo / network stacks) working;
+    // a curated set of syscalls that could leak into or mutate the host is
+    // instead answered with EPERM. Installed after RLIMIT, before exec, in
+    // this single-threaded child.
+    if std::env::var("RI_SANDBOX_NO_SECCOMP")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+    {
+        eprintln!("sandbox: seccomp disabled by RI_SANDBOX_NO_SECCOMP");
+    } else {
+        match install_seccomp_denylist() {
+            Ok(()) => {}
+            Err(e) => eprintln!("sandbox: seccomp install failed, continuing: {e}"),
+        }
+    }
+
     if argv.is_empty() {
         return Err(io::Error::other("sandbox: empty command"));
     }
@@ -406,6 +433,299 @@ fn apply_rlimits(spec: &str) {
     }
 }
 
+// ── seccomp (spec §7): raw-BPF denylist ──────────────────────────────────────
+//
+// The shipped BPF answers `SECCOMP_RET_ERRNO(EPERM)` for a curated list of
+// syscalls that could leak into or mutate the host, and lets everything else
+// through (denylist, not allowlist — cargo, network stacks and the varied
+// tool behaviours keep working). Written by hand as raw `sock_filter`s so the
+// musl-static `ri-sandbox` binary needs no extra dependency.
+//
+// Blocked classes:
+// - mount-namespace / chroot escapes: mount, umount*, pivot_root, chroot,
+//   open_by_handle_at / name_to_handle_at (file-handle walkouts), unshare,
+//   setns, mknod / mknodat (device node creation),
+// - SysV shared memory: shmget/shmctl/shmat/shmdt (host-VISIBLE because the
+//   sandbox does not create its own IPC namespace),
+// - kernel interface abuse: init/finit/delete_module, reboot, kexec*,
+//   bpf, perf_event_open, userfaultfd, io_uring_*, fanotify_*,
+// - cross-process/trace: ptrace, process_vm_readv/writev, kcmp,
+// - kernel keyring (host side effects): keyctl, add_key, request_key,
+// - host-visible hostname/privilege knobs: sethostname, setdomainname,
+//   ioperm, iopl, reboot, syslog, acct, quotactl, swapon/swapoff, modify_ldt,
+// - raw packet sockets: socket(AF_PACKET) via an argument filter on arg[0].
+//
+// Since the child is single-threaded here, the filter is installed before any
+// threads exist and therefore applies to every future thread and to exec'd
+// programs. `$RI_SANDBOX_NO_SECCOMP=1` skips installation (debug escape).
+
+/// x86_64 syscall numbers used by the denylist. Kept as literals instead of
+/// `libc::SYS_*` because several (io_uring, open_by_handle_at) are not
+/// defined for the musl target in the `libc` crate.
+///
+/// A second, I386 list exists because the bundled musl.cc `x86_64-linux-musl-
+/// cross` C compiler is a *32-bit* static driver (i386), so the filter must
+/// boot both architectures (`unshare(CLONE_NEWUSER)` on x86_64 hosts runs
+/// legacy i386 binaries; killing them would break the muslcc tool). Syscall
+/// numbers differ per arch, hence two chains. On i386 SysV IPC goes through
+/// the `ipc(2)` multiplexer (117) and raw sockets through `socketcall(2)`
+/// — neither is argument-filterable here, so those two gaps are accepted.
+const DENY_SYSCALLS_X86_64: &[u64] = &[
+    165, // mount
+    23,  // umount (legacy)
+    166, // umount2
+    155, // pivot_root
+    161, // chroot
+    272, // unshare
+    308, // setns
+    304, // open_by_handle_at
+    303, // name_to_handle_at
+    133, // mknod
+    259, // mknodat
+    29,  // shmget
+    30,  // shmctl
+    31,  // shmat
+    32,  // shmdt
+    175, // init_module
+    176, // delete_module
+    313, // finit_module
+    169, // reboot
+    246, // kexec_load
+    320, // kexec_file_load
+    321, // bpf
+    298, // perf_event_open
+    323, // userfaultfd
+    425, // io_uring_setup
+    426, // io_uring_enter
+    427, // io_uring_register
+    300, // fanotify_init
+    301, // fanotify_mark
+    101, // ptrace
+    310, // process_vm_readv
+    311, // process_vm_writev
+    312, // kcmp
+    250, // keyctl
+    248, // add_key
+    249, // request_key
+    170, // sethostname
+    171, // setdomainname
+    172, // ioperm
+    173, // iopl
+    103, // syslog
+    163, // acct
+    179, // quotactl
+    167, // swapon
+    168, // swapoff
+    154, // modify_ldt
+];
+
+/// `socket` syscall id (x86_64) and the AF_PACKET domain value used to reject
+/// raw packet sockets without blocking normal networking.
+const SYS_SOCKET_X86_64: u64 = 41;
+const AF_PACKET: u64 = 17;
+
+/// I386 (32-bit) syscall numbers for the same deny classes. Differs from the
+/// x86_64 table (IPC multiplexed, no native socket subcalls to filter).
+#[rustfmt::skip]
+const DENY_SYSCALLS_I386: &[u64] = &[
+    21,   // mount
+    22,   // umount (legacy)
+    52,   // umount2
+    217,  // pivot_root
+    61,   // chroot
+    310,  // unshare
+    346,  // setns
+    342,  // open_by_handle_at
+    341,  // name_to_handle_at
+    14,   // mknod
+    397,  // mknodat
+    117,  // ipc (SysV shm/sem/msg multiplexer)
+    128,  // init_module
+    129,  // delete_module
+    379,  // finit_module
+    88,   // reboot
+    283,  // kexec_load
+    372,  // kexec_file_load
+    357,  // bpf
+    336,  // perf_event_open
+    374,  // userfaultfd
+    425,  // io_uring_setup
+    426,  // io_uring_enter
+    427,  // io_uring_register
+    358,  // fanotify_init
+    359,  // fanotify_mark
+    26,   // ptrace
+    347,  // process_vm_readv
+    348,  // process_vm_writev
+    349,  // kcmp
+    288,  // keyctl
+    286,  // add_key
+    287,  // request_key
+    74,   // sethostname
+    75,   // setdomainname
+    101,  // ioperm
+    110,  // iopl
+    103,  // syslog
+    51,   // acct
+    131,  // quotactl
+    87,   // swapon
+    115,  // swapoff
+    123,  // modify_ldt
+];
+
+// BPF instruction constants (linux/filter.h).
+const BPF_LD: u16 = 0x00;
+const BPF_W: u16 = 0x00;
+const BPF_ABS: u16 = 0x20;
+const BPF_JMP: u16 = 0x05;
+const BPF_JEQ: u16 = 0x10;
+const BPF_RET: u16 = 0x06;
+const BPF_K: u16 = 0x00;
+
+// struct seccomp_data field offsets.
+const SECCOMP_NR_OFF: u32 = 0;
+const SECCOMP_ARCH_OFF: u32 = 4;
+const SECCOMP_ARG0_OFF: u32 = 16;
+
+// AUDIT_ARCH_* = EM_* | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE.
+//   X86_64 = 62 | 0x80000000 | 0x40000000 ; I386 = 3 | 0x40000000 (32-bit LE).
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+
+// seccomp return actions.
+const RET_ALLOW: u32 = 0x7fff_0000;
+const RET_ERRNO_EPERM: u32 = 0x0005_0001;
+const RET_KILL: u32 = 0x8000_0000;
+
+fn inst(code: u16, k: u32) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+/// Build one architecture's deny chain: `[LD nr]` + one `JEQ` per denied
+/// syscall (matching jumps to the EPERM terminal), an optional raw-socket
+/// sub-branch, the ALLOW terminal, then the shared EPERM deny terminal.
+/// Everything is self-contained — only internal (8-bit) relative jumps.
+fn build_arch_chain(deny: &[u64], socket_nr: Option<u64>) -> Vec<libc::sock_filter> {
+    let mut c: Vec<libc::sock_filter> = Vec::with_capacity(4 + deny.len());
+    c.push(inst(BPF_LD | BPF_W | BPF_ABS, SECCOMP_NR_OFF)); // 0
+    let chain_start = c.len(); // 1
+    for nr in deny {
+        c.push(inst(BPF_JMP | BPF_JEQ, (*nr) as u32));
+    }
+
+    if let Some(sn) = socket_nr {
+        let s = c.len();
+        c.push(inst(BPF_LD | BPF_W | BPF_ABS, SECCOMP_NR_OFF)); // S
+        c.push(inst(BPF_JMP | BPF_JEQ, sn as u32)); // S+1
+        c.push(inst(BPF_RET | BPF_K, RET_ALLOW)); // S+2 (not a socket call)
+        c.push(inst(BPF_LD | BPF_W | BPF_ABS, SECCOMP_ARG0_OFF)); // S+3
+        c.push(inst(BPF_JMP | BPF_JEQ, AF_PACKET as u32)); // S+4
+        c.push(inst(BPF_RET | BPF_K, RET_ALLOW)); // S+5 (socket, ok family)
+
+        let d = c.len(); // the deny terminal
+        c.push(inst(BPF_RET | BPF_K, RET_ERRNO_EPERM));
+
+        // Patch the deny JEQs and the two socket-branch JEQs to `d`.
+        for (i, _) in deny.iter().enumerate() {
+            let idx = chain_start + i;
+            let target = d - idx - 1;
+            assert!(target < 256, "seccomp deny chain too long");
+            c[idx].jt = target as u8;
+        }
+        c[s + 1].jt = 1; // socket match → [S+3]
+        let target = d - (s + 4) - 1;
+        assert!(target < 256, "seccomp AF_PACKET branch too long");
+        c[s + 4].jt = target as u8;
+    } else {
+        let allow = c.len();
+        c.push(inst(BPF_RET | BPF_K, RET_ALLOW));
+        let d = c.len(); // deny terminal
+        c.push(inst(BPF_RET | BPF_K, RET_ERRNO_EPERM));
+
+        for (i, _) in deny.iter().enumerate() {
+            let idx = chain_start + i;
+            let target = d - idx - 1;
+            assert!(target < 256, "seccomp deny chain too long");
+            c[idx].jt = target as u8;
+        }
+        let _ = allow; // non-matching syscalls fall through to it
+    }
+    c
+}
+
+/// Build the dual-arch denylist program (layout below). Kept separate from
+/// [`install_seccomp_denylist`] so tests can verify the BPF without installing
+/// it (which needs a single-threaded process).
+fn build_denylist_program() -> Vec<libc::sock_filter> {
+    //   [0]  LD arch
+    //   [1]  JEQ AUDIT_ARCH_X86_64   jt→x64_start   jf=0
+    //   [2]  JEQ AUDIT_ARCH_I386     jt→i386_start  jf=0
+    //   [3]  RET_KILL               (unknown arch)
+    //   x64_start:  x86_64 chain (deny + AF_PACKET socket check)
+    //   i386_start: i386  chain (deny; IPC/socketcall gaps documented above)
+    let mut prog: Vec<libc::sock_filter> =
+        Vec::with_capacity(4 + DENY_SYSCALLS_X86_64.len() + DENY_SYSCALLS_I386.len());
+    prog.push(inst(BPF_LD | BPF_W | BPF_ABS, SECCOMP_ARCH_OFF)); // 0
+    prog.push(inst(BPF_JMP | BPF_JEQ, AUDIT_ARCH_X86_64)); // 1
+    prog.push(inst(BPF_JMP | BPF_JEQ, AUDIT_ARCH_I386)); // 2
+    prog.push(inst(BPF_RET | BPF_K, RET_KILL)); // 3
+
+    let x64_start = prog.len();
+    let x64 = build_arch_chain(DENY_SYSCALLS_X86_64, Some(SYS_SOCKET_X86_64));
+    let i386_start = x64_start + x64.len();
+    let i386 = build_arch_chain(DENY_SYSCALLS_I386, None);
+    prog.extend(x64);
+    prog.extend(i386);
+
+    // Patch the arch dispatch jumps (8-bit; total program stays well under
+    // 256 instructions, so the offsets fit).
+    let x64_jt = x64_start - 1 - 1;
+    let i386_jt = i386_start - 2 - 1;
+    assert!(
+        x64_jt < 256 && i386_jt < 256,
+        "seccomp arch dispatch too long"
+    );
+    prog[1].jt = x64_jt as u8;
+    prog[2].jt = i386_jt as u8;
+    prog
+}
+
+/// Install the denylist filter. Returns an error describing a
+/// `seccomp(2)`/`prctl(2)` failure (caller logs and continues).
+fn install_seccomp_denylist() -> io::Result<()> {
+    let mut prog = build_denylist_program();
+
+    // SAFETY: `prctl`/`seccomp` only set the no-new-privs flag and install the
+    // just-built filter; the pointers we pass are derived from `prog` which
+    // outlives the call. Single-threaded child (pre-tokio ri-sandbox), so the
+    // TSYNC flag is unnecessary — the filter applies to the whole (single)
+    // thread and is inherited by future threads and exec'd programs.
+    let rc = unsafe {
+        let pnn = libc::prctl(38 /* PR_SET_NO_NEW_PRIVS */, 1, 0, 0, 0);
+        if pnn != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fprog = libc::sock_fprog {
+            len: prog.len() as u16,
+            filter: prog.as_mut_ptr(),
+        };
+        libc::syscall(
+            317, /* SYS_seccomp */
+            1,   /* SECCOMP_SET_MODE_FILTER */
+            0, &fprog,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// A host → guest bind request passed into the child.
 #[derive(Debug, Clone)]
 pub struct Binds {
@@ -432,6 +752,95 @@ mod tests {
         let b = bind("/home/x", "/work");
         assert_eq!(b.host, "/home/x");
         assert_eq!(b.guest, "/work");
+    }
+
+    #[test]
+    fn denylist_program_layout_is_sound() {
+        let prog = build_denylist_program();
+
+        // Dispatch head: LD arch ; JEQ X86_64 ; JEQ I386 ; RET_KILL.
+        assert_eq!(prog[0].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(prog[0].k, SECCOMP_ARCH_OFF);
+        assert_eq!(prog[1].code, BPF_JMP | BPF_JEQ);
+        assert_eq!(prog[1].k, AUDIT_ARCH_X86_64);
+        assert_eq!(prog[2].code, BPF_JMP | BPF_JEQ);
+        assert_eq!(prog[2].k, AUDIT_ARCH_I386);
+        assert_eq!(prog[3].code, BPF_RET | BPF_K);
+        assert_eq!(prog[3].k, RET_KILL);
+
+        let x64_start = 4usize;
+        let n64 = DENY_SYSCALLS_X86_64.len();
+        let ni = DENY_SYSCALLS_I386.len();
+
+        // x86_64 chain: [LD nr] + n64 denies + 6-insn socket sub-branch + EPERM.
+        let d_x64 = x64_start + 1 + n64 + 6;
+        for (i, nr) in DENY_SYSCALLS_X86_64.iter().enumerate() {
+            let idx = x64_start + 1 + i;
+            assert_eq!(prog[idx].code, BPF_JMP | BPF_JEQ, "x64 deny {i}");
+            assert_eq!(prog[idx].k, *nr as u32, "x64 deny {i} syscall id");
+            assert_eq!(
+                idx + 1 + prog[idx].jt as usize,
+                d_x64,
+                "x64 deny {i} must terminate at the EPERM terminal"
+            );
+        }
+        // Socket sub-branch: not-socket and allowed-family fall to ALLOW;
+        // AF_PACKET terminates at the same EPERM terminal.
+        let s = x64_start + 1 + n64;
+        assert_eq!(prog[s].k, SECCOMP_NR_OFF);
+        assert_eq!(prog[s + 1].k, SYS_SOCKET_X86_64 as u32);
+        assert_eq!(prog[s + 1].jt, 1);
+        assert_eq!(prog[s + 2].code, BPF_RET | BPF_K);
+        assert_eq!(prog[s + 2].k, RET_ALLOW);
+        assert_eq!(prog[s + 3].k, SECCOMP_ARG0_OFF);
+        assert_eq!(prog[s + 4].k, AF_PACKET as u32);
+        assert_eq!(
+            s + 4 + 1 + prog[s + 4].jt as usize,
+            d_x64,
+            "AF_PACKET must terminate at the EPERM terminal"
+        );
+        assert_eq!(prog[s + 5].code, BPF_RET | BPF_K);
+        assert_eq!(prog[s + 5].k, RET_ALLOW);
+        assert_eq!(prog[d_x64].code, BPF_RET | BPF_K);
+        assert_eq!(prog[d_x64].k, RET_ERRNO_EPERM);
+
+        // i386 chain follows immediately after the x86_64 one.
+        let i386_start = d_x64 + 1;
+        assert_eq!(prog[1].jt as usize, x64_start - 2, "x86_64 dispatch offset");
+        assert_eq!(prog[2].jt as usize, i386_start - 3, "i386 dispatch offset");
+        // i386 chain: [LD nr] + ni denies + ALLOW + EPERM (no socket branch).
+        let d_i386 = i386_start + 2 + ni;
+        for (i, nr) in DENY_SYSCALLS_I386.iter().enumerate() {
+            let idx = i386_start + 1 + i;
+            assert_eq!(prog[idx].code, BPF_JMP | BPF_JEQ, "i386 deny {i}");
+            assert_eq!(prog[idx].k, *nr as u32, "i386 deny {i} syscall id");
+            assert_eq!(
+                idx + 1 + prog[idx].jt as usize,
+                d_i386,
+                "i386 deny {i} must terminate at the EPERM terminal"
+            );
+        }
+        assert_eq!(prog[d_i386 - 1].code, BPF_RET | BPF_K);
+        assert_eq!(prog[d_i386 - 1].k, RET_ALLOW);
+        assert_eq!(prog[d_i386].code, BPF_RET | BPF_K);
+        assert_eq!(prog[d_i386].k, RET_ERRNO_EPERM);
+        assert_eq!(prog.len(), d_i386 + 1, "no trailing instructions");
+    }
+
+    #[test]
+    fn denylist_has_no_duplicate_syscalls() {
+        for (name, list) in [
+            ("x86_64", DENY_SYSCALLS_X86_64),
+            ("i386", DENY_SYSCALLS_I386),
+        ] {
+            let mut sorted = list.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), list.len(), "duplicate deny syscall ({name})");
+        }
+        // The AF_PACKET sub-branch must not collide with the plain denies.
+        assert_eq!(SYS_SOCKET_X86_64, 41);
+        assert_eq!(AF_PACKET, 17);
     }
 
     #[test]

@@ -277,6 +277,7 @@ async fn stream_assistant_turn(
 /// already-emitted tool calls complete in order.
 async fn execute_tool_batch(
     config: &AgentLoopConfig,
+    tools: &ToolRegistry,
     pending_tool_calls: &[(String, String, serde_json::Value)],
     tx: &UnboundedSender<AppEvent>,
     cancel_rx: &tokio::sync::watch::Receiver<CancelLevel>,
@@ -295,7 +296,7 @@ async fn execute_tool_batch(
                 &id,
                 &name,
                 args.clone(),
-                &config.tools,
+                tools,
                 &config.tool_output_log,
                 Some(tx.clone()),
             )
@@ -370,7 +371,10 @@ pub async fn run_agent_loop(
     mut steering_rx: UnboundedReceiver<String>,
     cancel_rx: tokio::sync::watch::Receiver<crate::agent::types::CancelLevel>,
 ) {
-    let tool_defs: Vec<ToolDefinition> = build_sorted_tool_defs(&config.tools);
+    // A local registry so freshly compiled custom tools (rustc / muslcc) are
+    // hot-reloaded into the loop between turns without restarting the app:
+    // `refresh_custom_tools` rescans the custom-tool dirs once per iteration.
+    let mut tools = config.tools.clone();
 
     let mut session_events = config.session_events.clone();
     let mut projection = LlmProjection::new();
@@ -401,6 +405,12 @@ pub async fn run_agent_loop(
         if cancel_level >= CancelLevel::HardAbort {
             return;
         }
+
+        // ── Hot-reload custom tools (newly compiled binaries become callable) ──
+        let tool_defs = {
+            crate::agent::tools::custom::refresh_custom_tools(&mut tools);
+            build_sorted_tool_defs(&tools)
+        };
 
         // ── Check for external file modifications ─────────────────────────────
         let changes = {
@@ -593,8 +603,15 @@ pub async fn run_agent_loop(
                 });
 
                 // ── Execute tool batch ────────────────────────────────────────
-                let batch_outcome =
-                    execute_tool_batch(&config, &calls, &tx, &cancel_rx, &mut session_events).await;
+                let batch_outcome = execute_tool_batch(
+                    &config,
+                    &tools,
+                    &calls,
+                    &tx,
+                    &cancel_rx,
+                    &mut session_events,
+                )
+                .await;
 
                 config
                     .file_tracker

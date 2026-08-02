@@ -7,7 +7,9 @@
 #   - rustc + rust-std for x86_64-unknown-linux-musl (rust-lang dist; host
 #     triple IS musl, so rustc itself runs on musl with no glibc),
 #   - the musl dynamic loader (ld-musl) and libgcc_s (Alpine official
-#     packages) — the two runtime libs the musl-host rustc needs.
+#     packages) — the two runtime libs the musl-host rustc needs,
+#   - optionally the musl.cc `x86_64-linux-musl-cross` C cross-compiler (the
+#     `muslcc` agent tool; fully static → runs inside te strict image).
 #
 # The sandbox image then BINDs this toolchain (read-only) at /toolchain,
 # so the agent can compile custom tools inside the sandbox (see the `rustc`
@@ -28,7 +30,6 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "rust: $RUST_VERSION ($TRIPLE)  musl: $MUSL_VERSION  libgcc: $LIBGCC_VERSION"
-
 # 1. rustc + rust-std (musl-host)
 curl -fsSL "$DIST_BASE/rustc-${RUST_VERSION}-${TRIPLE}.tar.xz"  -o "$TMPDIR/rustc.tar.xz"
 curl -fsSL "$DIST_BASE/rust-std-${RUST_VERSION}-${TRIPLE}.tar.xz" -o "$TMPDIR/std.tar.xz"
@@ -56,4 +57,21 @@ cp "$TMPDIR/lib/ld-musl-x86_64.so.1" "$DEST/lib/ld-musl-x86_64.so.1"
 cp "$TMPDIR/usr/lib/libgcc_s.so.1"   "$DEST/lib/libgcc_s.so.1"
 chmod +x "$DEST/bin/rustc"
 
-echo "toolchain provisioned at $DEST ($(du -sh "$DEST" | cut -f1)) — rustc $RUST_VERSION $TRIPLE"
+# 4. Optional musl C cross toolchain (muslcc agent tool; ~130MB). The static
+# build runs inside the strict sandbox image and brings its own musl (no host
+# musl-dev needed). Skip it with RI_NO_MUSLCC=1.
+if [ "${RI_NO_MUSLCC:-0}" != "1" ]; then
+  # musl.cc ships one host (glibc) and one static 32-bit driver build. The
+  # `x86_64-linux-musl-cross` tarball's gcc driver is a fully STATIC i386
+  # binary (relocatable), so it boots inside the strict musl-only sandbox.
+  MUSLCC_URL="${RI_MUSLCC_URL:-https://musl.cc/x86_64-linux-musl-cross.tgz}"
+  echo "fetch: $MUSLCC_URL"
+  curl -fsSL "$MUSLCC_URL" -o "$TMPDIR/muslcc.tgz"
+  mkdir -p "$DEST/musl-cross"
+  tar -xzf "$TMPDIR/muslcc.tgz" -C "$DEST/musl-cross" --strip-components=1
+  "$DEST/musl-cross/bin/x86_64-linux-musl-gcc" --version | head -n 1 \
+    || echo "warning: cross gcc could not run on host (still provisioned)"
+  echo "musl-cross: $(du -sh "$DEST/musl-cross" | cut -f1) (static host)"
+fi
+
+echo "toolchain provisioned at $DEST ($(du -sh "$DEST" | cut -f1)) — rustc $RUST_VERSION $TRIPLE (+ optional musl-cross)"

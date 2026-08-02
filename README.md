@@ -125,13 +125,15 @@ podman/docker, no root:
 - Resource limits are applied by default
   (`cpu=30s, nproc=64, nofile=2048, as=512MiB, fsize=1GiB, core=0`) and can be
   tuned via `$RI_SANDBOX_RLIMITS` (`none` disables).
-- **Tool bootstrapping**: a `rustc` agent tool compiles Rust source **inside
-  the sandbox** into a static musl custom tool (`~/.ri/tools`), using ri's own
-  downloaded musl-host toolchain — never your system rustup. Pure-Rust (std)
-  sources need no musl dev libraries (`-C link-self-contained=yes` ships
-  `libc.a`+CRT; musl is monolithic). Provision the compiler with
-  `just sandbox-toolchain` / `scripts/fetch-rust-toolchain.sh` (see
-  `docs/CONTAINER-RUNTIME-SPEC.md` §16).
+- **Tool bootstrapping**: `rustc` (Rust) and `muslcc` (C) agent tools compile
+  sources **inside the sandbox** into static musl custom tools (`~/.ri/tools`),
+  using ri's own downloaded toolchains — never your system rustup or host
+  musl-dev. Rust needs no dev libs (`-C link-self-contained=yes` ships
+  `libc.a`+CRT; musl is monolithic); C uses the bundled relocatable musl.cc
+  cross compiler. A `seccomp` denylist (§7) blocks namespace/fs/kernel escapes;
+  freshly compiled tools **hot-reload** into the running agent (no restart).
+  Provision with `just sandbox-toolchain` / `scripts/fetch-rust-toolchain.sh`
+  (see `docs/CONTAINER-RUNTIME-SPEC.md` §16–17).
 - Linux-only; user namespaces must be enabled in the kernel.
 
 See `docs/CONTAINER-RUNTIME-SPEC.md` for the full design spec and its

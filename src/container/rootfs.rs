@@ -138,6 +138,7 @@ const IMAGE_DIRS: &[&str] = &[
     "tools",
     "tools-local",
     "toolchain",
+    "x86_64-linux-musl-cross",
     "home/ri",
     "nix/store",
     "run/current-system/sw",
@@ -250,7 +251,6 @@ fn install_static_sh(image: &Path) -> io::Result<bool> {
     let dst = image.join("bin").join("ri-sh");
     let _ = fs::remove_file(&dst);
     fs::copy(&src, &dst)?;
-    #[cfg(unix)]
     fs::set_permissions(&dst, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     fs::write(
         image.join("bin").join(".ri-sh-source"),
@@ -259,7 +259,6 @@ fn install_static_sh(image: &Path) -> io::Result<bool> {
     // `bin/sh` → `ri-sh` (the bash tool invokes `/bin/sh -c …`).
     let sh_link = image.join("bin").join("sh");
     let _ = fs::remove_file(&sh_link);
-    #[cfg(unix)]
     std::os::unix::fs::symlink("ri-sh", &sh_link)?;
     Ok(true)
 }
@@ -425,7 +424,6 @@ fn copy_host_shell(image: &Path) -> io::Result<bool> {
     let _ = fs::remove_file(&dst);
     fs::copy(src, &dst)?;
     // Give the owner write so future copies / rebuilds are not blocked either.
-    #[cfg(unix)]
     fs::set_permissions(&dst, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     Ok(true)
 }
@@ -443,7 +441,6 @@ fn install_coreutils(image: &Path) -> io::Result<bool> {
     // binary (busybox-style); `coreutils <applet>` also works when invoked
     // directly.
     fs::copy(&src, &dst)?;
-    #[cfg(unix)]
     fs::set_permissions(&dst, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     fs::write(
         image.join("usr").join("bin").join(".coreutils-source"),

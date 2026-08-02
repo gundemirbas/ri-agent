@@ -840,8 +840,8 @@ tasarım spek'ten şu noktalarda üstünlük/güvenilirlik için ayrışıyor:
 |-------|-------|-----|
 | §3 Rootless user namespace | ✅ | `unshare(CLONE_NEWUSER\|CLONE_NEWNS)` + self-uid/gid-map → 0. Root yok, `unshare -Ur` ile aynı mekanizma. |
 | §4 chroot + bind mount | ✅ | `ri-sandbox` alt-süreci (pre-tokio tek-iş-parçacıklı `main`); `/work`, `/tools`, `/tmp`, `/proc`(best-effort), non-secret `/etc/*`, loader lib dir'leri RO. Image root'u RO remount. |
+| §7 Seccomp | ✅ | Denylist BPF (`ri-sandbox` çocuğunda, exec öncesi): mount/unshare/setns/ptrace/process_vm_*/bpf/io_uring/keyctl/sysv-shm/mknod/open_by_handle_at/socket(AF_PACKET) + ns-dışı tehlikeli syscall'lar EPERM ile reddedilir; varsayılan ALLOW (araç çeşitliliği bozulmaz). `RI_SANDBOX_NO_SECCOMP=1` ile kapatılır. |
 | §7 RLIMIT | ✅ | `ri-sandbox`, `sh` çalıştırılmadan önce sert limitler kurar: `RI_SANDBOX_RLIMITS` veya varsayılan `cpu=30,nproc=64,nofile=2048,as=512m,fsize=1g,core=0`. `parse_size` `k/m/g` öneklerini çözer. |
-| §7 Seccomp | ⏭️ Ertelendi | BPF kırılganlığı + araç çeşitliliği (cargo/network). userns+chroot zaten ana sınırı veriyor. |
 | §7 Seccomp | ⏭️ Ertelendi | BPF kırılganlığı + araç çeşitliliği (cargo/network). userns+chroot zaten ana sınırı veriyor. |
 | §8 Host network shared | ✅ | `CLONE_NEWNET` kullanılmıyor → internet açık (crates.io, API). |
 | §9 Dosya yapısı (`src/container/`) | ✅ | `mod.rs`/`rootfs.rs`/`sys.rs`/`bin_sandbox.rs`/`sh_main.rs` + `tests/container_sandbox.rs`. |
@@ -884,10 +884,12 @@ tasarım spek'ten şu noktalarda üstünlük/güvenilirlik için ayrışıyor:
    `passwd/group/resolv.conf/nsswitch.conf/hosts` + `/etc/ssl` (CA cert'ler)
    non-secret dosyalar bağlanır. `/etc/shadow`, `/etc/ssh` vs. görünmez.
 
-5. **Bootstrapping (§6)**: agent henüz sandbox İÇİNDE rustc ile tool
-   derlemiyor; custom tool'lar host'ta musl-static üretilip `/tools`'a konur
-   ve sandbox içinde çalışır (zaten static olduklarından hiçbir lib gerekmez).
-   Sandbox içi rustc, image içeriği büyütülerek ileride eklenebilir.
+5. **Bootstrapping (§6, uygulandı → §16)**: agent sandbox İÇİNDE derliyor —
+   `rustc` aracı (Rust) ve `muslcc` aracı (C), her ikisi de kendi sahip
+   olduğumuz musl-host deriv oluşturur: Rust için resmî musl-host toolchain
+   (`/toolchain`), C için musl.cc `x86_64-linux-musl-cross` (static-host,
+   kendi musl'ünü getirir → host musl-dev gerekmez). Çıkan static binary
+   `/tools`'a iner ve sandbox içinde çalışır.
 
 ### Kullanım
 
@@ -966,13 +968,65 @@ KULLANILMAZ**:
   protokolünü (`--describe`, stdin JSON) didaktik olarak anımsatır.
 - **musl dev kütüphanesi gerektirmez**: saf Rust (std) için
   `self-contained/libc.a + CRT + libunwind.a` yeterlidir; musl monolitik
-  olduğundan `-lm/-lpthread/-ldl` da tek `libc.a`'da. **C-native crate'ler**
-  (`cc`, openssl-sys vb.) ayrı bir musl C cross toolchain (headers+cc+static
-  libs, ör. musl.cc `x86_64-linux-musl-cross`) gerektirir — ileride
-  provisionable bir asset olarak eklenebilir.
+  olduğundan `-lm/-lpthread/-ldl` da tek `libc.a`'da. **C kodu için** musl
+  C cross toolchain'i (§17 `muslcc`) aynı script ile provision edilir; saf C
+  kaynakları kutudan derlenir, üçüncü parti kütüphaneler vendor edilir.
 
 ### Doğrulama
 
 `cargo test rustc_tool_bootstraps` — gerçek `rustc` aracı, sandbox içi derleme,
 tools dizinine iniş ve derlenen statik tool'un sandbox içinde çalıştırılması.
 Gerçek CLI smoke: `ri --print --provider test --sandbox 'tool rustc {…}'`.
+
+---
+
+## 17. C Derleme (`muslcc`), Seccomp Denylist ve Hot-Reload (Uygulandı)
+
+### `muslcc` — musl C cross compiler sandbox içinde
+
+§16'daki "C-native için ayrı bir musl C cross toolchain" notu artık gerçek:
+`scripts/fetch-rust-toolchain.sh`, musl.cc **`x86_64-linux-musl-cross`**
+tarball'ını da indirir (`rootfs/toolchain/musl-cross`, gitignored) ve sandbox'a
+kurarınız:
+
+- musl.cc'nin o sürümünün gcc **driver'ı tamamen static bir i386 binary'si** ve
+  **relocatable** (boş `--prefix`; sysroot gcc'nin kendi konumundan çözülür) —
+  yani strict musl-only image içinde **host musl-dev gerekmeden** koşar, kendi
+  musl'ünü getirir.
+- `ri-sandbox`, `<toolchain>/musl-cross`'u kanonik `/x86_64-linux-musl-cross`
+  önekine bind eder → kendi sysroot'unu (`<prefix>/x86_64-linux-musl`) bulur.
+- `muslcc` aracı: `source` (C) + `name` (ops.) → sandbox içinde
+  `x86_64-linux-musl-gcc -static -O2 -o /tools/{name} /tmp/{src}.c` → static-pie
+  musl binary `/tools/{name}`.
+- Gerçek world: `<stdio.h>/<stdlib.h>` vb. kutudan çıkar; üçüncü parti C
+  kütüphanesi kaynağın yanında vendor edilir (crates.io yok).
+
+### Seccomp denylist (§7, artık ✅)
+
+- Raw-BPF denylist (yeni bağımlılık yok): mount/unshare/setns/pivot_root/
+  chroot/open_by_handle_at/mknod/SysV-shm/module&reboot&kexec/bpf/io_uring/
+  ptrace&process_vm_*/keyctl + socket(AF_PACKET) gibi host'a sızabilecek veya
+  host'u değiştirebilecek syscall'lar **EPERM** ile reddedilir; varsayılan
+  ALLOW olduğundan cargo/ağ farklı araç davranışları bozulmaz.
+- **Dual-arch**: bundled musl.cc gcc i386 (32-bit) driver olduğundan filtre hem
+  AUDIT_ARCH_X86_64 hem AUDIT_ARCH_I386 için ayrı deny zinciri taşır (her ikisi
+  için numbers farklı). Kabul edilen iki boşluk: i386'da SysV IPC/socketcall
+  multiplexer'ları argument-filtrelenemez.
+- `PR_SET_NO_NEW_PRIVS` + exec öncesi tek-iş-parçacıklı çocukta kurulur (TSYNC
+  gerekmez). `$RI_SANDBOX_NO_SECCOMP=1` ile kapatılır.
+- Diferansiyel kanıt (toolchain'siz): statik `coreutils chroot` — filter açıkken
+  EPERM, `RI_SANDBOX_NO_SECCOMP=1` iken geçer; aynı toolchain-gated testte raw
+  `mount` syscall probe'u kullanılır.
+
+### Custom-tool hot-reload (aynı süreçte tool üret → kullan)
+
+- `custom::refresh_custom_tools(&mut registry)`; `run_agent_loop` her tur başında
+  çağırır: `rustc`/`muslcc`'nin derlediği binary **yeniden başlatmadan** bir
+  sonraki turda çağrılabilir. Kural: built-in isimlerine asla dokunmaz; diskten
+  silinen custom tool'lar registry'den düşer; isim çakışmasında built-in kazanır.
+
+### Doğrulama
+
+`cargo test muslcc_tool_bootstraps` (C e2e: derle → tools'a iniş → sandbox'ta
+çalıştır → hot-reload), `cargo test seccomp_denylist` (bütünleşik diferansiyel),
+`cargo test hot_reload` (birim), `cargo test rustc_tool_bootstraps`.

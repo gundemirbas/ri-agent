@@ -408,3 +408,73 @@ fn rlimits_are_applied_inside_the_sandbox() {
     }
     std::fs::remove_dir_all(&img).ok();
 }
+
+#[test]
+fn seccomp_denylist_blocks_chroot_but_keeps_tools_working() {
+    if !userns_available() {
+        eprintln!("SKIP: unprivileged user namespaces unavailable");
+        return;
+    }
+    // Differential proof needs the static coreutils multicall (`chroot`
+    // applet) inside the image; without staged coreutils we cannot drive a
+    // blocked syscall from a shell command, so we skip.
+    if coreutils_candidates().is_empty() {
+        eprintln!("SKIP: no static coreutils provisioned (scripts/fetch-uutils-coreutils.sh)");
+        return;
+    }
+    let _g = unlock_poisoned();
+    let img = scratch("seccomp");
+    assemble_image(&img).expect("assemble");
+    let cwd = img.clone();
+
+    // Baseline: the sandbox still runs ordinary tools with the filter on.
+    let control = in_sandbox(&img, &cwd, &["/bin/sh", "-c", "id -u"]);
+    let t = all_output(&control);
+    assert!(
+        t.contains("0"),
+        "ordinary tools must run under seccomp: {t}"
+    );
+
+    // With the default filter, `chroot` is answered EPERM by seccomp (the
+    // userns root holds CAP_SYS_CHROOT, so the capability alone would allow it
+    // — the block must come from the filter).
+    let blocked = Command::new(SANDBOX)
+        .arg(&img)
+        .arg("--")
+        .args([
+            "/bin/sh",
+            "-c",
+            "coreutils chroot / /bin/true 2>&1; echo RC=$?",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .expect("spawn ri-sandbox (seccomp on)");
+    let blocked_out = all_output(&blocked);
+    assert!(
+        blocked_out.contains("Operation not permitted"),
+        "chroot must be blocked by seccomp: {blocked_out}"
+    );
+
+    // With the escape hatch (`$RI_SANDBOX_NO_SECCOMP=1`) the same chroot
+    // succeeds (it only then fails to exec /bin/true, which stays a no-op
+    // chroot) — proving the differential is the filter, not a capability gap.
+    let open = Command::new(SANDBOX)
+        .arg(&img)
+        .arg("--")
+        .args([
+            "/bin/sh",
+            "-c",
+            "coreutils chroot / /bin/true 2>&1; echo RC=$?",
+        ])
+        .env("RI_SANDBOX_NO_SECCOMP", "1")
+        .current_dir(&cwd)
+        .output()
+        .expect("spawn ri-sandbox (seccomp off)");
+    let open_out = all_output(&open);
+    assert!(
+        !open_out.contains("Operation not permitted"),
+        "no-seccomp chroot must pass the syscall: {open_out}"
+    );
+
+    std::fs::remove_dir_all(&img).ok();
+}

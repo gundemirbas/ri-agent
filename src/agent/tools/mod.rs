@@ -172,6 +172,7 @@ pub mod edit;
 pub mod exec;
 pub mod find;
 pub mod invoke_subagent;
+pub mod muslcc;
 pub mod read;
 pub mod read_skill;
 pub mod rustc;
@@ -187,6 +188,7 @@ use edit::EditTool;
 use exec::ExecTool;
 use find::FindTool;
 use invoke_subagent::InvokeSubagentTool;
+use muslcc::MuslccTool;
 use read::ReadFileTool;
 use read_skill::ReadSkillTool;
 use write::WriteTool;
@@ -220,6 +222,7 @@ pub async fn register_builtin_tools(
     tools.push(Arc::new(BashTool));
     tools.push(Arc::new(ExecTool));
     tools.push(Arc::new(rustc::RustcTool));
+    tools.push(Arc::new(MuslccTool));
     tools.push(Arc::new(InvokeSubagentTool));
 
     for tool in tools {
@@ -234,6 +237,10 @@ pub async fn register_builtin_tools(
                 tool.name()
             );
         } else {
+            // Remember the name so a later refresh_custom_tools can update or
+            // drop this custom tool in place without touching built-ins (the
+            // borrow must end before `tool` moves into the Arc).
+            custom::track_custom(tool.name());
             registry.insert(tool.name().to_string(), Arc::new(tool));
         }
     }

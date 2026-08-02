@@ -14,6 +14,19 @@
   before exec (`RI_SANDBOX_RLIMITS` or `cpu=30,nproc=64,nofile=2048,as=512m,
   fsize=1g,core=0`; `none` disables). New integration tests cover strict mode
   (empty `/lib`, symlinked static shell), compat mode, and observable limits.
+- **`muslcc`, seccomp denylist and custom-tool hot-reload (spec §7, §16–17)**:
+  a second bootstrap tool `muslcc` compiles **C** inside the sandbox with a
+  bundled relocatable musl.cc `x86_64-linux-musl-cross` (a fully static i386
+  driver → runs in the strict image, brings its own musl; no host musl-dev).
+  The seccomp denylist is now live: raw-BPF, dual-arch (x86_64 + i386, because
+  the musl.cc driver is 32-bit), EPERM for mount/unshare/setns/chroot/open_by_
+  handle_at/SysV-shm/module/kexec/bpf/io_uring/ptrace/process_vm_*/keyctl and
+  socket(AF_PACKET) while default-ALLOW keeps tools/cargo/network working;
+  disable with `RI_SANDBOX_NO_SECCOMP=1`. Custom tools are **hot-reloaded**
+  each turn (`custom::refresh_custom_tools`), so a compiled tool is callable a
+  turn later with no restart; built-in names are never touched and deleted
+  tools are dropped. Also stripped the last `#[cfg(unix)]` gates (Linux only).
+  767 tests, clippy clean.
 - **In-sandbox `rustc` bootstrapping (spec §6/§16)**: a new `rustc` agent tool
   compiles a single-file Rust source **inside the sandbox** into a static musl
   custom tool and installs it into `~/.ri/tools`. The compiler is ri's **own
