@@ -239,8 +239,10 @@ Implemented surface:
   mapping with descriptions folded into labels; freeform asks get a trailing
   "Continue" escape), so headless clients can approve/deny tool operations
 - ri-specific `_ri/*` methods: `_ri/get_state` (model, thinking level,
-  sessions), `_ri/set_model`, `_ri/set_thinking` (all rebuild/swap the active
-  provider), `_ri/list_sessions` / `_ri/delete_session` / `_ri/prune_sessions`
+  sessions), `_ri/set_model`, `_ri/set_thinking`, `_ri/set_provider`
+  (re-resolve a provider preset by id and hot-swap the active provider for
+  subsequent turns), `_ri/list_sessions` / `_ri/delete_session` /
+  `_ri/prune_sessions`
   (persisted-session management), `_ri/logs` (recent activity),
   `_ri/steering` (queues steering for the next prompt turn); call
   unit-request methods with `"params": null`; mutating methods accept a

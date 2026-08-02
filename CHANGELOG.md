@@ -21,6 +21,11 @@
   checkpoint). Previously the serial handler blocked the loop, so a client's
   permission reply could never be read back (hang) and `_ri/get_state` only
   reflected state between turns.
+- **`_ri/set_provider`**: hot-swap the active provider instance by preset id
+  without restarting the server — re-resolves the preset from config, rebuilds
+  the provider, and updates the "current instance" + model so later
+  `_ri/set_model` / `_ri/set_thinking` build on the new provider. Unknown ids
+  return a descriptive error listing the available presets.
 - **In-process ACP integration tests**: the ACP smoke flows are now locked in
   as cargo tests that run under plain `cargo test` (no subprocess / JSON-RPC
   over stdio) using the SDK's in-memory `connect_with` wiring: echo turn with

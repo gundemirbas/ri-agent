@@ -24,7 +24,8 @@
 //!   option descriptions folded into labels; freeform asks surface a trailing
 //!   "Continue" escape)
 //! - Custom `_ri/*` methods: `_ri/get_state`, `_ri/set_model`,
-//!   `_ri/set_thinking` (provider is rebuilt on change),
+//!   `_ri/set_thinking`, `_ri/set_provider` (re-resolves a provider preset by
+//!   id — the provider is rebuilt and the "current instance" + model updated),
 //!   `_ri/list_sessions` / `_ri/delete_session` / `_ri/prune_sessions`
 //!   (persisted-session management), `_ri/logs` (recent activity),
 //!   `_ri/steering` (queues steering for the *next* prompt turn). Mutating
@@ -130,6 +131,24 @@ struct RiSetThinkingResponse {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_ri/set_provider", response = RiSetProviderResponse)]
+struct RiSetProviderRequest {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RiSetProviderResponse {
+    ok: bool,
+    error: Option<String>,
+    model: String,
+    thinking: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
 #[request(method = "_ri/list_sessions", response = RiListSessionsResponse)]
 struct RiListSessionsRequest;
 
@@ -216,10 +235,20 @@ struct RiLogsResponse {
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
-/// Rebuilds the active provider for a given model + thinking level (used by
-/// the `_ri/set_model` / `_ri/set_thinking` custom methods).
+/// Rebuilds the active provider for a given provider id + model + thinking
+/// level (used by the `_ri/set_model` / `_ri/set_thinking` /
+/// `_ri/set_provider` custom methods). The provider id is `None` to rebuild
+/// on the current instance; `Some(id)` re-resolves the provider preset by id
+/// and updates the server's "current instance". Returns the new provider and
+/// its effective model name.
 pub type ProviderRebuild = Arc<
-    dyn Fn(&str, ThinkingLevel) -> anyhow::Result<Arc<dyn LlmProvider + Send + Sync>> + Send + Sync,
+    dyn Fn(
+            Option<&str>,
+            &str,
+            ThinkingLevel,
+        ) -> anyhow::Result<(Arc<dyn LlmProvider + Send + Sync>, String)>
+        + Send
+        + Sync,
 >;
 
 /// Everything a headless server needs: the current provider (swappable), the
@@ -354,6 +383,7 @@ fn build_agent(
     let ctx_state = Arc::clone(&ctx);
     let ctx_set_model = Arc::clone(&ctx);
     let ctx_set_thinking = Arc::clone(&ctx);
+    let ctx_set_provider = Arc::clone(&ctx);
     let ctx_logs = Arc::clone(&ctx);
     let ctx_del = Arc::clone(&ctx);
     let ctx_prune = Arc::clone(&ctx);
@@ -1149,8 +1179,8 @@ fn build_agent(
                     });
                 }
                 let thinking = *ctx_set_model.thinking.read().unwrap();
-                match (ctx_set_model.rebuild)(&req.model, thinking) {
-                    Ok(provider) => {
+                match (ctx_set_model.rebuild)(None, &req.model, thinking) {
+                    Ok((provider, _model)) => {
                         *ctx_set_model.model.write().unwrap() = req.model.clone();
                         *ctx_set_model.provider.write().unwrap() = provider;
                         ctx_set_model.log("info", None, format!("_ri/set_model -> {}", req.model));
@@ -1186,8 +1216,8 @@ fn build_agent(
                     });
                 };
                 let model = ctx_set_thinking.model.read().unwrap().clone();
-                match (ctx_set_thinking.rebuild)(&model, level) {
-                    Ok(provider) => {
+                match (ctx_set_thinking.rebuild)(None, &model, level) {
+                    Ok((provider, _model)) => {
                         *ctx_set_thinking.thinking.write().unwrap() = level;
                         *ctx_set_thinking.provider.write().unwrap() = provider;
                         ctx_set_thinking.log(
@@ -1211,6 +1241,60 @@ fn build_agent(
                             ok: false,
                             error: Some(e.to_string()),
                             level: req.level,
+                        })
+                    }
+                }
+            },
+            on_receive_request!(),
+        )
+        // ── _ri/set_provider (hot-swap the provider instance) ───────────────
+        .on_receive_request(
+            async move |req: RiSetProviderRequest, responder, _connection| {
+                if !ctx_set_provider.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/set_provider");
+                }
+                if req.provider.trim().is_empty() {
+                    return responder.respond(RiSetProviderResponse {
+                        ok: false,
+                        error: Some("provider must not be empty".to_string()),
+                        model: ctx_set_provider.model.read().unwrap().clone(),
+                        thinking: ctx_set_provider
+                            .thinking
+                            .read()
+                            .unwrap()
+                            .as_str()
+                            .to_string(),
+                    });
+                }
+                let thinking = *ctx_set_provider.thinking.read().unwrap();
+                let current_model = ctx_set_provider.model.read().unwrap().clone();
+                match (ctx_set_provider.rebuild)(Some(&req.provider), &current_model, thinking) {
+                    Ok((provider, model)) => {
+                        *ctx_set_provider.model.write().unwrap() = model.clone();
+                        *ctx_set_provider.provider.write().unwrap() = provider;
+                        ctx_set_provider.log(
+                            "info",
+                            None,
+                            format!("_ri/set_provider -> {} (model {model})", req.provider),
+                        );
+                        responder.respond(RiSetProviderResponse {
+                            ok: true,
+                            error: None,
+                            model,
+                            thinking: thinking.as_str().to_string(),
+                        })
+                    }
+                    Err(e) => {
+                        ctx_set_provider.log(
+                            "error",
+                            None,
+                            format!("_ri/set_provider failed: {e}"),
+                        );
+                        responder.respond(RiSetProviderResponse {
+                            ok: false,
+                            error: Some(e.to_string()),
+                            model: current_model,
+                            thinking: thinking.as_str().to_string(),
                         })
                     }
                 }
@@ -2018,9 +2102,12 @@ mod acp_e2e {
     fn test_ctx() -> Arc<AcpContext> {
         let provider: Arc<dyn LlmProvider + Send + Sync + 'static> =
             Arc::new(crate::llm::test_provider::TestProvider::new());
-        let rebuild: ProviderRebuild = Arc::new(|_, _| {
-            Ok(Arc::new(crate::llm::test_provider::TestProvider::new())
-                as Arc<dyn LlmProvider + Send + Sync>)
+        let rebuild: ProviderRebuild = Arc::new(|_, _, _| {
+            Ok((
+                Arc::new(crate::llm::test_provider::TestProvider::new())
+                    as Arc<dyn LlmProvider + Send + Sync>,
+                "test".to_string(),
+            ))
         });
         Arc::new(AcpContext {
             provider: RwLock::new(provider),
@@ -2383,9 +2470,76 @@ mod acp_e2e {
                     cleanup_session(&sid);
                     Ok(())
                 });
+
         tokio::time::timeout(Duration::from_secs(30), client)
             .await
             .expect("cancel e2e timed out")
+            .expect("client connection failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acp_inproc_set_provider_hot_swap_and_set_model() {
+        let ctx = test_ctx();
+        let agent = build_agent(ctx, sessions());
+        let client =
+            Client
+                .builder()
+                .connect_with(agent, |cx: ConnectionTo<AcpRoleAgent>| async move {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let ns = cx
+                        .send_request(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
+                        .block_task()
+                        .await?;
+                    let sid = ns.session_id;
+
+                    let pr = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![text_block("echo birinci")],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(pr.stop_reason, StopReason::EndTurn);
+
+                    // Hot-swap the provider instance by id (test provider), then a
+                    // model change on the newly-selected instance.
+                    let sp = cx
+                        .send_request(RiSetProviderRequest {
+                            provider: "test".to_string(),
+                            token: None,
+                        })
+                        .block_task()
+                        .await?;
+                    assert!(sp.ok, "set_provider failed: {:?}", sp.error);
+                    assert_eq!(sp.model, "test");
+                    let sm = cx
+                        .send_request(RiSetModelRequest {
+                            model: "swapped-model".to_string(),
+                            token: None,
+                        })
+                        .block_task()
+                        .await?;
+                    assert!(sm.ok, "set_model after swap failed: {:?}", sm.error);
+                    assert_eq!(sm.model, "swapped-model");
+
+                    // A subsequent prompt still works against the swapped provider.
+                    let pr2 = cx
+                        .send_request(PromptRequest::new(
+                            sid.clone(),
+                            vec![text_block("echo ikinci")],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(pr2.stop_reason, StopReason::EndTurn);
+                    cleanup_session(&sid);
+                    Ok(())
+                });
+        tokio::time::timeout(Duration::from_secs(30), client)
+            .await
+            .expect("set_provider e2e timed out")
             .expect("client connection failed");
     }
 }

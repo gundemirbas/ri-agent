@@ -248,15 +248,31 @@ async fn main() -> io::Result<()> {
                 }
             };
 
-        // Provider rebuild hook so `_ri/set_model` / `_ri/set_thinking` can
-        // swap the active provider for subsequent sessions/prompts.
-        let instance_for_build = initial_instance.clone();
-        let rebuild: acp::ProviderRebuild =
-            Arc::new(move |model: &str, thinking: ThinkingLevel| {
-                let mut inst = instance_for_build.clone();
+        // Provider rebuild hook so `_ri/set_model` / `_ri/set_thinking` /
+        // `_ri/set_provider` can swap the active provider for subsequent
+        // sessions/prompts. A shared cell tracks the *current* provider
+        // instance: set_provider re-resolves a preset by id and stores it
+        // there, and later set_model/set_thinking rebuild on that instance.
+        let current_instance = Arc::new(std::sync::RwLock::new(initial_instance.clone()));
+        let instance_cell = Arc::clone(&current_instance);
+        let server_config = config.clone();
+        let rebuild: acp::ProviderRebuild = Arc::new(
+            move |provider_id: Option<&str>, model: &str, thinking: ThinkingLevel| {
+                let mut inst = match provider_id {
+                    Some(id) => {
+                        let inst =
+                            provider_setup::resolve_provider_instance(Some(id), &server_config)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        *instance_cell.write().unwrap() = inst.clone();
+                        inst
+                    }
+                    None => instance_cell.read().unwrap().clone(),
+                };
                 inst.model = Some(model.to_string());
-                build_provider_for_instance(&inst, thinking, &config::RiConfig::default())
-            });
+                let provider = build_provider_for_instance(&inst, thinking, &server_config)?;
+                Ok((provider, inst.effective_model().to_string()))
+            },
+        );
         let handle = tokio::runtime::Handle::current();
 
         // Track project files, but never the sessions data dir or cache dir.
