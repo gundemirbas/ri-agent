@@ -87,6 +87,7 @@ cargo install --path .
 | `-m` | `--model <MODEL>` | Model name to use (e.g. gpt-4o) |
 | `-p` | `--print <PROMPT>...` | Run in non-interactive mode: send PROMPT, stream the response to stdout, and exit. Accepts multiple words without shell quoting |
 | | `--serve` | Run as a headless ACP (Agent Client Protocol) server on stdio instead of the TUI |
+| | `--serve-ws <ADDR>` | Run as a headless ACP server over HTTP + WebSocket (`ws://ADDR/acp`) instead of the TUI |
 | | `--print-dirs` | Print the file-system paths ri uses and exit |
 | `-h` | `--help` | Print help |
 | `-V` | `--version` | Print version |
@@ -207,17 +208,30 @@ manually, optionally with custom summary instructions.
 `ri --serve` runs the same agent loop without the TUI, speaking the
 vendor-neutral [Agent Client Protocol](https://agentclientprotocol.com/) —
 JSON-RPC 2.0 over stdio, one message per newline — so any ACP-capable client
-(editors, desktop/web UIs, `acpx`, …) can drive ri as a subprocess:
+(editors, desktop/web UIs, `acpx`, …) can drive ri as a subprocess. A WebSocket
+variant is available via `ri --serve-ws 127.0.0.1:8080` (route `/acp`, with
+streamable HTTP on the same server for non-WebSocket clients):
 
 ```sh
-ri --serve --provider test   # or any configured provider
+ri --serve --provider test         # stdio
+ri --serve-ws 127.0.0.1:8080 --provider test   # WebSocket + HTTP
 ```
 
-Implemented surface: `initialize` (protocol v1, image prompts accepted),
-`session/new`, `session/prompt` (streams `agent_message_chunk`,
-`agent_thought_chunk`, `tool_call`/`tool_call_update`, `usage_update`), and
-`session/cancel` (maps to ri's hard abort).
+Implemented surface:
+
+- `initialize` — protocol v1, image prompts, in-memory `session/load`
+- `session/new`, `session/prompt` (streams `agent_message_chunk`,
+  `agent_thought_chunk`, `tool_call`/`tool_call_update`, `usage_update`)
+- `session/load` — replays a known in-memory session's history as updates
+- `session/cancel` — maps to ri's hard abort
+- `ask_user` — forwarded as `session/request_permission` (multiple-choice
+  mapping; freeform-only asks surface a single "Continue" option), so headless
+  clients can approve/deny tool operations
+- ri-specific `_ri/*` methods: `_ri/get_state` (model, thinking level,
+  sessions), `_ri/set_model`, `_ri/set_thinking` (both rebuild the active
+  provider; call `_ri/get_state` with `"params": null`)
 
 Current limitations: one prompt at a time per session; auto-compaction is
-disabled; `ask_user`/`request_permission` and session load/resume are not yet
-wired. Requires Rust 1.88 (ATC dependency baseline).
+disabled; `session/load` replays only in-memory sessions (no disk persistence);
+tool cwd is the process directory (per-session `cwd` feeds the system prompt).
+Requires Rust 1.88 (ACP dependency baseline).

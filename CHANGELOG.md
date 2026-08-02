@@ -11,6 +11,15 @@
   `usage_update`), and `session/cancel`. The existing agent loop is reused
   unchanged; the ACP connection runs on a dedicated thread. Now requires
   Rust 1.88 (ACP dependency baseline).
+- **ACP extensions**: `ask_user` now maps to `session/request_permission` so
+  headless clients can approve/deny tool operations (freeform-only asks get a
+  single "Continue" option). `--serve-ws <ADDR>` serves the same surface over
+  HTTP + WebSocket at `/acp` (axum). Ri-specific `_ri/get_state`,
+  `_ri/set_model`, `_ri/set_thinking` custom methods can introspect and swap
+  the active provider/thinking level at runtime. `session/load` replays a
+  known in-memory session's history. Tools are registered per prompt so
+  `ask_user` routes through the same channel the loop reads; the sessions data
+  dir and cache dir are excluded from the headless file tracker.
 
 ### Fixed
 

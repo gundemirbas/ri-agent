@@ -2,39 +2,48 @@
 //!
 //! Runs the existing multi-turn agent loop behind the vendor-neutral ACP
 //! JSON-RPC surface, so any ACP-capable client (editors, desktop/web UIs,
-//! `acpx`, …) can drive ri as a subprocess over stdio.
+//! `acpx`, …) can drive ri as a subprocess (stdio) or over WebSocket.
 //!
-//! Current coverage (prototype vertical slice):
-//! - `initialize` — capability negotiation (protocol v1, image prompts accepted)
-//! - `session/new` — in-memory session with its own history + cancel channel
+//! Implemented surface:
+//! - `initialize` — protocol v1, capability negotiation (image prompts,
+//!   in-memory `session/load`)
+//! - `session/new` — in-memory session (history, cancel channel, cwd)
+//! - `session/load` — replays a known in-memory session's history as updates
 //! - `session/prompt` — streams `agent_message_chunk`, `agent_thought_chunk`,
-//!   `tool_call`/`tool_call_update`, and `usage_update` notifications, then
-//!   answers with `stopReason: end_turn` (or a JSON-RPC error on failure)
-//! - `session/cancel` — maps to ri's `HardAbort` cancel level
+//!   `tool_call`/`tool_call_update`, `usage_update`, then `end_turn`
+//! - `session/cancel` — maps to ri `HardAbort`
+//! - `ask_user` → `session/request_permission` (multiple-choice mapping;
+//!   freeform-only asks surface a single "Continue" option)
+//! - Custom `_ri/*` methods: `_ri/get_state`, `_ri/set_model`,
+//!   `_ri/set_thinking` (provider is rebuilt on change)
 //!
-//! Known limitations (deliberate, documented): one prompt at a time per
-//! session; auto-compaction is disabled (compaction control is a follow-up);
-//! `ask_user` is unavailable headless (`request_permission` wiring is a
-//! follow-up); multi-turn history is mirrored from streamed events so chained
-//! prompts keep their context. The agent loop itself is reused unchanged.
+//! Limitations (deliberate, documented): one prompt at a time per session;
+//! auto-compaction disabled (follow-up); `session/load` replays only
+//! in-memory sessions (no disk persistence); tool cwd is the current process
+//! directory (per-session cwd is used for the system prompt). The agent loop
+//! itself is reused unchanged.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, EmbeddedResourceResource,
-    InitializeRequest, InitializeResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionCapabilities, SessionId,
+    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
+    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SessionCapabilities, SessionId,
     SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::{
-    Agent, Result as AcpResult, Stdio, on_receive_notification, on_receive_request,
+    Agent, Client, ConnectTo, JsonRpcRequest, JsonRpcResponse, Result as AcpResult, Stdio,
+    on_receive_notification, on_receive_request,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 
-use crate::agent::types::{AgentEvent, CancelLevel, ToolRegistry};
+use crate::agent::tools::register_builtin_tools;
+use crate::agent::types::{AgentEvent, AskRequest, AskUserResponse, CancelLevel};
 use crate::agent::{
     AgentLoopConfig, DefaultToolExecutor, FileTracker, ToolOutputLog, run_agent_loop,
 };
@@ -42,33 +51,94 @@ use crate::app_event::AppEvent;
 use crate::context_window::context_window_for_model;
 use crate::llm::{AssistantPhase, LlmProvider, UsageStats};
 use crate::session_event::SessionEvent;
+use crate::thinking::ThinkingLevel;
 
-/// Everything a headless session needs: provider, tools, system prompt.
-#[derive(Clone)]
+// ── Ri-specific custom RPC (item: provider/thinking surface) ─────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_ri/get_state", response = RiGetStateResponse)]
+struct RiGetStateRequest;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RiGetStateResponse {
+    model: String,
+    thinking: String,
+    sessions: Vec<String>,
+    streaming_sessions: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_ri/set_model", response = RiSetModelResponse)]
+struct RiSetModelRequest {
+    #[serde(default)]
+    model: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RiSetModelResponse {
+    ok: bool,
+    error: Option<String>,
+    model: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_ri/set_thinking", response = RiSetThinkingResponse)]
+struct RiSetThinkingRequest {
+    #[serde(default)]
+    level: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RiSetThinkingResponse {
+    ok: bool,
+    error: Option<String>,
+    level: String,
+}
+
+// ── Context ───────────────────────────────────────────────────────────────────
+
+/// Rebuilds the active provider for a given model + thinking level (used by
+/// the `_ri/set_model` / `_ri/set_thinking` custom methods).
+pub type ProviderRebuild = Arc<
+    dyn Fn(&str, ThinkingLevel) -> anyhow::Result<Arc<dyn LlmProvider + Send + Sync>> + Send + Sync,
+>;
+
+/// Everything a headless server needs: the current provider (swappable), the
+/// current model/thinking level, a provider rebuild hook, and shared tool
+/// prerequisites.
 pub struct AcpContext {
-    pub provider: Arc<dyn LlmProvider + Send + Sync + 'static>,
-    pub model: String,
-    pub tools: Arc<ToolRegistry>,
-    pub system_prompt: String,
+    pub provider: RwLock<Arc<dyn LlmProvider + Send + Sync + 'static>>,
+    pub model: RwLock<String>,
+    pub thinking: RwLock<ThinkingLevel>,
+    pub rebuild: ProviderRebuild,
+    /// Optional explicit tokio runtime handle. Set in stdio mode (handlers run
+    /// on the ACP async-io executor, so they cannot call
+    /// [`tokio::runtime::Handle::current`]); `None` in WebSocket mode where
+    /// handlers run inside tokio/axum and use [`tokio::runtime::Handle::current`].
+    pub tokio_handle: Option<tokio::runtime::Handle>,
     pub file_tracker: Arc<Mutex<FileTracker>>,
+    pub skills: Arc<Vec<crate::skills::SkillMeta>>,
 }
 
 /// In-memory per-session state.
 struct AcpSession {
-    /// Committed history, mirrored from streamed events across prompts.
     events: Vec<SessionEvent>,
-    /// Guard against concurrent prompts on the same session.
     running: bool,
-    /// Cancel channel for the in-flight prompt, if any.
     cancel_tx: Option<watch::Sender<CancelLevel>>,
+    #[allow(dead_code)] // kept for future tool-cwd wiring; session prompt uses it
+    cwd: std::path::PathBuf,
 }
 
 impl AcpSession {
-    fn new() -> Self {
+    fn new(cwd: std::path::PathBuf) -> Self {
         Self {
             events: Vec::new(),
             running: false,
             cancel_tx: None,
+            cwd,
         }
     }
 }
@@ -76,9 +146,6 @@ impl AcpSession {
 type Sessions = Arc<Mutex<HashMap<SessionId, AcpSession>>>;
 
 /// Send an ACP session update notification, ignoring send failures.
-///
-/// `send_notification` is a synchronous send over the SDK's internal channel;
-/// the transport flushes it asynchronously in the background.
 macro_rules! send_update {
     ($connection:expr, $session_id:expr, $update:expr) => {{
         let _ =
@@ -86,20 +153,20 @@ macro_rules! send_update {
     }};
 }
 
-/// Run the ACP server on stdio. Blocks until the connection closes.
-///
-/// Called from a dedicated OS thread via an executor-agnostic block_on; the
-/// tokio runtime is reached through `tokio_handle` (tokio channels are
-/// executor-agnostic and safe to await from here).
-pub async fn run_acp_server(
+/// Build the agent component (handlers registered) shared by the stdio and
+/// WebSocket transports. Returns a builder that implements `ConnectTo<Client>`.
+fn build_agent(
     ctx: Arc<AcpContext>,
-    tokio_handle: tokio::runtime::Handle,
-) -> AcpResult<()> {
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-
-    let sessions_new = Arc::clone(&sessions);
-    let sessions_prompt = Arc::clone(&sessions);
-    let sessions_cancel = Arc::clone(&sessions);
+    sessions: Sessions,
+) -> impl agent_client_protocol::ConnectTo<Client> {
+    let s_new = Arc::clone(&sessions);
+    let s_load = Arc::clone(&sessions);
+    let s_prompt = Arc::clone(&sessions);
+    let s_cancel = Arc::clone(&sessions);
+    let s_state = Arc::clone(&sessions);
+    let ctx_state = Arc::clone(&ctx);
+    let ctx_set_model = Arc::clone(&ctx);
+    let ctx_set_thinking = Arc::clone(&ctx);
 
     Agent
         .builder()
@@ -112,7 +179,8 @@ pub async fn run_acp_server(
                         AgentCapabilities::new()
                             .mcp_capabilities(McpCapabilities::new())
                             .session_capabilities(SessionCapabilities::new())
-                            .prompt_capabilities(PromptCapabilities::new().image(true)),
+                            .prompt_capabilities(PromptCapabilities::new().image(true))
+                            .load_session(true),
                     ),
                 )
             },
@@ -122,12 +190,60 @@ pub async fn run_acp_server(
         .on_receive_request(
             async move |req: NewSessionRequest, responder, _connection| {
                 let id = SessionId::new(format!("sess-{}", new_session_suffix()));
-                sessions_new
+                s_new
                     .lock()
                     .unwrap()
-                    .insert(id.clone(), AcpSession::new());
-                let _ = req; // cwd is captured; used in a follow-up for FileTracker roots
+                    .insert(id.clone(), AcpSession::new(req.cwd.clone()));
                 responder.respond(NewSessionResponse::new(id))
+            },
+            on_receive_request!(),
+        )
+        // ── session/load (in-memory replay) ────────────────────────────────
+        .on_receive_request(
+            async move |req: LoadSessionRequest, responder, connection| {
+                let (running, events) = {
+                    let map = s_load.lock().unwrap();
+                    let Some(s) = map.get(&req.session_id) else {
+                        responder
+                            .respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("unknown session"),
+                            )
+                            .ok();
+                        return Ok(());
+                    };
+                    (s.running, s.events.clone())
+                };
+                if running {
+                    responder
+                        .respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data("session is busy; cannot load while a prompt runs"),
+                        )
+                        .ok();
+                    return Ok(());
+                }
+                for ev in &events {
+                    match ev {
+                        SessionEvent::UserMessage { content, .. } => send_update!(
+                            connection,
+                            req.session_id,
+                            SessionUpdate::UserMessageChunk(ContentChunk::new(ContentBlock::Text(
+                                TextContent::new(content.clone()),
+                            )))
+                        ),
+                        SessionEvent::AssistantMessage { content, .. } => send_update!(
+                            connection,
+                            req.session_id,
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(content.clone()),)
+                            ))
+                        ),
+                        _ => {}
+                    }
+                }
+                let _ = req.cwd;
+                responder.respond(LoadSessionResponse::new())
             },
             on_receive_request!(),
         )
@@ -137,10 +253,9 @@ pub async fn run_acp_server(
                 let session_id = req.session_id.clone();
                 let prompt_text = render_prompt_blocks(&req.prompt);
 
-                // 1. Session registry + busy guard; push the user message and
-                //    any embedded-resource reads into committed history.
-                let (cancel_rx, context_size, history_snapshot) = {
-                    let mut map = sessions_prompt.lock().unwrap();
+                // Per-session (cwd, busy guard) + push user message / resource reads.
+                let (session_cwd, cancel_rx, context_size, history_snapshot) = {
+                    let mut map = s_prompt.lock().unwrap();
                     let Some(s) = map.get_mut(&session_id) else {
                         responder
                             .respond_with_error(
@@ -167,40 +282,64 @@ pub async fn run_acp_server(
                     s.events.extend(synthesize_resource_reads(&req.prompt));
                     let (cancel_tx, cancel_rx) = watch::channel(CancelLevel::None);
                     s.cancel_tx = Some(cancel_tx);
+                    let cwd = s.cwd.clone();
                     (
+                        cwd,
                         cancel_rx,
-                        context_window_for_model(&ctx.model).unwrap_or(200_000),
+                        context_window_for_model(&ctx.model.read().unwrap()).unwrap_or(200_000),
                         s.events.clone(),
                     )
                 };
 
-                // 2. Spawn the existing agent loop on the ri tokio runtime.
+                // Channel for agent events AND ask_user replies.
                 let (tx, rx): (UnboundedSender<AppEvent>, UnboundedReceiver<AppEvent>) =
                     tokio::sync::mpsc::unbounded_channel();
                 let mut rx = rx;
-                let (_steering_keeper, steering_rx) = tokio::sync::mpsc::unbounded_channel();
+
+                // Tools are registered per prompt so `ask_user` can route its
+                // question back through this prompt's channel (headless mode).
+                let tools = register_builtin_tools(
+                    Some(tx.clone()),
+                    Arc::clone(&ctx.file_tracker),
+                    Arc::clone(&ctx.skills),
+                    Vec::new(),
+                )
+                .await;
+                let system_prompt = crate::agent::build_system_prompt(
+                    &tools,
+                    &session_cwd.to_string_lossy(),
+                    &ctx.skills,
+                    None,
+                );
+                let provider = ctx.provider.read().unwrap().clone();
+                let model = ctx.model.read().unwrap().clone();
+                let tokio_handle = ctx
+                    .tokio_handle
+                    .clone()
+                    .unwrap_or_else(tokio::runtime::Handle::current);
 
                 let config = AgentLoopConfig {
-                    tools: (*ctx.tools).clone(),
+                    tools,
                     file_tracker: Arc::clone(&ctx.file_tracker),
                     tool_output_log: Arc::new(std::sync::Mutex::new(ToolOutputLog::new(
-                        &session_id.to_string(),
+                        session_id.to_string().as_str(),
                     ))),
                     session_events: history_snapshot,
-                    current_model: ctx.model.clone(),
+                    current_model: model,
                     auto_compaction_enabled: false, // see module docs
                     manual_compaction_instructions: None,
                     executor: Arc::new(DefaultToolExecutor::new()),
-                    system_prompt: Some(ctx.system_prompt.clone()),
+                    system_prompt: Some(system_prompt),
                 };
-                let provider = Arc::clone(&ctx.provider);
+                let (steering_keeper, steering_rx) = tokio::sync::mpsc::unbounded_channel();
+                let _ = steering_keeper;
+                let provider_loop = Arc::clone(&provider);
                 let task_tx = tx.clone();
                 let join = tokio_handle.spawn(async move {
-                    run_agent_loop(config, provider, task_tx, steering_rx, cancel_rx).await;
+                    run_agent_loop(config, provider_loop, task_tx, steering_rx, cancel_rx).await;
                 });
 
-                // 3. Forward agent events as ACP updates; mirror committed
-                //    history so later prompts on this session keep context.
+                // Forward agent events + answer ask_user via request_permission.
                 let mut error: Option<String> = None;
                 let mut assistant_text = String::new();
                 let mut assistant_thinking: Option<String> = None;
@@ -209,123 +348,146 @@ pub async fn run_acp_server(
                 let mut pending_tool: Vec<SessionEvent> = Vec::new();
 
                 while let Some(ev) = rx.recv().await {
-                    let AppEvent::Agent(agent_ev) = ev else {
-                        continue;
-                    };
-                    match agent_ev {
-                        AgentEvent::Done => break,
-                        AgentEvent::Error(e) => {
-                            error = Some(e.message.clone());
-                            break;
-                        }
-                        AgentEvent::TextToken { text, phase: ph } => {
-                            assistant_text.push_str(&text);
-                            if ph != AssistantPhase::Unknown {
-                                phase = ph;
+                    match ev {
+                        AppEvent::AskUser(request) => {
+                            let (options, option_titles) = permission_options(&request);
+                            let mut title = request.question.clone();
+                            if let Some(ctx_text) = request.context.as_deref() {
+                                title = format!("{title}\n\n{ctx_text}");
                             }
-                            if let Some(u) = agent_event_to_update(AgentEvent::TextToken {
-                                text,
-                                phase: AssistantPhase::Unknown,
-                            }) {
-                                send_update!(connection, session_id, u);
-                            }
-                        }
-                        AgentEvent::ThinkingToken(t) => {
-                            assistant_thinking
-                                .get_or_insert_with(String::new)
-                                .push_str(&t);
-                            send_update!(
-                                connection,
-                                session_id,
-                                SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                                    ContentBlock::Text(TextContent::new(t.clone())),
-                                ))
+                            let tool_call = ToolCallUpdate::new(
+                                format!("ask-{}", now_ts()),
+                                ToolCallUpdateFields::new()
+                                    .title(title.clone())
+                                    .kind(ToolKind::Other)
+                                    .status(ToolCallStatus::InProgress),
                             );
+                            let outcome = connection
+                                .send_request(RequestPermissionRequest::new(
+                                    session_id.clone(),
+                                    tool_call,
+                                    options,
+                                ))
+                                .block_task()
+                                .await;
+                            let answer = ask_reply_from_outcome(&outcome, &option_titles);
+                            let _ = request.reply.send(answer);
                         }
-                        AgentEvent::Usage(u) => {
-                            usage = Some(u);
-                            if let Some(uu) = usage_update_value(&u, context_size as u64) {
+                        AppEvent::Agent(agent_ev) => match agent_ev {
+                            AgentEvent::Done => break,
+                            AgentEvent::Error(e) => {
+                                error = Some(e.message.clone());
+                                break;
+                            }
+                            AgentEvent::TextToken { text, phase: ph } => {
+                                assistant_text.push_str(&text);
+                                if ph != AssistantPhase::Unknown {
+                                    phase = ph;
+                                }
                                 send_update!(
                                     connection,
                                     session_id,
-                                    SessionUpdate::UsageUpdate(uu)
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(text)),
+                                    ))
                                 );
                             }
-                        }
-                        AgentEvent::ToolCallStart { id, name, args } => {
-                            pending_tool.push(SessionEvent::ToolCall {
-                                id: id.clone(),
-                                name: name.clone(),
-                                args,
-                                include_in_llm: true,
-                                timestamp: now_ts(),
-                            });
-                            let kind = tool_kind(&name);
-                            send_update!(
-                                connection,
-                                session_id,
-                                SessionUpdate::ToolCall(
-                                    ToolCall::new(id, name.clone())
-                                        .kind(kind)
-                                        .status(ToolCallStatus::Pending)
-                                )
-                            );
-                        }
-                        AgentEvent::ToolCallEnd { id, result } => {
-                            pending_tool.push(SessionEvent::ToolResult {
-                                id: id.clone(),
-                                name: String::new(),
-                                content: result.content.as_text().to_string(),
-                                is_error: result.is_error,
-                                display_range: None,
-                                include_in_llm: true,
-                                timestamp: now_ts(),
-                            });
-                            let content = result.content.as_text().to_string();
-                            send_update!(
-                                connection,
-                                session_id,
-                                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                                    id,
-                                    ToolCallUpdateFields::new()
-                                        .status(ToolCallStatus::Completed)
-                                        .content(vec![ToolCallContent::from(ContentBlock::Text(
-                                            TextContent::new(content)
-                                        ),)]),
-                                ))
-                            );
-                        }
-                        AgentEvent::TurnEnd => {
-                            commit_turn(
-                                &sessions_prompt,
-                                &session_id,
-                                &mut assistant_text,
-                                &mut assistant_thinking,
-                                phase,
-                                usage,
-                                &pending_tool,
-                            );
-                            pending_tool.clear();
-                            assistant_text.clear();
-                            assistant_thinking = None;
-                            phase = AssistantPhase::Unknown;
-                            usage = None;
-                        }
-                        // Not surfaced headless (display-only or future work):
-                        AgentEvent::ToolCallIntent { .. }
-                        | AgentEvent::ToolCallArgsDelta { .. }
-                        | AgentEvent::ToolOutputChunk { .. }
-                        | AgentEvent::SteeringConsumed { .. }
-                        | AgentEvent::StatusUpdate(_)
-                        | AgentEvent::Compacting
-                        | AgentEvent::CompactionDone(_)
-                        | AgentEvent::ExternalFileChange { .. } => {}
+                            AgentEvent::ThinkingToken(t) => {
+                                assistant_thinking
+                                    .get_or_insert_with(String::new)
+                                    .push_str(&t);
+                                send_update!(
+                                    connection,
+                                    session_id,
+                                    SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(t.clone())),
+                                    ))
+                                );
+                            }
+                            AgentEvent::Usage(u) => {
+                                usage = Some(u);
+                                if let Some(uu) = usage_update_value(&u, context_size as u64) {
+                                    send_update!(
+                                        connection,
+                                        session_id,
+                                        SessionUpdate::UsageUpdate(uu)
+                                    );
+                                }
+                            }
+                            AgentEvent::ToolCallStart { id, name, args } => {
+                                pending_tool.push(SessionEvent::ToolCall {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    args,
+                                    include_in_llm: true,
+                                    timestamp: now_ts(),
+                                });
+                                let kind = tool_kind(&name);
+                                send_update!(
+                                    connection,
+                                    session_id,
+                                    SessionUpdate::ToolCall(
+                                        ToolCall::new(id, name.clone())
+                                            .kind(kind)
+                                            .status(ToolCallStatus::Pending)
+                                    )
+                                );
+                            }
+                            AgentEvent::ToolCallEnd { id, result } => {
+                                pending_tool.push(SessionEvent::ToolResult {
+                                    id: id.clone(),
+                                    name: String::new(),
+                                    content: result.content.as_text().to_string(),
+                                    is_error: result.is_error,
+                                    display_range: None,
+                                    include_in_llm: true,
+                                    timestamp: now_ts(),
+                                });
+                                let content = result.content.as_text().to_string();
+                                send_update!(
+                                    connection,
+                                    session_id,
+                                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                        id,
+                                        ToolCallUpdateFields::new()
+                                            .status(ToolCallStatus::Completed)
+                                            .content(vec![ToolCallContent::from(
+                                                ContentBlock::Text(TextContent::new(content)),
+                                            )]),
+                                    ))
+                                );
+                            }
+                            AgentEvent::TurnEnd => {
+                                commit_turn(
+                                    &s_prompt,
+                                    &session_id,
+                                    &mut assistant_text,
+                                    &mut assistant_thinking,
+                                    phase,
+                                    usage,
+                                    &pending_tool,
+                                );
+                                pending_tool.clear();
+                                assistant_text.clear();
+                                assistant_thinking = None;
+                                phase = AssistantPhase::Unknown;
+                                usage = None;
+                            }
+                            AgentEvent::ToolCallIntent { .. }
+                            | AgentEvent::ToolCallArgsDelta { .. }
+                            | AgentEvent::ToolOutputChunk { .. }
+                            | AgentEvent::SteeringConsumed { .. }
+                            | AgentEvent::StatusUpdate(_)
+                            | AgentEvent::Compacting
+                            | AgentEvent::CompactionDone(_)
+                            | AgentEvent::ExternalFileChange { .. } => {}
+                        },
+                        _ => {}
                     }
                 }
 
-                // 4. Release the session; wait for (already finished) loop.
                 {
-                    let mut map = sessions_prompt.lock().unwrap();
+                    let mut map = s_prompt.lock().unwrap();
                     if let Some(s) = map.get_mut(&session_id) {
                         s.running = false;
                         s.cancel_tx = None;
@@ -333,7 +495,6 @@ pub async fn run_acp_server(
                 }
                 let _ = join.await;
 
-                // 5. Reply to the original prompt request.
                 match error {
                     Some(msg) => responder.respond_with_error(
                         agent_client_protocol::Error::internal_error().data(msg),
@@ -346,7 +507,7 @@ pub async fn run_acp_server(
         // ── session/cancel ──────────────────────────────────────────────────
         .on_receive_notification(
             async move |notif: CancelNotification, _connection| {
-                let mut map = sessions_cancel.lock().unwrap();
+                let mut map = s_cancel.lock().unwrap();
                 if let Some(s) = map.get_mut(&notif.session_id)
                     && let Some(tx) = s.cancel_tx.as_ref()
                 {
@@ -356,11 +517,163 @@ pub async fn run_acp_server(
             },
             on_receive_notification!(),
         )
-        .connect_to(Stdio::new())
-        .await
+        // ── _ri/get_state ───────────────────────────────────────────────────
+        .on_receive_request(
+            async move |_req: RiGetStateRequest, responder, _connection| {
+                let model = ctx_state.model.read().unwrap().clone();
+                let thinking = ctx_state.thinking.read().unwrap().as_str().to_string();
+                {
+                    let map = s_state.lock().unwrap();
+                    let sessions = map.keys().map(|s| s.to_string()).collect::<Vec<_>>();
+                    let streaming = map.values().filter(|s| s.running).count();
+                    responder.respond(RiGetStateResponse {
+                        model,
+                        thinking,
+                        sessions,
+                        streaming_sessions: streaming,
+                    })
+                }
+            },
+            on_receive_request!(),
+        )
+        // ── _ri/set_model ───────────────────────────────────────────────────
+        .on_receive_request(
+            async move |req: RiSetModelRequest, responder, _connection| {
+                if req.model.trim().is_empty() {
+                    return responder.respond(RiSetModelResponse {
+                        ok: false,
+                        error: Some("model must not be empty".to_string()),
+                        model: req.model,
+                    });
+                }
+                let thinking = *ctx_set_model.thinking.read().unwrap();
+                match (ctx_set_model.rebuild)(&req.model, thinking) {
+                    Ok(provider) => {
+                        *ctx_set_model.model.write().unwrap() = req.model.clone();
+                        *ctx_set_model.provider.write().unwrap() = provider;
+                        responder.respond(RiSetModelResponse {
+                            ok: true,
+                            error: None,
+                            model: req.model,
+                        })
+                    }
+                    Err(e) => responder.respond(RiSetModelResponse {
+                        ok: false,
+                        error: Some(e.to_string()),
+                        model: req.model,
+                    }),
+                }
+            },
+            on_receive_request!(),
+        )
+        // ── _ri/set_thinking ───────────────────────────────────────────────
+        .on_receive_request(
+            async move |req: RiSetThinkingRequest, responder, _connection| {
+                let Some(level) = ThinkingLevel::parse(&req.level) else {
+                    return responder.respond(RiSetThinkingResponse {
+                        ok: false,
+                        error: Some(format!("unknown thinking level '{}'", req.level)),
+                        level: req.level,
+                    });
+                };
+                let model = ctx_set_thinking.model.read().unwrap().clone();
+                match (ctx_set_thinking.rebuild)(&model, level) {
+                    Ok(provider) => {
+                        *ctx_set_thinking.thinking.write().unwrap() = level;
+                        *ctx_set_thinking.provider.write().unwrap() = provider;
+                        responder.respond(RiSetThinkingResponse {
+                            ok: true,
+                            error: None,
+                            level: level.as_str().to_string(),
+                        })
+                    }
+                    Err(e) => responder.respond(RiSetThinkingResponse {
+                        ok: false,
+                        error: Some(e.to_string()),
+                        level: req.level,
+                    }),
+                }
+            },
+            on_receive_request!(),
+        )
 }
 
-// ── Forwarding / mirroring helpers ────────────────────────────────────────────
+// ── Transport entry points ────────────────────────────────────────────────────
+
+/// Run the ACP server on stdio. Blocks until the connection closes.
+///
+/// Called from a dedicated OS thread via an executor-agnostic block_on; ri's
+/// tokio runtime is reached through a captured handle (tokio channels are
+/// executor-agnostic).
+pub async fn run_acp_server(
+    ctx: Arc<AcpContext>,
+    _tokio_handle: tokio::runtime::Handle,
+) -> AcpResult<()> {
+    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    build_agent(ctx, sessions).connect_to(Stdio::new()).await
+}
+
+/// Run the ACP over HTTP + WebSocket on `addr` (axum).
+pub async fn run_acp_ws(ctx: Arc<AcpContext>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let factory = {
+        let ctx = Arc::clone(&ctx);
+        let sessions = sessions.clone();
+        move || build_agent(ctx.clone(), sessions.clone())
+    };
+    let server = agent_client_protocol_http::AcpHttpServer::new(factory);
+    let router = server.into_router();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+// ── Mirroring helpers ─────────────────────────────────────────────────────────
+
+/// Build ACP permission options for an `ask_user` request. Freeform-only asks
+/// (no options) get a single "Continue" option so the headless client always
+/// has an actionable choice.
+fn permission_options(request: &AskRequest) -> (Vec<PermissionOption>, Vec<(String, String)>) {
+    let mut options: Vec<PermissionOption> = request
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| permission_option(format!("opt-{i}"), &o.title))
+        .collect();
+    if options.is_empty() {
+        options.push(permission_option("continue".to_string(), "Continue"));
+    }
+    let titles = options
+        .iter()
+        .map(|o| (o.option_id.0.to_string(), o.name.clone()))
+        .collect();
+    (options, titles)
+}
+
+fn permission_option(id: String, title: &str) -> PermissionOption {
+    PermissionOption::new(id, title.to_string(), PermissionOptionKind::AllowOnce)
+}
+
+/// Map a `session/request_permission` outcome back to an `ask_user` reply.
+fn ask_reply_from_outcome(
+    outcome: &Result<RequestPermissionResponse, agent_client_protocol::Error>,
+    option_titles: &[(String, String)],
+) -> AskUserResponse {
+    match outcome {
+        Ok(r) => match &r.outcome {
+            RequestPermissionOutcome::Selected(sel) => {
+                let title = option_titles
+                    .iter()
+                    .find(|(id, _)| id == &sel.option_id.0.to_string())
+                    .map(|(_, t)| t.clone())
+                    .unwrap_or_else(|| sel.option_id.0.to_string());
+                AskUserResponse::Answer(title)
+            }
+            _ => AskUserResponse::Cancelled,
+        },
+        Err(_) => AskUserResponse::Cancelled,
+    }
+}
 
 /// Commit one completed assistant turn (message + tool pairs) into the
 /// session's mirrored history.
@@ -399,47 +712,43 @@ fn commit_turn(
 
 // ── Prompt rendering ─────────────────────────────────────────────────────────
 
-/// Flatten ACP prompt content blocks into a user-message string.
 fn render_prompt_blocks(blocks: &[ContentBlock]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for block in blocks {
         match block {
             ContentBlock::Text(t) => parts.push(t.text.clone()),
             ContentBlock::Image(img) => {
-                let uri = format!("data:{};base64,{}", img.mime_type, img.data);
-                parts.push(format!("![image]({uri})\n[Image attached by client]"));
+                parts.push(format!(
+                    "data:{};base64,{}\n[Image attached by client]",
+                    img.mime_type, img.data
+                ));
             }
-            ContentBlock::ResourceLink(r) => {
-                parts.push(format!("(see attached: {})", r.uri));
-            }
-            ContentBlock::Resource(r) => {
-                parts.push(format!("(see attached: {})", resource_uri(&r.resource)));
-            }
+            ContentBlock::ResourceLink(r) => parts.push(format!("(see attached: {})", r.uri)),
+            ContentBlock::Resource(r) => parts.push(format!(
+                "(see attached: {})",
+                match &r.resource {
+                    agent_client_protocol::schema::v1::EmbeddedResourceResource::TextResourceContents(t) => t.uri.clone(),
+                    agent_client_protocol::schema::v1::EmbeddedResourceResource::BlobResourceContents(b) => b.uri.clone(),
+                    _ => String::new(),
+                }
+            )),
             _ => parts.push("(unsupported content block)".to_string()),
         }
     }
     parts.join("\n\n")
 }
 
-fn resource_uri(r: &EmbeddedResourceResource) -> String {
+fn resource_text(
+    r: &agent_client_protocol::schema::v1::EmbeddedResourceResource,
+) -> Option<String> {
     match r {
-        EmbeddedResourceResource::TextResourceContents(t) => t.uri.clone(),
-        EmbeddedResourceResource::BlobResourceContents(b) => b.uri.clone(),
-        _ => String::new(),
-    }
-}
-
-fn resource_text(r: &EmbeddedResourceResource) -> Option<String> {
-    match r {
-        EmbeddedResourceResource::TextResourceContents(t) => Some(t.text.clone()),
-        EmbeddedResourceResource::BlobResourceContents(_) => None,
+        agent_client_protocol::schema::v1::EmbeddedResourceResource::TextResourceContents(t) => {
+            Some(t.text.clone())
+        }
         _ => None,
     }
 }
 
-/// For embedded `Resource` blocks, synthesize the same `read_file` tool-call +
-/// result pair the `@file` attachment path uses, so file contents reach the LLM
-/// without a round trip.
 fn synthesize_resource_reads(blocks: &[ContentBlock]) -> Vec<SessionEvent> {
     let mut out = Vec::new();
     for (idx, block) in blocks.iter().enumerate() {
@@ -473,26 +782,25 @@ fn synthesize_resource_reads(blocks: &[ContentBlock]) -> Vec<SessionEvent> {
     out
 }
 
-// ── AgentEvent → ACP SessionUpdate (display-only events) ──────────────────────
-
-/// Map a visible `AgentEvent` to an ACP `SessionUpdate` (or `None` when the
-/// event carries nothing a client should render — those are mirrored by the
-/// main loop where needed).
-fn agent_event_to_update(ev: AgentEvent) -> Option<SessionUpdate> {
-    match ev {
-        AgentEvent::TextToken { text, .. } => Some(SessionUpdate::AgentMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(text))),
-        )),
-        _ => None,
+fn resource_uri(r: &agent_client_protocol::schema::v1::EmbeddedResourceResource) -> String {
+    match r {
+        agent_client_protocol::schema::v1::EmbeddedResourceResource::TextResourceContents(t) => {
+            t.uri.clone()
+        }
+        agent_client_protocol::schema::v1::EmbeddedResourceResource::BlobResourceContents(b) => {
+            b.uri.clone()
+        }
+        _ => String::new(),
     }
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn usage_update_value(usage: &UsageStats, context_size: u64) -> Option<UsageUpdate> {
     let used = usage.used_tokens()? as u64;
     Some(UsageUpdate::new(used.min(context_size), context_size))
 }
 
-/// Map a ri tool name to an ACP `ToolKind`.
 fn tool_kind(name: &str) -> ToolKind {
     match name {
         "read_file" | "read_skill" => ToolKind::Read,
@@ -503,8 +811,6 @@ fn tool_kind(name: &str) -> ToolKind {
         _ => ToolKind::Other,
     }
 }
-
-// ── small helpers ─────────────────────────────────────────────────────────────
 
 fn now_ts() -> u64 {
     std::time::SystemTime::now()
@@ -527,55 +833,9 @@ fn new_session_suffix() -> String {
     )
 }
 
-/// Build context for an ACP server: provider, built-in tools, system prompt.
-pub async fn build_context(
-    provider: Arc<dyn LlmProvider + Send + Sync + 'static>,
-    model: &str,
-    cwd: &std::path::Path,
-) -> AcpContext {
-    let file_tracker = Arc::new(Mutex::new(FileTracker::with_exclusions(vec![], &[])));
-    let skills = Arc::new(crate::skills::load_skills());
-    let tools = crate::agent::tools::register_builtin_tools(
-        None,
-        Arc::clone(&file_tracker),
-        Arc::clone(&skills),
-        Vec::new(),
-    )
-    .await;
-    let system_prompt =
-        crate::agent::build_system_prompt(&tools, &cwd.to_string_lossy(), &skills, None);
-
-    AcpContext {
-        provider,
-        model: model.to_string(),
-        tools: Arc::new(tools),
-        system_prompt,
-        file_tracker,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::AssistantPhase;
-
-    #[test]
-    fn maps_text_token_to_agent_message_chunk() {
-        let update = agent_event_to_update(AgentEvent::TextToken {
-            text: "hello".to_string(),
-            phase: AssistantPhase::Unknown,
-        })
-        .unwrap();
-        match update {
-            SessionUpdate::AgentMessageChunk(chunk) => {
-                let ContentBlock::Text(t) = chunk.content else {
-                    panic!("expected text block");
-                };
-                assert_eq!(t.text, "hello");
-            }
-            other => panic!("expected AgentMessageChunk, got {other:?}"),
-        }
-    }
 
     #[test]
     fn maps_tool_kind_names() {
@@ -587,23 +847,10 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_display_only_events() {
-        assert!(
-            agent_event_to_update(AgentEvent::ToolOutputChunk {
-                id: "x".into(),
-                chunk: "y".into(),
-            })
-            .is_none()
-        );
-        assert!(agent_event_to_update(AgentEvent::Done).is_none());
-    }
-
-    #[test]
     fn renders_prompt_blocks_with_text_and_resource() {
         use agent_client_protocol::schema::v1::{
             EmbeddedResource, EmbeddedResourceResource, TextResourceContents,
         };
-
         let blocks = vec![
             ContentBlock::Text(TextContent::new("analyze this")),
             ContentBlock::Resource(EmbeddedResource::new(
@@ -637,5 +884,109 @@ mod tests {
         let u = usage_update_value(&usage, 200_000).expect("usage");
         assert_eq!(u.used, 150);
         assert_eq!(u.size, 200_000);
+    }
+
+    #[test]
+    fn thinking_round_trip() {
+        assert_eq!(ThinkingLevel::parse("high"), Some(ThinkingLevel::High));
+        assert_eq!(ThinkingLevel::parse("nope"), None);
+        assert_eq!(ThinkingLevel::High.as_str(), "high");
+    }
+
+    // ── ask_user → request_permission mapping ────────────────────────────────
+
+    use crate::agent::types::AskUserOption;
+
+    fn ask_request(
+        options: Vec<AskUserOption>,
+    ) -> (AskRequest, tokio::sync::oneshot::Receiver<AskUserResponse>) {
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        (
+            AskRequest {
+                question: "proceed?".to_string(),
+                context: None,
+                options,
+                allow_multiple: false,
+                allow_freeform: true,
+                reply,
+            },
+            reply_rx,
+        )
+    }
+
+    #[test]
+    fn permission_options_map_titles_and_default_to_continue() {
+        let (req, _) = ask_request(vec![
+            AskUserOption {
+                title: "Yes".to_string(),
+                description: None,
+            },
+            AskUserOption {
+                title: "No".to_string(),
+                description: None,
+            },
+        ]);
+        let (opts, titles) = permission_options(&req);
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].name, "Yes");
+        assert_eq!(opts[1].name, "No");
+        assert_eq!(opts[0].option_id.0.as_ref(), "opt-0");
+        assert_eq!(titles[1].1, "No");
+
+        let (bare, _) = ask_request(vec![]);
+        let (opts, titles) = permission_options(&bare);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].name, "Continue");
+        assert_eq!(titles[0].1, "Continue");
+    }
+
+    #[test]
+    fn ask_reply_maps_selected_cancelled_and_error_outcomes() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOptionId as Id, SelectedPermissionOutcome,
+        };
+
+        let (req, _) = ask_request(vec![AskUserOption {
+            title: "Run tests".to_string(),
+            description: None,
+        }]);
+        let (_opts, titles) = permission_options(&req);
+
+        let selected = Ok(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(Id::new("opt-0"))),
+        ));
+        assert!(matches!(
+            ask_reply_from_outcome(&selected, &titles),
+            AskUserResponse::Answer(t) if t == "Run tests"
+        ));
+
+        let cancelled = Ok(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Cancelled,
+        ));
+        assert!(matches!(
+            ask_reply_from_outcome(&cancelled, &titles),
+            AskUserResponse::Cancelled
+        ));
+
+        let err = Err(agent_client_protocol::Error::internal_error());
+        assert!(matches!(
+            ask_reply_from_outcome(&err, &titles),
+            AskUserResponse::Cancelled
+        ));
+    }
+
+    #[test]
+    fn ask_reply_falls_back_to_option_id_for_unknown_selection() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOptionId as Id, SelectedPermissionOutcome,
+        };
+        let unknown = Ok(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(Id::new("mystery"))),
+        ));
+        let titles = [("opt-0".to_string(), "Run tests".to_string())];
+        assert!(matches!(
+            ask_reply_from_outcome(&unknown, &titles),
+            AskUserResponse::Answer(t) if t == "mystery"
+        ));
     }
 }

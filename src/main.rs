@@ -9,7 +9,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io,
     io::ErrorKind,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 mod acp;
@@ -114,6 +114,11 @@ struct Cli {
     /// JSON-RPC surface so external ACP clients can connect.
     #[arg(long)]
     serve: bool,
+
+    /// Run as a headless ACP server over HTTP + WebSocket at ADDR (e.g.
+    /// 127.0.0.1:8080) instead of the TUI.
+    #[arg(long, value_name = "ADDR")]
+    serve_ws: Option<std::net::SocketAddr>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -207,34 +212,65 @@ async fn main() -> io::Result<()> {
         provider_setup::resolve_thinking_level_for_model(&config, &initial_model);
 
     // ── Headless ACP server mode ──────────────────────────────────────────
-    // No TUI, no terminal: build the provider and serve the agent loop over
-    // ACP on stdio. The SDK's Stdio transport uses blocking-thread + async-io
-    // facilities, so the connection runs on a dedicated OS thread; ri's tokio
-    // runtime is reached through a captured handle.
-    if cli.serve {
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| ".".to_string());
+    // No TUI, no terminal: serve the agent loop over ACP on stdio or WS. The
+    // SDK's Stdio transport uses blocking-thread + async-io facilities, so the
+    // connection runs on a dedicated OS thread; ri's tokio runtime is reached
+    // through a captured handle.
+    if cli.serve || cli.serve_ws.is_some() {
         let provider =
             match build_provider_for_instance(&initial_instance, initial_thinking, &config) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("error: provider unavailable in --serve mode: {e}");
+                    eprintln!("error: provider unavailable in server mode: {e}");
                     return Err(io::Error::other(e.to_string()));
                 }
             };
-        let context =
-            acp::build_context(provider, &initial_model, std::path::Path::new(&cwd)).await;
-        let ctx = Arc::new(context);
+
+        // Provider rebuild hook so `_ri/set_model` / `_ri/set_thinking` can
+        // swap the active provider for subsequent sessions/prompts.
+        let instance_for_build = initial_instance.clone();
+        let rebuild: acp::ProviderRebuild =
+            Arc::new(move |model: &str, thinking: ThinkingLevel| {
+                let mut inst = instance_for_build.clone();
+                inst.model = Some(model.to_string());
+                build_provider_for_instance(&inst, thinking, &config::RiConfig::default())
+            });
         let handle = tokio::runtime::Handle::current();
+
+        // Track project files, but never the sessions data dir or cache dir.
+        let excluded_prefixes: Vec<std::path::PathBuf> = dirs::PROJECT_DIRS
+            .as_ref()
+            .map(|d| vec![d.data_dir().join("sessions"), d.cache_dir().to_path_buf()])
+            .unwrap_or_default();
+        let context = crate::acp::AcpContext {
+            provider: RwLock::new(provider),
+            model: RwLock::new(initial_model.clone()),
+            thinking: RwLock::new(initial_thinking),
+            rebuild,
+            tokio_handle: Some(handle.clone()),
+            file_tracker: Arc::new(std::sync::Mutex::new(FileTracker::with_exclusions(
+                excluded_prefixes,
+                &["AGENTS.md", "SKILL.md"],
+            ))),
+            skills: Arc::new(skills::load_skills()),
+        };
+        let ctx = Arc::new(context);
+
+        if let Some(addr) = &cli.serve_ws {
+            eprintln!("ri ACP listening on http://{addr} (WebSocket + streamable HTTP)");
+            return acp::run_acp_ws(ctx, *addr)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()));
+        }
+
         let server = std::thread::spawn(move || {
             futures_lite::future::block_on(acp::run_acp_server(ctx, handle))
         });
-        match server.join() {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(e)) => return Err(io::Error::other(e.to_string())),
-            Err(_) => return Err(io::Error::other("ACP server thread panicked")),
-        }
+        return match server.join() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(io::Error::other(e.to_string())),
+            Err(_) => Err(io::Error::other("ACP server thread panicked")),
+        };
     }
 
     let window_folder = std::env::current_dir()
