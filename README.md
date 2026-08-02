@@ -88,6 +88,8 @@ cargo install --path .
 | `-p` | `--print <PROMPT>...` | Run in non-interactive mode: send PROMPT, stream the response to stdout, and exit. Accepts multiple words without shell quoting |
 | | `--serve` | Run as a headless ACP (Agent Client Protocol) server on stdio instead of the TUI |
 | | `--serve-ws <ADDR>` | Run as a headless ACP server over HTTP + WebSocket (`ws://ADDR/acp`) instead of the TUI |
+| | `--serve-ws-token <TOKEN>` | Require this admin token on mutating `_ri/*` methods |
+| | `--serve-ws-cert <CERT>` / `--serve-ws-key <KEY>` | Serve `--serve-ws` over TLS (`wss://`) |
 | | `--print-dirs` | Print the file-system paths ri uses and exit |
 | `-h` | `--help` | Print help |
 | `-V` | `--version` | Print version |
@@ -226,16 +228,20 @@ Implemented surface:
 - `session/load` — replays a session's history as updates; sessions are
   persisted to disk after each prompt (`~/.local/share/ri/sessions/acp/`), so
   a later process can resume them (`_ri/list_sessions` → `session/load` →
-  `session/prompt`)
+  `session/prompt`); prompt tools run anchored at the session `cwd`
 - `session/cancel` — maps to ri's hard abort
 - `ask_user` — forwarded as `session/request_permission` (multiple-choice
-  mapping; freeform-only asks surface a single "Continue" option), so headless
-  clients can approve/deny tool operations
+  mapping with descriptions folded into labels; freeform asks get a trailing
+  "Continue" escape), so headless clients can approve/deny tool operations
 - ri-specific `_ri/*` methods: `_ri/get_state` (model, thinking level,
   sessions), `_ri/set_model`, `_ri/set_thinking` (all rebuild/swap the active
-  provider), `_ri/list_sessions` (persisted sessions, newest first); call
-  unit-request methods with `"params": null`
+  provider), `_ri/list_sessions` / `_ri/delete_session` / `_ri/prune_sessions`
+  (persisted-session management), `_ri/logs` (recent activity); call
+  unit-request methods with `"params": null`; mutating methods accept a
+  `token` field enforced by `--serve-ws-token`
+- Transport: stdio (`--serve`) or HTTP+WebSocket at `/acp` (`--serve-ws`,
+  optionally TLS via `--serve-ws-cert`/`--serve-ws-key`); the WS server
+  multiplexes many clients, stdio serves one
 
-Current limitations: one prompt at a time per session; auto-compaction is
-disabled; tool cwd is the process directory (per-session `cwd` feeds the
-system prompt). Requires Rust 1.88 (ACP dependency baseline).
+Current limitations: one prompt at a time per session. Requires Rust 1.88
+(ACP dependency baseline).

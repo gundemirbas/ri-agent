@@ -119,6 +119,21 @@ struct Cli {
     /// 127.0.0.1:8080) instead of the TUI.
     #[arg(long, value_name = "ADDR")]
     serve_ws: Option<std::net::SocketAddr>,
+
+    /// Optional admin token required by state-mutating `_ri/*` methods (the
+    /// client echoes it in the request's `token` field). Works for both stdio
+    /// and `--serve-ws`. Unset = no authentication.
+    #[arg(long, value_name = "TOKEN")]
+    serve_ws_token: Option<String>,
+
+    /// PEM certificate chain file (with `--serve-ws-key`) to serve `--serve-ws`
+    /// over TLS instead of plain HTTP.
+    #[arg(long, value_name = "CERT")]
+    serve_ws_cert: Option<std::path::PathBuf>,
+
+    /// PEM private key file (PKCS#8 or PKCS#1) used with `--serve-ws-cert`.
+    #[arg(long, value_name = "KEY")]
+    serve_ws_key: Option<std::path::PathBuf>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -253,12 +268,30 @@ async fn main() -> io::Result<()> {
                 &["AGENTS.md", "SKILL.md"],
             ))),
             skills: Arc::new(skills::load_skills()),
+            logs: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            admin_token: cli.serve_ws_token.as_deref().map(Arc::from),
         };
         let ctx = Arc::new(context);
 
         if let Some(addr) = &cli.serve_ws {
-            eprintln!("ri ACP listening on http://{addr} (WebSocket + streamable HTTP)");
-            return acp::run_acp_ws(ctx, *addr)
+            // TLS config: both cert and key must be provided together.
+            let tls: Option<(std::path::PathBuf, std::path::PathBuf)> =
+                match (&cli.serve_ws_cert, &cli.serve_ws_key) {
+                    (Some(c), Some(k)) => Some((c.clone(), k.clone())),
+                    (None, None) => None,
+                    _ => {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidInput,
+                            "--serve-ws-cert and --serve-ws-key must be provided together",
+                        ));
+                    }
+                };
+            if tls.is_some() {
+                eprintln!("ri ACP listening on wss://{addr} (TLS)");
+            } else {
+                eprintln!("ri ACP listening on http://{addr} (WebSocket + streamable HTTP)");
+            }
+            return acp::run_acp_ws(ctx, *addr, tls)
                 .await
                 .map_err(|e| io::Error::other(e.to_string()));
         }

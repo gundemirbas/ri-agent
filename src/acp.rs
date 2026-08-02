@@ -6,25 +6,31 @@
 //!
 //! Implemented surface:
 //! - `initialize` — protocol v1, capability negotiation (image prompts,
-//!   in-memory `session/load`)
+//!   `session/load`)
 //! - `session/new` — in-memory session (history, cancel channel, cwd)
 //! - `session/load` — replays a known session's history as updates; sessions
 //!   are persisted to disk (`~/.local/share/ri/sessions/acp/<id>.json`) after
 //!   each prompt, so they can be resumed by a later process
 //! - `session/prompt` — streams `agent_message_chunk`, `agent_thought_chunk`,
 //!   `tool_call`/`tool_call_update` (with live tool output forwarded as
-//!   in-progress `tool_call_update` chunks), `usage_update`, then `end_turn`
+//!   in-progress `tool_call_update` chunks), `usage_update`, then `end_turn`;
+//!   tools run anchored at the session `cwd` and auto-compaction is enabled
 //! - `session/cancel` — maps to ri `HardAbort`
 //! - `ask_user` → `session/request_permission` (multiple-choice mapping;
-//!   freeform-only asks surface a single "Continue" option)
+//!   option descriptions folded into labels; freeform asks surface a trailing
+//!   "Continue" escape)
 //! - Custom `_ri/*` methods: `_ri/get_state`, `_ri/set_model`,
 //!   `_ri/set_thinking` (provider is rebuilt on change),
-//!   `_ri/list_sessions` (persisted sessions, newest first)
+//!   `_ri/list_sessions` / `_ri/delete_session` / `_ri/prune_sessions`
+//!   (persisted-session management), `_ri/logs` (recent activity). Mutating
+//!   `_ri/*` methods require an admin `token` when `--serve-ws-token` is set.
 //!
-//! Limitations (deliberate, documented): one prompt at a time per session;
-//! tool cwd is the current process directory (per-session cwd feeds the
-//! system prompt; follow-up makes it a real per-session root). The agent loop
-//! itself is reused unchanged.
+//! Transports: stdio (`--serve`), or HTTP + WebSocket at `/acp` (`--serve-ws <ADDR>`,
+//! optionally TLS via `--serve-ws-cert`/`--serve-ws-key`). The WebSocket server
+//! multiplexes multiple client connections; stdio serves exactly one.
+//!
+//! Limitations (deliberate, documented): one prompt at a time per session.
+//! The agent loop itself is reused unchanged.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -78,6 +84,8 @@ struct RiGetStateResponse {
 struct RiSetModelRequest {
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
@@ -93,6 +101,8 @@ struct RiSetModelResponse {
 struct RiSetThinkingRequest {
     #[serde(default)]
     level: String,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
@@ -126,6 +136,8 @@ struct RiSessionMeta {
 struct RiDeleteSessionRequest {
     #[serde(default, rename = "sessionId")]
     session_id: String,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
@@ -142,6 +154,8 @@ struct RiDeleteSessionResponse {
 struct RiPruneSessionsRequest {
     #[serde(default, rename = "olderThanSeconds")]
     older_than_seconds: u64,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
@@ -149,6 +163,19 @@ struct RiPruneSessionsRequest {
 struct RiPruneSessionsResponse {
     ok: bool,
     deleted: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_ri/logs", response = RiLogsResponse)]
+struct RiLogsRequest {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RiLogsResponse {
+    logs: Vec<AcpLogEntry>,
 }
 
 // ── Context ───────────────────────────────────────────────────────────────────
@@ -174,6 +201,46 @@ pub struct AcpContext {
     pub tokio_handle: Option<tokio::runtime::Handle>,
     pub file_tracker: Arc<Mutex<FileTracker>>,
     pub skills: Arc<Vec<crate::skills::SkillMeta>>,
+    /// Bounded activity buffer surfaced by `_ri/logs`.
+    pub logs: Arc<Mutex<std::collections::VecDeque<AcpLogEntry>>>,
+    /// Optional admin token. When set, state-mutating `_ri/*` methods require
+    /// a matching `token` request field (`--serve-ws-token`).
+    pub admin_token: Option<Arc<str>>,
+}
+
+/// A single `_ri/logs` entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpLogEntry {
+    ts: u64,
+    level: String,
+    session: Option<String>,
+    message: String,
+}
+
+impl AcpContext {
+    /// Append a bounded activity entry (surfaced via `_ri/logs`).
+    pub fn log(&self, level: &str, session: Option<&str>, message: impl Into<String>) {
+        let mut logs = self.logs.lock().unwrap();
+        logs.push_back(AcpLogEntry {
+            ts: now_ts(),
+            level: level.to_string(),
+            session: session.map(str::to_string),
+            message: message.into(),
+        });
+        if logs.len() > 500 {
+            logs.pop_front();
+        }
+    }
+
+    /// Allow the request when no admin token is configured, or when the
+    /// provided token matches the configured one.
+    pub fn authorize(&self, token: Option<&str>) -> bool {
+        match &self.admin_token {
+            Some(expected) => token.is_some_and(|t| t == expected.as_ref()),
+            None => true,
+        }
+    }
 }
 
 /// In-memory per-session state.
@@ -206,6 +273,19 @@ macro_rules! send_update {
     }};
 }
 
+/// Reject an unauthorized mutating `_ri/*` request and return from the handler.
+macro_rules! unauthorized {
+    ($responder:expr, $method:expr) => {{
+        $responder
+            .respond_with_error(agent_client_protocol::Error::invalid_params().data(format!(
+                "{}.unauthorized: invalid or missing admin token",
+                $method
+            )))
+            .ok();
+        return Ok(());
+    }};
+}
+
 /// Build the agent component (handlers registered) shared by the stdio and
 /// WebSocket transports. Returns a builder that implements `ConnectTo<Client>`.
 fn build_agent(
@@ -218,9 +298,14 @@ fn build_agent(
     let s_cancel = Arc::clone(&sessions);
     let s_state = Arc::clone(&sessions);
     let s_del = Arc::clone(&sessions);
+    let ctx_new = Arc::clone(&ctx);
+    let ctx_cancel = Arc::clone(&ctx);
     let ctx_state = Arc::clone(&ctx);
     let ctx_set_model = Arc::clone(&ctx);
     let ctx_set_thinking = Arc::clone(&ctx);
+    let ctx_logs = Arc::clone(&ctx);
+    let ctx_del = Arc::clone(&ctx);
+    let ctx_prune = Arc::clone(&ctx);
 
     Agent
         .builder()
@@ -248,6 +333,7 @@ fn build_agent(
                     .lock()
                     .unwrap()
                     .insert(id.clone(), AcpSession::new(req.cwd.clone()));
+                ctx_new.log("info", Some(&id.to_string()), "session/new");
                 responder.respond(NewSessionResponse::new(id))
             },
             on_receive_request!(),
@@ -305,6 +391,14 @@ fn build_agent(
             async move |req: PromptRequest, responder, connection| {
                 let session_id = req.session_id.clone();
                 let prompt_text = render_prompt_blocks(&req.prompt);
+                ctx.log(
+                    "info",
+                    Some(&session_id.to_string()),
+                    format!(
+                        "session/prompt start ({})",
+                        prompt_text.chars().take(60).collect::<String>()
+                    ),
+                );
 
                 // Per-session (cwd, busy guard) + push user message / resource reads.
                 let (session_cwd, cancel_rx, context_size, history_snapshot) = {
@@ -424,6 +518,18 @@ fn build_agent(
                                 .block_task()
                                 .await;
                             let answer = ask_reply_from_outcome(&outcome, &option_titles);
+                            match &answer {
+                                AskUserResponse::Answer(a) => ctx.log(
+                                    "info",
+                                    Some(&session_id.to_string()),
+                                    format!("ask_user answered: {a}"),
+                                ),
+                                AskUserResponse::Cancelled => ctx.log(
+                                    "warn",
+                                    Some(&session_id.to_string()),
+                                    "ask_user cancelled",
+                                ),
+                            }
                             let _ = request.reply.send(answer);
                         }
                         AppEvent::Agent(agent_ev) => match agent_ev {
@@ -577,6 +683,17 @@ fn build_agent(
                     }
                 }
 
+                match &error {
+                    Some(msg) => {
+                        ctx.log(
+                            "error",
+                            Some(&session_id.to_string()),
+                            format!("session/prompt failed: {msg}"),
+                        );
+                    }
+                    None => ctx.log("info", Some(&session_id.to_string()), "session/prompt end"),
+                }
+
                 match error {
                     Some(msg) => responder.respond_with_error(
                         agent_client_protocol::Error::internal_error().data(msg),
@@ -595,6 +712,12 @@ fn build_agent(
                 {
                     let _ = tx.send(CancelLevel::HardAbort);
                 }
+                drop(map);
+                ctx_cancel.log(
+                    "info",
+                    Some(&notif.session_id.to_string()),
+                    "session/cancel (hard abort)",
+                );
                 Ok(())
             },
             on_receive_notification!(),
@@ -636,6 +759,9 @@ fn build_agent(
         // ── _ri/delete_session ───────────────────────────────────────────────
         .on_receive_request(
             async move |req: RiDeleteSessionRequest, responder, _connection| {
+                if !ctx_del.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/delete_session");
+                }
                 if req.session_id.trim().is_empty() {
                     return responder.respond(RiDeleteSessionResponse {
                         ok: false,
@@ -671,6 +797,13 @@ fn build_agent(
                 }
 
                 let deleted_on_disk = delete_persisted_session(&id);
+                ctx_del.log(
+                    "info",
+                    Some(&req.session_id),
+                    format!(
+                        "_ri/delete_session (memory={deleted_in_memory}, disk={deleted_on_disk})"
+                    ),
+                );
                 responder.respond(RiDeleteSessionResponse {
                     ok: true,
                     error: None,
@@ -683,6 +816,9 @@ fn build_agent(
         // ── _ri/prune_sessions (retention) ──────────────────────────────────
         .on_receive_request(
             async move |req: RiPruneSessionsRequest, responder, _connection| {
+                if !ctx_prune.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/prune_sessions");
+                }
                 let cutoff = now_ts().saturating_sub(req.older_than_seconds);
                 let mut deleted = 0usize;
                 if let Some(dir) = acp_sessions_dir() {
@@ -703,6 +839,11 @@ fn build_agent(
                         }
                     }
                 }
+                ctx_prune.log(
+                    "info",
+                    None,
+                    format!("_ri/prune_sessions deleted {deleted}"),
+                );
                 responder.respond(RiPruneSessionsResponse { ok: true, deleted })
             },
             on_receive_request!(),
@@ -710,6 +851,9 @@ fn build_agent(
         // ── _ri/set_model ───────────────────────────────────────────────────
         .on_receive_request(
             async move |req: RiSetModelRequest, responder, _connection| {
+                if !ctx_set_model.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/set_model");
+                }
                 if req.model.trim().is_empty() {
                     return responder.respond(RiSetModelResponse {
                         ok: false,
@@ -722,17 +866,21 @@ fn build_agent(
                     Ok(provider) => {
                         *ctx_set_model.model.write().unwrap() = req.model.clone();
                         *ctx_set_model.provider.write().unwrap() = provider;
+                        ctx_set_model.log("info", None, format!("_ri/set_model -> {}", req.model));
                         responder.respond(RiSetModelResponse {
                             ok: true,
                             error: None,
                             model: req.model,
                         })
                     }
-                    Err(e) => responder.respond(RiSetModelResponse {
-                        ok: false,
-                        error: Some(e.to_string()),
-                        model: req.model,
-                    }),
+                    Err(e) => {
+                        ctx_set_model.log("error", None, format!("_ri/set_model failed: {e}"));
+                        responder.respond(RiSetModelResponse {
+                            ok: false,
+                            error: Some(e.to_string()),
+                            model: req.model,
+                        })
+                    }
                 }
             },
             on_receive_request!(),
@@ -740,6 +888,9 @@ fn build_agent(
         // ── _ri/set_thinking ───────────────────────────────────────────────
         .on_receive_request(
             async move |req: RiSetThinkingRequest, responder, _connection| {
+                if !ctx_set_thinking.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/set_thinking");
+                }
                 let Some(level) = ThinkingLevel::parse(&req.level) else {
                     return responder.respond(RiSetThinkingResponse {
                         ok: false,
@@ -752,18 +903,43 @@ fn build_agent(
                     Ok(provider) => {
                         *ctx_set_thinking.thinking.write().unwrap() = level;
                         *ctx_set_thinking.provider.write().unwrap() = provider;
+                        ctx_set_thinking.log(
+                            "info",
+                            None,
+                            format!("_ri/set_thinking -> {}", level.as_str()),
+                        );
                         responder.respond(RiSetThinkingResponse {
                             ok: true,
                             error: None,
                             level: level.as_str().to_string(),
                         })
                     }
-                    Err(e) => responder.respond(RiSetThinkingResponse {
-                        ok: false,
-                        error: Some(e.to_string()),
-                        level: req.level,
-                    }),
+                    Err(e) => {
+                        ctx_set_thinking.log(
+                            "error",
+                            None,
+                            format!("_ri/set_thinking failed: {e}"),
+                        );
+                        responder.respond(RiSetThinkingResponse {
+                            ok: false,
+                            error: Some(e.to_string()),
+                            level: req.level,
+                        })
+                    }
                 }
+            },
+            on_receive_request!(),
+        )
+        // ── _ri/logs ────────────────────────────────────────────────────────
+        .on_receive_request(
+            async move |req: RiLogsRequest, responder, _connection| {
+                let limit = req.limit.unwrap_or(200).min(1000);
+                let most_recent_first: Vec<AcpLogEntry> = {
+                    let all = ctx_logs.logs.lock().unwrap();
+                    all.iter().rev().take(limit).cloned().collect()
+                };
+                let logs = most_recent_first.into_iter().rev().collect();
+                responder.respond(RiLogsResponse { logs })
             },
             on_receive_request!(),
         )
@@ -785,7 +961,11 @@ pub async fn run_acp_server(
 }
 
 /// Run the ACP over HTTP + WebSocket on `addr` (axum).
-pub async fn run_acp_ws(ctx: Arc<AcpContext>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+pub async fn run_acp_ws(
+    ctx: Arc<AcpContext>,
+    addr: std::net::SocketAddr,
+    tls: Option<(PathBuf, PathBuf)>,
+) -> anyhow::Result<()> {
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     let factory = {
         let ctx = Arc::clone(&ctx);
@@ -795,8 +975,88 @@ pub async fn run_acp_ws(ctx: Arc<AcpContext>, addr: std::net::SocketAddr) -> any
     let server = agent_client_protocol_http::AcpHttpServer::new(factory);
     let router = server.into_router();
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await?;
+    match tls {
+        Some((cert, key)) => {
+            let acceptor = build_tls_acceptor(&cert, &key)?;
+            axum::serve(
+                TlsServer {
+                    inner: listener,
+                    acceptor,
+                },
+                router,
+            )
+            .await?;
+        }
+        None => axum::serve(listener, router).await?,
+    }
     Ok(())
+}
+
+/// Minimal axum [`axum::serve::Listener`] that upgrades each accepted TCP
+/// connection to TLS. Connections that fail the handshake are logged and
+/// dropped rather than propagated as errors.
+struct TlsServer {
+    inner: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl axum::serve::Listener for TlsServer {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (tcp, addr) = match self.inner.accept().await {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("ri ACP: accept error: {e}");
+                    continue;
+                }
+            };
+            match self.acceptor.accept(tcp).await {
+                Ok(tls) => return (tls, addr),
+                Err(e) => {
+                    eprintln!("ri ACP: TLS handshake failed from {addr}: {e}");
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+/// Build a `TlsAcceptor` from PEM cert + key files (PKCS#8 or PKCS#1).
+fn build_tls_acceptor(
+    cert_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let certs: Vec<CertificateDer<'static>> = {
+        let data = fs::read(cert_path)?;
+        let mut reader = std::io::Cursor::new(data);
+        rustls_pemfile::certs(&mut reader).collect::<Result<_, _>>()?
+    };
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in {}", cert_path.display());
+    }
+    let key: PrivateKeyDer<'static> = {
+        let data = fs::read(key_path)?;
+        let mut reader = std::io::Cursor::new(data);
+        rustls_pemfile::private_key(&mut reader)?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?
+    };
+    // Install the crate's default crypto provider (already built for musl via
+    // the HTTP stack). Ignore "already installed" errors.
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(anyhow::Error::msg)?;
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
 }
 
 // ── Mirroring helpers ─────────────────────────────────────────────────────────

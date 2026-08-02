@@ -11,6 +11,10 @@
   `usage_update`), and `session/cancel`. The existing agent loop is reused
   unchanged; the ACP connection runs on a dedicated thread. Now requires
   Rust 1.88 (ACP dependency baseline).
+- **Per-session tool cwd + auto-compaction**: every `session/prompt` roots its
+  tools at the session `cwd` — `bash`/`exec` run with that working directory
+  and `read`/`write`/`edit`/`find` resolve relative paths against it — and ACP
+  sessions run with auto-compaction enabled (matching the TUI).
 - **ACP extensions**: `ask_user` now maps to `session/request_permission` so
   headless clients can approve/deny tool operations (freeform-only asks get a
   single "Continue" option). `--serve-ws <ADDR>` serves the same surface over
@@ -30,6 +34,13 @@
   lists persisted sessions (newest first), `session/load` replays the restored
   history and registers it in memory, and the next `session/prompt` continues
   the multi-turn conversation from that history across process restarts.
+- **ACP ops**: `_ri/logs` surfaces a bounded recent-activity buffer (session
+  lifecycle, prompt start/end, asks, provider swaps, deletes). Mutating
+  `_ri/*` methods (`set_model`, `set_thinking`, `delete_session`,
+  `prune_sessions`) require an admin `token` when `--serve-ws-token` is set.
+  `--serve-ws` can run TLS via `--serve-ws-cert`/`--serve-ws-key` (`wss://`),
+  and the WS server multiplexes many client connections while stdio serves
+  one.
 
 ### Fixed
 
