@@ -257,6 +257,11 @@ pub struct ToolCallContext {
     /// Enables the `invoke_subagent` tool. `None` when subagent invocation is
     /// not wired in this context (e.g. tests, headless tool runs).
     pub subagent: Option<SubagentContext>,
+    /// Workspace root for this tool call. `None` = tools run relative to the
+    /// process working directory (TUI). When set, subprocess tools execute
+    /// with this cwd and relative file paths are anchored here (headless
+    /// per-session cwd).
+    pub root: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]
@@ -268,6 +273,7 @@ impl ToolCallContext {
             tx: None,
             cancel_rx: None,
             subagent: None,
+            root: None,
         }
     }
 }
@@ -365,6 +371,9 @@ pub struct DefaultToolExecutor {
     /// Subagent-launch context passed through to tools. When present, the
     /// `invoke_subagent` tool can run named subagents (see [`SubagentContext`]).
     pub subagent: Option<SubagentContext>,
+    /// Workspace root threaded into every [`ToolCallContext`]. `None` keeps
+    /// tools anchored to the process working directory.
+    pub root: Option<std::path::PathBuf>,
 }
 
 impl DefaultToolExecutor {
@@ -373,6 +382,16 @@ impl DefaultToolExecutor {
         Self {
             cancel_rx: None,
             subagent: None,
+            root: None,
+        }
+    }
+
+    /// Create an executor whose tools are anchored at `root` (relative paths
+    /// resolve there and subprocesses run with it as cwd).
+    pub fn with_root(root: std::path::PathBuf) -> Self {
+        Self {
+            root: Some(root),
+            ..Self::new()
         }
     }
 }
@@ -407,6 +426,7 @@ impl ToolExecutor for DefaultToolExecutor {
                             cwd: s.cwd.clone(),
                             tools: tools.clone(),
                         }),
+                        root: self.root.clone(),
                     };
                     let r = tool.run(args.clone(), ctx).await;
                     let cmd_summary = args.get("command").and_then(|v| v.as_str());

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use serde::de::DeserializeOwned;
 
 use crate::agent::file_tracker::FileTracker;
-use crate::agent::types::{Tool, ToolRegistry, ToolResult};
+use crate::agent::types::{Tool, ToolCallContext, ToolRegistry, ToolResult};
 
 /// Translate a serde_json inner error message into a model-friendly description.
 ///
@@ -147,6 +147,22 @@ pub(super) fn parse_args<T: DeserializeOwned>(
 ) -> Result<T, Box<ToolResult>> {
     serde_path_to_error::deserialize::<_, T>(args)
         .map_err(|e| Box::new(ToolResult::err(format_parse_error(e))))
+}
+
+/// Resolve a tool-supplied path against a per-session workspace root.
+///
+/// Absolute paths are returned unchanged. Relative paths are anchored at
+/// `ctx.root` when the tool context carries one (`None` keeps the old
+/// process-workdir behaviour, used by the TUI and tests).
+pub(super) fn resolve_workspace_path(ctx: &ToolCallContext, path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match ctx.root.as_ref() {
+        Some(root) => root.join(p),
+        None => p.to_path_buf(),
+    }
 }
 
 pub mod ask_user;

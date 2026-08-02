@@ -136,7 +136,7 @@ impl Tool for ReadFileTool {
     fn run(
         &self,
         args: Value,
-        _ctx: crate::agent::types::ToolCallContext,
+        ctx: crate::agent::types::ToolCallContext,
     ) -> Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + '_>> {
         Box::pin(async move {
             let ReadFileArgs {
@@ -147,6 +147,9 @@ impl Tool for ReadFileTool {
                 Ok(a) => a,
                 Err(e) => return *e,
             };
+            let path = super::resolve_workspace_path(&ctx, &path)
+                .to_string_lossy()
+                .into_owned();
 
             // Read the raw bytes first so we can sniff the magic header.
             let raw_bytes = match tokio::fs::read(&path).await {

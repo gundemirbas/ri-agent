@@ -60,7 +60,7 @@ impl Tool for FindTool {
     fn run(
         &self,
         args: Value,
-        _ctx: crate::agent::types::ToolCallContext,
+        ctx: crate::agent::types::ToolCallContext,
     ) -> Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + '_>> {
         Box::pin(async move {
             let FindArgs {
@@ -71,7 +71,18 @@ impl Tool for FindTool {
                 Ok(a) => a,
                 Err(e) => return *e,
             };
-            let search_dir = path.unwrap_or_else(|| ".".to_string());
+            // Default the search root to the session workspace (when set),
+            // otherwise the process working directory.
+            let search_dir = match path {
+                Some(p) => super::resolve_workspace_path(&ctx, &p)
+                    .to_string_lossy()
+                    .into_owned(),
+                None => ctx
+                    .root
+                    .as_ref()
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| ".".to_string()),
+            };
             let limit = limit.unwrap_or(DEFAULT_LIMIT);
 
             // Compile the glob pattern up front so we can report errors early.

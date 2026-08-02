@@ -22,8 +22,8 @@
 //!   `_ri/list_sessions` (persisted sessions, newest first)
 //!
 //! Limitations (deliberate, documented): one prompt at a time per session;
-//! auto-compaction disabled (follow-up); tool cwd is the current process
-//! directory (per-session cwd is used for the system prompt). The agent loop
+//! tool cwd is the current process directory (per-session cwd feeds the
+//! system prompt; follow-up makes it a real per-session root). The agent loop
 //! itself is reused unchanged.
 
 use std::collections::HashMap;
@@ -121,6 +121,36 @@ struct RiSessionMeta {
     updated: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_ri/delete_session", response = RiDeleteSessionResponse)]
+struct RiDeleteSessionRequest {
+    #[serde(default, rename = "sessionId")]
+    session_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RiDeleteSessionResponse {
+    ok: bool,
+    error: Option<String>,
+    deleted_in_memory: bool,
+    deleted_on_disk: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_ri/prune_sessions", response = RiPruneSessionsResponse)]
+struct RiPruneSessionsRequest {
+    #[serde(default, rename = "olderThanSeconds")]
+    older_than_seconds: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RiPruneSessionsResponse {
+    ok: bool,
+    deleted: usize,
+}
+
 // ── Context ───────────────────────────────────────────────────────────────────
 
 /// Rebuilds the active provider for a given model + thinking level (used by
@@ -187,6 +217,7 @@ fn build_agent(
     let s_prompt = Arc::clone(&sessions);
     let s_cancel = Arc::clone(&sessions);
     let s_state = Arc::clone(&sessions);
+    let s_del = Arc::clone(&sessions);
     let ctx_state = Arc::clone(&ctx);
     let ctx_set_model = Arc::clone(&ctx);
     let ctx_set_thinking = Arc::clone(&ctx);
@@ -348,9 +379,9 @@ fn build_agent(
                     ))),
                     session_events: history_snapshot,
                     current_model: model,
-                    auto_compaction_enabled: false, // see module docs
+                    auto_compaction_enabled: true,
                     manual_compaction_instructions: None,
-                    executor: Arc::new(DefaultToolExecutor::new()),
+                    executor: Arc::new(DefaultToolExecutor::with_root(session_cwd.clone())),
                     system_prompt: Some(system_prompt),
                 };
                 let (steering_keeper, steering_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -602,6 +633,80 @@ fn build_agent(
             },
             on_receive_request!(),
         )
+        // ── _ri/delete_session ───────────────────────────────────────────────
+        .on_receive_request(
+            async move |req: RiDeleteSessionRequest, responder, _connection| {
+                if req.session_id.trim().is_empty() {
+                    return responder.respond(RiDeleteSessionResponse {
+                        ok: false,
+                        error: Some("sessionId must not be empty".to_string()),
+                        deleted_in_memory: false,
+                        deleted_on_disk: false,
+                    });
+                }
+                let id = SessionId::new(req.session_id.clone());
+
+                // Remember whether a disk file existed so we can report it.
+                let mut deleted_in_memory = false;
+                let mut error: Option<String> = None;
+                {
+                    let mut map = s_del.lock().unwrap();
+                    if let Some(s) = map.get(&id) {
+                        if s.running {
+                            error =
+                                Some("session is busy; cancel the active prompt first".to_string());
+                        } else {
+                            map.remove(&id);
+                            deleted_in_memory = true;
+                        }
+                    }
+                }
+                if error.is_some() {
+                    return responder.respond(RiDeleteSessionResponse {
+                        ok: false,
+                        error,
+                        deleted_in_memory,
+                        deleted_on_disk: false,
+                    });
+                }
+
+                let deleted_on_disk = delete_persisted_session(&id);
+                responder.respond(RiDeleteSessionResponse {
+                    ok: true,
+                    error: None,
+                    deleted_in_memory,
+                    deleted_on_disk,
+                })
+            },
+            on_receive_request!(),
+        )
+        // ── _ri/prune_sessions (retention) ──────────────────────────────────
+        .on_receive_request(
+            async move |req: RiPruneSessionsRequest, responder, _connection| {
+                let cutoff = now_ts().saturating_sub(req.older_than_seconds);
+                let mut deleted = 0usize;
+                if let Some(dir) = acp_sessions_dir() {
+                    let Ok(entries) = fs::read_dir(&dir) else {
+                        return responder.respond(RiPruneSessionsResponse { ok: true, deleted });
+                    };
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                            continue;
+                        }
+                        if let Ok(data) = fs::read_to_string(&path)
+                            && let Ok(p) = serde_json::from_str::<PersistedSession>(&data)
+                            && p.updated <= cutoff
+                        {
+                            let _ = fs::remove_file(&path);
+                            deleted += 1;
+                        }
+                    }
+                }
+                responder.respond(RiPruneSessionsResponse { ok: true, deleted })
+            },
+            on_receive_request!(),
+        )
         // ── _ri/set_model ───────────────────────────────────────────────────
         .on_receive_request(
             async move |req: RiSetModelRequest, responder, _connection| {
@@ -718,17 +823,25 @@ fn session_replay_updates(events: &[SessionEvent]) -> Vec<SessionUpdate> {
     updates
 }
 
-/// Build ACP permission options for an `ask_user` request. Freeform-only asks
-/// (no options) get a single "Continue" option so the headless client always
-/// has an actionable choice.
+/// Build ACP permission options for an `ask_user` request. Each `ask_user`
+/// option maps to an `AllowOnce` choice (option `description` is folded into
+/// the visible label). When the ask also allows freeform input — or has no
+/// listed options at all — a trailing "Continue" escape is added so the
+/// headless client can always proceed without picking a listed option.
 fn permission_options(request: &AskRequest) -> (Vec<PermissionOption>, Vec<(String, String)>) {
     let mut options: Vec<PermissionOption> = request
         .options
         .iter()
         .enumerate()
-        .map(|(i, o)| permission_option(format!("opt-{i}"), &o.title))
+        .map(|(i, o)| {
+            let label = match o.description.as_deref() {
+                Some(d) if !d.is_empty() => format!("{} — {d}", o.title),
+                _ => o.title.clone(),
+            };
+            permission_option(format!("opt-{i}"), &label)
+        })
         .collect();
-    if options.is_empty() {
+    if request.allow_freeform || options.is_empty() {
         options.push(permission_option("continue".to_string(), "Continue"));
     }
     let titles = options
@@ -953,6 +1066,18 @@ fn persisted_session_list() -> Vec<PersistedSession> {
     list_persisted_in(&dir)
 }
 
+/// Remove a persisted session from disk. Returns `true` if a file was deleted.
+fn delete_persisted_session(id: &SessionId) -> bool {
+    let Some(dir) = acp_sessions_dir() else {
+        return false;
+    };
+    let path = dir.join(format!("{id}.json"));
+    let existed = path.is_file();
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(dir.join(format!("{id}.json.tmp")));
+    existed
+}
+
 fn list_persisted_in(dir: &Path) -> Vec<PersistedSession> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -1072,8 +1197,10 @@ mod tests {
 
     use crate::agent::types::AskUserOption;
 
-    fn ask_request(
+    fn ask_request_opts(
         options: Vec<AskUserOption>,
+        allow_freeform: bool,
+        allow_multiple: bool,
     ) -> (AskRequest, tokio::sync::oneshot::Receiver<AskUserResponse>) {
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         (
@@ -1081,38 +1208,69 @@ mod tests {
                 question: "proceed?".to_string(),
                 context: None,
                 options,
-                allow_multiple: false,
-                allow_freeform: true,
+                allow_multiple,
+                allow_freeform,
                 reply,
             },
             reply_rx,
         )
     }
 
+    fn ask_request(
+        options: Vec<AskUserOption>,
+    ) -> (AskRequest, tokio::sync::oneshot::Receiver<AskUserResponse>) {
+        ask_request_opts(options, true, false)
+    }
+
     #[test]
-    fn permission_options_map_titles_and_default_to_continue() {
-        let (req, _) = ask_request(vec![
-            AskUserOption {
-                title: "Yes".to_string(),
-                description: None,
-            },
-            AskUserOption {
-                title: "No".to_string(),
-                description: None,
-            },
-        ]);
+    fn permission_options_map_titles_descriptions_and_continue_escape() {
+        // Freeform asks add a trailing "Continue" escape even when options exist.
+        let (req, _) = ask_request_opts(
+            vec![
+                AskUserOption {
+                    title: "Yes".to_string(),
+                    description: None,
+                },
+                AskUserOption {
+                    title: "No".to_string(),
+                    description: None,
+                },
+            ],
+            true,
+            false,
+        );
         let (opts, titles) = permission_options(&req);
-        assert_eq!(opts.len(), 2);
+        assert_eq!(opts.len(), 3, "freeform ask: 2 options + Continue");
         assert_eq!(opts[0].name, "Yes");
         assert_eq!(opts[1].name, "No");
         assert_eq!(opts[0].option_id.0.as_ref(), "opt-0");
         assert_eq!(titles[1].1, "No");
+        assert_eq!(opts[2].name, "Continue");
+        assert_eq!(titles[2].1, "Continue");
 
-        let (bare, _) = ask_request(vec![]);
+        // Non-freeform asks with options: no Continue injection.
+        let (req, _) = ask_request_opts(
+            vec![AskUserOption {
+                title: "Run tests".to_string(),
+                description: Some("cargo test --all-features".to_string()),
+            }],
+            false,
+            false,
+        );
+        let (opts, _) = permission_options(&req);
+        assert_eq!(opts.len(), 1, "non-freeform ask: no Continue escape");
+        assert_eq!(
+            opts[0].name, "Run tests — cargo test --all-features",
+            "description folded into visible label"
+        );
+
+        // Empty options degenerate to a Continue escape in all cases.
+        let (bare, _) = ask_request_opts(vec![], false, false);
         let (opts, titles) = permission_options(&bare);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].name, "Continue");
         assert_eq!(titles[0].1, "Continue");
+        assert_eq!(opts[0].option_id.0.as_ref(), "continue");
     }
 
     #[test]

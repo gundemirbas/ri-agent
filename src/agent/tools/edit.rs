@@ -93,7 +93,7 @@ impl Tool for EditTool {
     fn run(
         &self,
         args: Value,
-        _ctx: crate::agent::types::ToolCallContext,
+        ctx: crate::agent::types::ToolCallContext,
     ) -> Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + '_>> {
         Box::pin(async move {
             let EditArgs {
@@ -104,6 +104,9 @@ impl Tool for EditTool {
                 Ok(a) => a,
                 Err(e) => return *e,
             };
+            let path = super::resolve_workspace_path(&ctx, &path)
+                .to_string_lossy()
+                .into_owned();
 
             // Guard against editing a file that was modified externally
             // since it was last read.

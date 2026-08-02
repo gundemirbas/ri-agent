@@ -63,12 +63,11 @@ impl Tool for BashTool {
                 Err(e) => return *e,
             };
 
-            run_with_timeout(
-                SubprocessCommand::new("sh").arg("-c").arg(command),
-                timeout,
-                ctx,
-            )
-            .await
+            let mut command_builder = SubprocessCommand::new("sh").arg("-c").arg(command);
+            if let Some(dir) = &ctx.root {
+                command_builder = command_builder.current_dir(dir.to_string_lossy());
+            }
+            run_with_timeout(command_builder, timeout, ctx).await
         })
     }
 }

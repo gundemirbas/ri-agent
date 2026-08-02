@@ -227,6 +227,7 @@ pub async fn run_subagent(
                         // No nested subagents: the outer cancellation channel and
                         // registry are reused, but invoke_subagent was stripped.
                         subagent: None,
+                        root: None,
                     };
 
                     let result = match tools.get(tool_name) {

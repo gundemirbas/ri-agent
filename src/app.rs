@@ -666,6 +666,7 @@ impl App {
             tx: Some(tx.clone()),
             cancel_rx: None,
             subagent: None,
+            root: None,
         };
 
         self.runtime.pending_shell_handle = Some(tokio::spawn(async move {

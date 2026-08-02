@@ -106,6 +106,10 @@ impl Tool for ExecTool {
             }
             if let Some(dir) = cwd {
                 cmd = cmd.current_dir(dir);
+            } else if let Some(dir) = &ctx.root {
+                // Fall back to the per-session workspace root when the caller
+                // did not pick an explicit cwd.
+                cmd = cmd.current_dir(dir.to_string_lossy());
             }
             run_with_timeout(cmd, timeout, ctx).await
         })

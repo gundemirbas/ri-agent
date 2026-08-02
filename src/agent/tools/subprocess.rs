@@ -503,6 +503,7 @@ mod tests {
             tx,
             cancel_rx: Some(cancel_rx),
             subagent: None,
+            root: None,
         }
     }
 
