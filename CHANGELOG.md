@@ -4,6 +4,19 @@
 
 ### Added
 
+- **Protocol v2 serving (deferred, T2-4)**: `unstable_protocol_v2` is NOT yet
+  enabled. ACP v2 is a materially different protocol in the SDK's unstable
+  schema (permission round-trips reply with a `ToolCallUpdate` rather than an
+  outcome enum, session `cwd`/roots use `AbsolutePath` newtypes, and
+  `SessionUpdate` has ~19 variants with builder-only constructors), so serving
+  it faithfully means porting the whole session surface to v2 types. Planned
+  increment: enable the feature, register an `AgentProtocolRouter` (`.with_v1`
+  + `.with_v2`), and add a v2 implementation reusing the version-agnostic core
+  (session state, turn driver, `_ri/*` custom methods) with v1/v2 translation
+  at the boundary — starting with `initialize` + `session/new` +
+  `session/prompt` + `session/cancel`.
+
+
 - **ACP headless server**: `ri --serve` exposes the agent loop over the
   vendor-neutral Agent Client Protocol (JSON-RPC 2.0 over stdio): `initialize`
   (protocol v1, image prompts), `session/new`, `session/prompt` (streams
