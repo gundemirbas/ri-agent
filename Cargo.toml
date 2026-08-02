@@ -50,7 +50,7 @@ jawohl = "0.1.0"
 csscolorparser = "0.8.3"
 libc = "0.2"
 rig-core = { version = "0.41", default-features = false, features = ["reqwest", "rustls"] }
-agent-client-protocol = "2"
+agent-client-protocol = { version = "2", features = ["unstable_end_turn_token_usage", "unstable_session_fork"] }
 futures-lite = "2"
 agent-client-protocol-http = { version = "2", features = ["server"] }
 axum = "0.8"

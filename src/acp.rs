@@ -5,16 +5,20 @@
 //! `acpx`, …) can drive ri as a subprocess (stdio) or over WebSocket.
 //!
 //! Implemented surface:
-//! - `initialize` — protocol v1, capability negotiation (image prompts,
-//!   `session/load`)
+//! - `initialize` — protocol negotiation (image prompts, `session/load`),
+//!   advertises `session/fork` (ACP v2 session capability)
 //! - `session/new` — in-memory session (history, cancel channel, cwd)
 //! - `session/load` — replays a known session's history as updates; sessions
 //!   are persisted to disk (`~/.local/share/ri/sessions/acp/<id>.json`) after
 //!   each prompt, so they can be resumed by a later process
+//! - `session/fork` — clones a session (in-memory or persisted) into a new id
+//!   so clients can branch conversations
 //! - `session/prompt` — streams `agent_message_chunk`, `agent_thought_chunk`,
 //!   `tool_call`/`tool_call_update` (with live tool output forwarded as
 //!   in-progress `tool_call_update` chunks), `usage_update`, then `end_turn`;
-//!   tools run anchored at the session `cwd` and auto-compaction is enabled
+//!   tools run anchored at the session `cwd`, auto-compaction is enabled, and
+//!   the final `end_turn` response folds the turn's token usage
+//!   (`end_turn_token_usage`)
 //! - `session/cancel` — maps to ri `HardAbort`
 //! - `ask_user` → `session/request_permission` (multiple-choice mapping;
 //!   option descriptions folded into labels; freeform asks surface a trailing
@@ -22,15 +26,20 @@
 //! - Custom `_ri/*` methods: `_ri/get_state`, `_ri/set_model`,
 //!   `_ri/set_thinking` (provider is rebuilt on change),
 //!   `_ri/list_sessions` / `_ri/delete_session` / `_ri/prune_sessions`
-//!   (persisted-session management), `_ri/logs` (recent activity). Mutating
+//!   (persisted-session management), `_ri/logs` (recent activity),
+//!   `_ri/steering` (queues steering for the *next* prompt turn). Mutating
 //!   `_ri/*` methods require an admin `token` when `--serve-ws-token` is set.
 //!
 //! Transports: stdio (`--serve`), or HTTP + WebSocket at `/acp` (`--serve-ws <ADDR>`,
 //! optionally TLS via `--serve-ws-cert`/`--serve-ws-key`). The WebSocket server
 //! multiplexes multiple client connections; stdio serves exactly one.
 //!
-//! Limitations (deliberate, documented): one prompt at a time per session.
-//! The agent loop itself is reused unchanged.
+//! Known limitations: one prompt at a time per session; the SDK dispatches
+//! incoming requests serially per connection, so a second incoming request is
+//! served only after an in-flight `session/prompt` turn finishes (this means
+//! `_ri/get_state` reports live state only between turns, and `_ri/steering`
+//! applies at the next turn boundary rather than mid-turn). The agent loop
+//! itself is reused unchanged.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,13 +47,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::{fs, path::Path};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
-    PromptCapabilities, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SessionCapabilities, SessionId,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallContent,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, ForkSessionRequest,
+    ForkSessionResponse, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, PromptCapabilities, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SessionCapabilities, SessionForkCapabilities, SessionId, SessionNotification, SessionUpdate,
+    StopReason, TextContent, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, Usage as AcpUsage, UsageUpdate,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectTo, JsonRpcRequest, JsonRpcResponse, Result as AcpResult, Stdio,
@@ -166,6 +176,26 @@ struct RiPruneSessionsResponse {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
+#[request(method = "_ri/steering", response = RiSteeringResponse)]
+struct RiSteeringRequest {
+    #[serde(default, rename = "sessionId")]
+    session_id: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct RiSteeringResponse {
+    ok: bool,
+    error: Option<String>,
+    /// True when the text was queued on the session for the next turn.
+    forwarded: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonRpcRequest)]
 #[request(method = "_ri/logs", response = RiLogsResponse)]
 struct RiLogsRequest {
     #[serde(default)]
@@ -248,6 +278,11 @@ struct AcpSession {
     events: Vec<SessionEvent>,
     running: bool,
     cancel_tx: Option<watch::Sender<CancelLevel>>,
+    /// Steering messages queued via `_ri/steering`. Because the SDK dispatches
+    /// requests serially, mid-turn injection is impossible; the queued texts
+    /// are fed into the next prompt's turn boundary instead (turn-boundary
+    /// steering semantics).
+    queued_steering: Vec<String>,
     #[allow(dead_code)] // kept for future tool-cwd wiring; session prompt uses it
     cwd: std::path::PathBuf,
 }
@@ -258,6 +293,7 @@ impl AcpSession {
             events: Vec::new(),
             running: false,
             cancel_tx: None,
+            queued_steering: Vec::new(),
             cwd,
         }
     }
@@ -298,7 +334,11 @@ fn build_agent(
     let s_cancel = Arc::clone(&sessions);
     let s_state = Arc::clone(&sessions);
     let s_del = Arc::clone(&sessions);
+    let s_fork = Arc::clone(&sessions);
+    let s_steer = Arc::clone(&sessions);
     let ctx_new = Arc::clone(&ctx);
+    let ctx_fork = Arc::clone(&ctx);
+    let ctx_steer = Arc::clone(&ctx);
     let ctx_cancel = Arc::clone(&ctx);
     let ctx_state = Arc::clone(&ctx);
     let ctx_set_model = Arc::clone(&ctx);
@@ -317,7 +357,9 @@ fn build_agent(
                     InitializeResponse::new(req.protocol_version).agent_capabilities(
                         AgentCapabilities::new()
                             .mcp_capabilities(McpCapabilities::new())
-                            .session_capabilities(SessionCapabilities::new())
+                            .session_capabilities(
+                                SessionCapabilities::new().fork(SessionForkCapabilities::new()),
+                            )
                             .prompt_capabilities(PromptCapabilities::new().image(true))
                             .load_session(true),
                     ),
@@ -386,6 +428,48 @@ fn build_agent(
             },
             on_receive_request!(),
         )
+        // ── session/fork (ACP v2 / unstable_session_fork) ─────────────────
+        .on_receive_request(
+            async move |req: ForkSessionRequest, responder, _connection| {
+                // Source is the live in-memory session, then a persisted one.
+                let src = {
+                    let map = s_fork.lock().unwrap();
+                    map.get(&req.session_id)
+                        .map(|s| (s.events.clone(), s.cwd.clone()))
+                };
+                let (events, cwd) = match src {
+                    Some(x) => x,
+                    None => match read_persisted_session(&req.session_id) {
+                        Some(p) => (p.events, p.cwd),
+                        None => {
+                            responder
+                                .respond_with_error(
+                                    agent_client_protocol::Error::invalid_params()
+                                        .data("unknown session"),
+                                )
+                                .ok();
+                            return Ok(());
+                        }
+                    },
+                };
+
+                let new_id = SessionId::new(format!("sess-{}", new_session_suffix()));
+                let mut session = AcpSession::new(cwd.clone());
+                session.events = events.clone();
+                {
+                    let mut map = s_fork.lock().unwrap();
+                    map.insert(new_id.clone(), session);
+                }
+                persist_session(&new_id, &events, &cwd);
+                ctx_fork.log(
+                    "info",
+                    Some(&req.session_id.to_string()),
+                    format!("session/fork -> {new_id} ({} events)", events.len()),
+                );
+                responder.respond(ForkSessionResponse::new(new_id))
+            },
+            on_receive_request!(),
+        )
         // ── session/prompt ─────────────────────────────────────────────────
         .on_receive_request(
             async move |req: PromptRequest, responder, connection| {
@@ -401,7 +485,7 @@ fn build_agent(
                 );
 
                 // Per-session (cwd, busy guard) + push user message / resource reads.
-                let (session_cwd, cancel_rx, context_size, history_snapshot) = {
+                let (session_cwd, cancel_rx, context_size, history_snapshot, steering_rx) = {
                     let mut map = s_prompt.lock().unwrap();
                     let Some(s) = map.get_mut(&session_id) else {
                         responder
@@ -429,12 +513,17 @@ fn build_agent(
                     s.events.extend(synthesize_resource_reads(&req.prompt));
                     let (cancel_tx, cancel_rx) = watch::channel(CancelLevel::None);
                     s.cancel_tx = Some(cancel_tx);
+                    let (steering_tx, steering_rx) = tokio::sync::mpsc::unbounded_channel();
+                    for text in s.queued_steering.drain(..) {
+                        let _ = steering_tx.send(text);
+                    }
                     let cwd = s.cwd.clone();
                     (
                         cwd,
                         cancel_rx,
                         context_window_for_model(&ctx.model.read().unwrap()).unwrap_or(200_000),
                         s.events.clone(),
+                        steering_rx,
                     )
                 };
 
@@ -478,8 +567,6 @@ fn build_agent(
                     executor: Arc::new(DefaultToolExecutor::with_root(session_cwd.clone())),
                     system_prompt: Some(system_prompt),
                 };
-                let (steering_keeper, steering_rx) = tokio::sync::mpsc::unbounded_channel();
-                let _ = steering_keeper;
                 let provider_loop = Arc::clone(&provider);
                 let task_tx = tx.clone();
                 let join = tokio_handle.spawn(async move {
@@ -492,6 +579,9 @@ fn build_agent(
                 let mut assistant_thinking: Option<String> = None;
                 let mut phase = AssistantPhase::Unknown;
                 let mut usage: Option<UsageStats> = None;
+                // Usage survives TurnEnd's `usage = None` reset so the final
+                // end_turn response can include the last turn's tokens.
+                let mut final_usage: Option<UsageStats> = None;
                 let mut pending_tool: Vec<SessionEvent> = Vec::new();
 
                 while let Some(ev) = rx.recv().await {
@@ -565,6 +655,7 @@ fn build_agent(
                             }
                             AgentEvent::Usage(u) => {
                                 usage = Some(u);
+                                final_usage = Some(u);
                                 if let Some(uu) = usage_update_value(&u, context_size as u64) {
                                     send_update!(
                                         connection,
@@ -698,7 +789,19 @@ fn build_agent(
                     Some(msg) => responder.respond_with_error(
                         agent_client_protocol::Error::internal_error().data(msg),
                     ),
-                    None => responder.respond(PromptResponse::new(StopReason::EndTurn)),
+                    None => {
+                        let mut resp = PromptResponse::new(StopReason::EndTurn);
+                        // ACP end_turn_token_usage: fold the turn's usage into
+                        // the response in addition to the streamed usage_update.
+                        if let Some(u) = &final_usage {
+                            resp = resp.usage(AcpUsage::new(
+                                u.total_tokens.unwrap_or_default() as u64,
+                                u.input_tokens.unwrap_or_default() as u64,
+                                u.output_tokens.unwrap_or_default() as u64,
+                            ));
+                        }
+                        responder.respond(resp)
+                    }
                 }
             },
             on_receive_request!(),
@@ -753,6 +856,49 @@ fn build_agent(
                     })
                     .collect();
                 responder.respond(RiListSessionsResponse { sessions })
+            },
+            on_receive_request!(),
+        )
+        // ── _ri/steering (queue steering for the next prompt turn) ───────────
+        .on_receive_request(
+            async move |req: RiSteeringRequest, responder, _connection| {
+                if !ctx_steer.authorize(req.token.as_deref()) {
+                    unauthorized!(responder, "_ri/steering");
+                }
+                if req.session_id.trim().is_empty() || req.text.trim().is_empty() {
+                    return responder.respond(RiSteeringResponse {
+                        ok: false,
+                        error: Some("sessionId and text are required".to_string()),
+                        forwarded: false,
+                    });
+                }
+                let forwarded = {
+                    let mut map = s_steer.lock().unwrap();
+                    if let Some(s) = map.get_mut(&SessionId::new(req.session_id.clone())) {
+                        s.queued_steering.push(req.text.clone());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                ctx_steer.log(
+                    if forwarded { "info" } else { "warn" },
+                    Some(&req.session_id),
+                    if forwarded {
+                        "_ri/steering queued for next turn".to_string()
+                    } else {
+                        "unknown session for _ri/steering".to_string()
+                    },
+                );
+                responder.respond(RiSteeringResponse {
+                    ok: forwarded,
+                    error: if forwarded {
+                        None
+                    } else {
+                        Some("unknown session".to_string())
+                    },
+                    forwarded,
+                })
             },
             on_receive_request!(),
         )

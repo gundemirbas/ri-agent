@@ -222,10 +222,14 @@ ri --serve-ws 127.0.0.1:8080 --provider test   # WebSocket + HTTP
 
 Implemented surface:
 
-- `initialize` — protocol v1, image prompts, in-memory `session/load`
+- `initialize` — protocol negotiation, image prompts, `session/load`,
+  `session/fork` (ACP v2 session capability)
 - `session/new`, `session/prompt` (streams `agent_message_chunk`,
   `agent_thought_chunk`, `tool_call`/`tool_call_update` with live tool output
-  forwarded as in-progress updates, `usage_update`)
+  forwarded as in-progress updates, `usage_update`; the `end_turn` response
+  folds the turn's token usage)
+- `session/fork` — clones a session (live or persisted) into a new id so
+  clients can branch conversations
 - `session/load` — replays a session's history as updates; sessions are
   persisted to disk after each prompt (`~/.local/share/ri/sessions/acp/`), so
   a later process can resume them (`_ri/list_sessions` → `session/load` →
@@ -237,15 +241,18 @@ Implemented surface:
 - ri-specific `_ri/*` methods: `_ri/get_state` (model, thinking level,
   sessions), `_ri/set_model`, `_ri/set_thinking` (all rebuild/swap the active
   provider), `_ri/list_sessions` / `_ri/delete_session` / `_ri/prune_sessions`
-  (persisted-session management), `_ri/logs` (recent activity); call
+  (persisted-session management), `_ri/logs` (recent activity),
+  `_ri/steering` (queues steering for the next prompt turn); call
   unit-request methods with `"params": null`; mutating methods accept a
   `token` field enforced by `--serve-ws-token`
 - Transport: stdio (`--serve`) or HTTP+WebSocket at `/acp` (`--serve-ws`,
   optionally TLS via `--serve-ws-cert`/`--serve-ws-key`); the WS server
   multiplexes many clients, stdio serves one
 
-Current limitations: one prompt at a time per session. Requires Rust 1.88
-(ACP dependency baseline).
+Current limitations: one prompt at a time per session; requests are served
+serially per connection, so `_ri/get_state` is a live snapshot only between
+turns and `_ri/steering` applies at the next turn boundary. Requires Rust
+1.88 (ACP dependency baseline).
 
 ## Decoupled TUI (`--tui-acp`)
 
@@ -261,6 +268,9 @@ vocabulary, tool-permission asks surface through the TUI ask dialog
 ri --tui-acp --provider test   # interactive TUI driving a detached --serve
 ```
 
-Limitations: one prompt at a time, no steering, and provider/model switches
-inside the TUI are not pushed to the already-spawned child (restart to
-apply). The plain in-process TUI remains the default.
+Limitations: steering applies at the next turn boundary (the SDK serves
+requests serially, so mid-turn injection is impossible), live `_ri/get_state`
+is only observable between turns, and provider *instance* (preset/API-key)
+changes inside the TUI are not hot-swapped in the child — model/thinking
+changes are pushed automatically via `_ri/set_model`/`_ri/set_thinking`. The
+plain in-process TUI remains the default.

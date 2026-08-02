@@ -35,9 +35,21 @@ use crate::app_event::{AppEvent, AppEventTx, SendIgnore};
 use crate::llm::{AssistantPhase, UsageStats};
 
 /// Control handles handed back to the TUI after a successful spawn.
+/// Admin commands the TUI can push to the child (`_ri/*` methods).
+pub enum AcpTuiAdmin {
+    SetModel(String),
+    SetThinking(String),
+}
+
 pub struct AcpTuiControls {
-    /// Send the text of a submitted user message (one prompt at a time).
+    /// Send the text of a submitted user message. Prompts are FIFO-queued by
+    /// the client so rapid submissions are never silently dropped.
     pub prompt_tx: UnboundedSender<String>,
+    /// Send a steering message that is injected into the running prompt
+    /// (`_ri/steering`). No-op when no prompt is active.
+    pub steer_tx: UnboundedSender<String>,
+    /// Push provider/thinking changes to the child.
+    pub admin_tx: UnboundedSender<AcpTuiAdmin>,
     /// Cancel channel the TUI presses to abort the active prompt.
     pub cancel_tx: watch::Sender<CancelLevel>,
     /// The orchestration task (aborted on drop so the child is reaped).
@@ -109,6 +121,8 @@ pub async fn spawn(
     }
 
     let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (admin_tx, admin_rx) = tokio::sync::mpsc::unbounded_channel::<AcpTuiAdmin>();
     let (cancel_tx, cancel_rx) = watch::channel(CancelLevel::None);
 
     let task = tokio::spawn(run_loop(
@@ -117,12 +131,16 @@ pub async fn spawn(
         lines,
         session_id,
         prompt_rx,
+        steer_rx,
+        admin_rx,
         cancel_rx,
         app_event_tx,
     ));
 
     Ok(AcpTuiControls {
         prompt_tx,
+        steer_tx,
+        admin_tx,
         cancel_tx,
         task,
     })
@@ -165,18 +183,48 @@ impl Drop for ChildGuard {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Send a `session/prompt` request for `text`. Returns true when it was sent
+/// (i.e. a new turn is now pending).
+async fn send_prompt(
+    stdin: &mut tokio::process::ChildStdin,
+    session_id: &str,
+    next_id: &mut i64,
+    prompt_pending: &mut bool,
+    prompt_id: &mut Option<i64>,
+    text: String,
+) -> bool {
+    let id = *next_id;
+    *next_id += 1;
+    let req = json!({
+        "jsonrpc":"2.0","id": id, "method":"session/prompt",
+        "params": {"sessionId": session_id, "prompt": [{"type":"text","text": text}]}
+    });
+    if write_line(stdin, req).await.is_ok() {
+        *prompt_pending = true;
+        *prompt_id = Some(id);
+        true
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     child: tokio::process::Child,
     mut stdin: tokio::process::ChildStdin,
     mut lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     session_id: String,
     mut prompt_rx: UnboundedReceiver<String>,
+    mut steer_rx: UnboundedReceiver<String>,
+    mut admin_rx: UnboundedReceiver<AcpTuiAdmin>,
     mut cancel_rx: watch::Receiver<CancelLevel>,
     app_event_tx: AppEventTx,
 ) {
     let mut child = ChildGuard(child);
     let mut next_id: i64 = 10;
     let mut prompt_pending = false;
+    let mut prompt_id: Option<i64> = None;
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     loop {
         tokio::select! {
@@ -217,17 +265,37 @@ async fn run_loop(
                             handle_server_request(&value, &mut stdin, &mut next_id, &app_event_tx)
                                 .await;
                         } else if has_response {
-                            // session/prompt completion.
-                            prompt_pending = false;
-                            if let Some(err) = value.get("error") {
-                                app_event_tx.send_ignore(AppEvent::Agent(AgentEvent::Error(
-                                    crate::llm::ProviderError::other(
-                                        "acp_tui",
-                                        serde_json::to_string(err).unwrap_or_default(),
-                                    ),
-                                )));
-                            } else {
-                                end_turn(&app_event_tx);
+                            // Only a matching id completes the prompt; other
+                            // responses (e.g. _ri/set_model) are ignored.
+                            let rid = value.get("id").and_then(|v| v.as_i64());
+                            if rid == prompt_id {
+                                prompt_pending = false;
+                                prompt_id = None;
+                                if let Some(err) = value.get("error") {
+                                    app_event_tx.send_ignore(AppEvent::Agent(AgentEvent::Error(
+                                        crate::llm::ProviderError::other(
+                                            "acp_tui",
+                                            serde_json::to_string(err).unwrap_or_default(),
+                                        ),
+                                    )));
+                                } else {
+                                    end_turn(&app_event_tx);
+                                }
+                                // Serialize queued follows-ups.
+                                while let Some(next) = queue.pop_front() {
+                                    if send_prompt(
+                                        &mut stdin,
+                                        &session_id,
+                                        &mut next_id,
+                                        &mut prompt_pending,
+                                        &mut prompt_id,
+                                        next,
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                }
                             }
                         } else if method.as_deref() == Some("session/update") {
                             handle_update(&value, &app_event_tx);
@@ -237,18 +305,41 @@ async fn run_loop(
             }
             Some(text) = prompt_rx.recv() => {
                 if prompt_pending {
-                    continue; // one prompt at a time
+                    queue.push_back(text); // FIFO follow-up, not dropped
+                } else {
+                    send_prompt(
+                        &mut stdin,
+                        &session_id,
+                        &mut next_id,
+                        &mut prompt_pending,
+                        &mut prompt_id,
+                        text,
+                    )
+                    .await;
                 }
-                let req = json!({
-                    "jsonrpc":"2.0","id": next_id, "method":"session/prompt",
-                    "params": {"sessionId": session_id, "prompt": [
-                        {"type":"text","text": text}
-                    ]}
-                });
+            }
+            Some(steer) = steer_rx.recv() => {
+                let _ = write_line(
+                    &mut stdin,
+                    json!({
+                        "jsonrpc":"2.0","id": next_id, "method":"_ri/steering",
+                        "params":{"sessionId": session_id, "text": steer}
+                    }),
+                )
+                .await;
                 next_id += 1;
-                if write_line(&mut stdin, req).await.is_ok() {
-                    prompt_pending = true;
-                }
+            }
+            Some(admin) = admin_rx.recv() => {
+                let (method, params) = match admin {
+                    AcpTuiAdmin::SetModel(model) => ("_ri/set_model", json!({"model": model})),
+                    AcpTuiAdmin::SetThinking(level) => ("_ri/set_thinking", json!({"level": level})),
+                };
+                let _ = write_line(
+                    &mut stdin,
+                    json!({"jsonrpc":"2.0","id": next_id, "method": method, "params": params}),
+                )
+                .await;
+                next_id += 1;
             }
             changed = cancel_rx.changed() => {
                 if changed.is_ok() && *cancel_rx.borrow() >= CancelLevel::HardAbort && prompt_pending {
@@ -261,9 +352,24 @@ async fn run_loop(
                     )
                     .await;
                     prompt_pending = false;
+                    prompt_id = None;
                     // The server aborts the prompt; surface a clean end so the
                     // TUI turn wraps up.
                     end_turn(&app_event_tx);
+                    while let Some(next) = queue.pop_front() {
+                        if send_prompt(
+                            &mut stdin,
+                            &session_id,
+                            &mut next_id,
+                            &mut prompt_pending,
+                            &mut prompt_id,
+                            next,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         }

@@ -351,6 +351,7 @@ async fn main() -> io::Result<()> {
     let app_event_tx = app.app_event_tx();
 
     // ── Decoupled mode: drive a detached agent over ACP (`--tui-acp`) ──
+    let mut acp_admin: Option<tokio::sync::mpsc::UnboundedSender<acp_tui::AcpTuiAdmin>> = None;
     if cli.tui_acp {
         let child_args = vec![
             "--provider".to_string(),
@@ -363,8 +364,11 @@ async fn main() -> io::Result<()> {
             .map_err(|e| {
                 io::Error::other(format!("--tui-acp failed to start the ACP agent: {e}"))
             })?;
+        acp_admin = Some(controls.admin_tx.clone());
         app.backend = crate::app::AgentBackend::Acp(controls);
     }
+    let mut synced_model = initial_model.clone();
+    let mut synced_thinking = initial_thinking;
 
     let custom_tools = load_custom_tools(&custom_tool_dirs());
     let loaded_skills = Arc::new(skills::load_skills());
@@ -484,6 +488,22 @@ async fn main() -> io::Result<()> {
                 api_key,
             }) => {
                 handle_configure_provider(&mut app, &mut config, *instance, url, api_key);
+            }
+        }
+
+        // ── Keep a detached `--tui-acp` child in sync with provider state ──
+        if let Some(admin_tx) = &acp_admin {
+            let cur_model = app.provider.current_model.clone();
+            let cur_thinking = app.provider.current_thinking;
+            if cur_model != synced_model {
+                let _ = admin_tx.send(acp_tui::AcpTuiAdmin::SetModel(cur_model.clone()));
+                synced_model = cur_model;
+            }
+            if cur_thinking != synced_thinking {
+                let _ = admin_tx.send(acp_tui::AcpTuiAdmin::SetThinking(
+                    cur_thinking.as_str().to_string(),
+                ));
+                synced_thinking = cur_thinking;
             }
         }
     }

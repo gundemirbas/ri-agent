@@ -28,9 +28,10 @@ impl App {
                 _ => None,
             });
             // Reuse the App cancel channel: Esc/Ctrl-C map to session/cancel in
-            // the ACP client. Steering and local agent_task are unsupported.
+            // the ACP client. Steering is forwarded to the running prompt via
+            // the child's `_ri/steering`; there is no local agent task.
             self.runtime.cancel_tx = Some(controls.cancel_tx.clone());
-            self.runtime.steering_tx = None;
+            self.runtime.steering_tx = Some(controls.steer_tx.clone());
             self.runtime.agent_task = None;
             if let Some(text) = prompt_text {
                 let _ = controls.prompt_tx.send(text);

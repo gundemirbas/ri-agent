@@ -38,6 +38,7 @@ const HELP_TEXT: &str = r#"# Test Provider Commands
 | `echo <text>`   | Stream text back to the UI                                      |
 | `slow <text>`   | Stream text with artificial per-word delays                     |
 | `tool <name> <args-json>` | Emit a scripted tool call to drive a real tool (e.g. `bash`) |
+| `usage`          | Report token usage so the usage/end-turn paths can be exercised  |
 | `system`        | Show the exact system prompt that is being sent to the model    |
 | `error`         | Emit a provider error to exercise the error-display path        |
 "#;
@@ -144,6 +145,21 @@ impl super::LlmProvider for TestProvider {
 
             "error" => Box::pin(stream! {
                 yield LlmEvent::Error(ProviderError::other("test", "test error triggered by 'error' command"));
+            }),
+
+            "usage" => Box::pin(stream! {
+                yield LlmEvent::Usage(crate::llm::UsageStats {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    total_tokens: Some(15),
+                    cached_tokens: Some(8),
+                    reasoning_tokens: None,
+                });
+                yield LlmEvent::Token {
+                    text: "[usage reported]\n".to_string(),
+                    phase: AssistantPhase::Final,
+                };
+                yield LlmEvent::Done;
             }),
 
             "tool" => {

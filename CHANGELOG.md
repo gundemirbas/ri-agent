@@ -49,6 +49,15 @@
   `session/cancel`. Verified over a real pseudo-terminal: text streams,
   cancel, multi-turn, and a live detached child process. The in-process TUI
   remains the default.
+- **ACP v2 (fork, end_turn usage) + TUI bridge hardening**: `session/fork`
+  (clones a live/persisted session into a new id for branching conversations),
+  `end_turn_token_usage` (the `session/prompt` response folds the turn's
+  tokens alongside the streamed `usage_update`), and `_ri/steering` (queues
+  steering applied at the next prompt turn boundary — the SDK serves requests
+  serially, so mid-turn injection is impossible). The `--tui-acp` client now
+  FIFO-queues rapid submissions instead of dropping them, and pushes
+  model/thinking changes to the child via `_ri/set_model`/`_ri/set_thinking`;
+  `TestProvider` gains a `usage` command to exercise the usage paths offline.
 
 ### Fixed
 
